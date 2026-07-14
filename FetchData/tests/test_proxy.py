@@ -3,7 +3,8 @@ import os
 import unittest
 from unittest.mock import patch
 
-from fetch_data.proxy import ProxyError, ProxyManager
+from fetch_data.observability import RuntimeObservability
+from fetch_data.proxy import ProxyError, ProxyManager, ProxySettings
 
 
 class FakeClock:
@@ -15,6 +16,43 @@ class FakeClock:
 
 
 class ProxyManagerTests(unittest.TestCase):
+    def test_https_validation_sends_proxy_credentials_on_initial_connect(
+        self,
+    ) -> None:
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        class ConnectAuthProxy:
+            def open(self, request, timeout):
+                if request.get_header("Proxy-authorization") is None:
+                    raise OSError("Tunnel connection failed: 407")
+                return FakeResponse()
+
+        proxy = ProxySettings(
+            server="http://127.0.0.1:8080",
+            username="user",
+            password="secret",
+        )
+
+        with patch(
+            "fetch_data.proxy.urllib.request.build_opener",
+            return_value=ConnectAuthProxy(),
+        ):
+            is_valid = ProxyManager._validate_proxy(
+                proxy,
+                "https://example.com",
+                {},
+                1,
+            )
+
+        self.assertTrue(is_valid)
+
     def test_plain_text_proxy_is_parsed_for_playwright(self) -> None:
         proxy = ProxyManager.parse_proxy_response(
             "127.0.0.1:8080\n",
@@ -104,6 +142,35 @@ class ProxyManagerTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_proxy_refresh_validation_and_invalidation_are_observable(self) -> None:
+        observability = RuntimeObservability()
+        responses = iter(["127.0.0.1:8001", "127.0.0.1:8002"])
+        manager = ProxyManager(
+            api_url="https://supplier.example/get",
+            username="user",
+            password="secret",
+            max_consecutive_errors=1,
+            fetcher=lambda api_url, headers, timeout: next(responses),
+            validator=lambda proxy, url, headers, timeout: True,
+            clock=FakeClock(),
+            observability=observability,
+        )
+
+        async def exercise() -> None:
+            await manager.get_proxy()
+            await manager.report_error()
+            await manager.get_proxy()
+
+        asyncio.run(exercise())
+        metrics = observability.render_metrics()
+        self.assertIn(
+            'football_proxy_requests_total{result="refresh"} 2', metrics
+        )
+        self.assertIn(
+            'football_proxy_validation_total{result="success"} 2', metrics
+        )
+        self.assertIn("football_proxy_invalidations_total 1", metrics)
+
     def test_success_resets_consecutive_errors(self) -> None:
         responses = iter(["127.0.0.1:8001", "127.0.0.1:8002"])
         manager = ProxyManager(
@@ -145,7 +212,7 @@ class ProxyManagerTests(unittest.TestCase):
         ):
             manager = ProxyManager.from_env()
 
-        self.assertEqual(manager.update_interval, 300)
+        self.assertEqual(manager.update_interval, 60)
         self.assertEqual(manager.max_consecutive_errors, 3)
         self.assertEqual(manager.api_timeout, 5)
         self.assertEqual(manager.test_timeout, 5)

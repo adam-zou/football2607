@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import base64
 import os
 import time
 import urllib.request
@@ -12,8 +13,10 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Mapping, Optional
 from urllib.parse import urlparse
 
+from .observability import RuntimeObservability
 
-DEFAULT_PROXY_UPDATE_INTERVAL = 300.0
+
+DEFAULT_PROXY_UPDATE_INTERVAL = 60.0
 DEFAULT_MAX_CONSECUTIVE_ERRORS = 3
 DEFAULT_PROXY_API_TIMEOUT = 5.0
 DEFAULT_PROXY_TEST_TIMEOUT = 5.0
@@ -76,6 +79,7 @@ class ProxyManager:
         fetcher: Optional[ProxyFetcher] = None,
         validator: Optional[ProxyValidator] = None,
         clock: Clock = time.monotonic,
+        observability: Optional[RuntimeObservability] = None,
     ) -> None:
         if not api_url.strip():
             raise ValueError("api_url is required")
@@ -104,6 +108,7 @@ class ProxyManager:
         self._fetcher = fetcher or self._fetch_proxy_text
         self._validator = validator or self._validate_proxy
         self._clock = clock
+        self.observability = observability
         # 以下是会随运行变化的缓存状态，不来自环境变量。
         self._proxy: Optional[ProxySettings] = None
         self._updated_at = 0.0
@@ -111,7 +116,10 @@ class ProxyManager:
         self._lock: Optional[asyncio.Lock] = None
 
     @classmethod
-    def from_env(cls) -> "ProxyManager":
+    def from_env(
+        cls,
+        observability: Optional[RuntimeObservability] = None,
+    ) -> "ProxyManager":
         """读取环境变量，并尽早报告缺少或格式错误的配置。"""
 
         required = {
@@ -146,6 +154,7 @@ class ProxyManager:
                 "PROXY_TEST_TIMEOUT",
                 DEFAULT_PROXY_TEST_TIMEOUT,
             ),
+            observability=observability,
         )
 
     async def get_proxy(self) -> ProxySettings:
@@ -158,8 +167,16 @@ class ProxyManager:
                 self._proxy is not None
                 and now - self._updated_at < self.update_interval
             ):
+                if self.observability is not None:
+                    self.observability.increment(
+                        "proxy_requests_total", result="cache_hit"
+                    )
                 return self._proxy
 
+            if self.observability is not None:
+                self.observability.increment(
+                    "proxy_requests_total", result="refresh"
+                )
             try:
                 # urllib 是同步 API，放进线程后不会卡住 Playwright 的事件循环。
                 response = await asyncio.to_thread(
@@ -174,8 +191,12 @@ class ProxyManager:
                     password=self.password,
                 )
             except (ProxyError, ValueError):
+                if self.observability is not None:
+                    self.observability.record_health("proxy", False, "fetch failed")
                 raise
             except Exception:
+                if self.observability is not None:
+                    self.observability.record_health("proxy", False, "fetch failed")
                 raise ProxyError("failed to fetch proxy from supplier") from None
 
             try:
@@ -187,14 +208,33 @@ class ProxyManager:
                     self.test_timeout,
                 )
             except Exception:
+                if self.observability is not None:
+                    self.observability.increment(
+                        "proxy_validation_total", result="failure"
+                    )
+                    self.observability.record_health(
+                        "proxy", False, "validation failed"
+                    )
                 raise ProxyError("proxy validation failed") from None
             if not is_valid:
+                if self.observability is not None:
+                    self.observability.increment(
+                        "proxy_validation_total", result="failure"
+                    )
+                    self.observability.record_health(
+                        "proxy", False, "validation failed"
+                    )
                 raise ProxyError("proxy validation failed")
 
             # 只有“成功获取 + 成功验证”后才替换旧缓存。
             self._proxy = proxy
             self._updated_at = now
             self._consecutive_errors = 0
+            if self.observability is not None:
+                self.observability.increment(
+                    "proxy_validation_total", result="success"
+                )
+                self.observability.record_health("proxy", True)
             return proxy
 
     async def report_success(self) -> None:
@@ -208,11 +248,15 @@ class ProxyManager:
 
         async with self._get_lock():
             self._consecutive_errors += 1
+            if self.observability is not None:
+                self.observability.increment("proxy_access_errors_total")
             if self._consecutive_errors >= self.max_consecutive_errors:
                 # 不在这里立刻访问供应商。真正需要代理的调用会通过
                 # get_proxy 获取，保持职责和异常处理简单。
                 self._proxy = None
                 self._updated_at = 0.0
+                if self.observability is not None:
+                    self.observability.increment("proxy_invalidations_total")
 
     def _get_lock(self) -> asyncio.Lock:
         """惰性创建事件循环锁，保护缓存刷新和失败计数。"""
@@ -302,6 +346,15 @@ class ProxyManager:
             urllib.request.ProxyBasicAuthHandler(password_manager),
         )
         request = urllib.request.Request(test_url, headers=dict(headers))
+        # HTTPS 代理认证发生在 CONNECT 建立隧道之前。urllib 的认证处理器
+        # 无法在 CONNECT 返回 407 后重试，因此首次请求必须主动携带凭据。
+        credentials = base64.b64encode(
+            f"{proxy.username}:{proxy.password}".encode("utf-8")
+        ).decode("ascii")
+        request.add_unredirected_header(
+            "Proxy-Authorization",
+            f"Basic {credentials}",
+        )
         try:
             with opener.open(request, timeout=timeout) as response:
                 return 200 <= response.status < 400

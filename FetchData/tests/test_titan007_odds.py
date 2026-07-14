@@ -1,5 +1,7 @@
 import json
+import asyncio
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from fetch_data.models import HandicapChange, Movement, OneXTwoChange, OverUnderChange
 from fetch_data.providers.titan007_odds import Titan007OddsProvider
@@ -9,7 +11,111 @@ def cell(text: str, color: str = "", col_span: int = 1):
     return {"text": text, "color": color, "colSpan": col_span}
 
 
+class FakeProxy:
+    def playwright_options(self):
+        return {}
+
+
+class FakeProxyManager:
+    async def get_proxy(self):
+        return FakeProxy()
+
+    async def report_success(self):
+        return None
+
+    async def report_error(self):
+        return None
+
+
+class FakeBrowser:
+    async def close(self):
+        return None
+
+
+class FakeChromium:
+    async def launch(self, **kwargs):
+        return FakeBrowser()
+
+
+class FakePlaywrightContext:
+    async def __aenter__(self):
+        return type("Playwright", (), {"chromium": FakeChromium()})()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+
 class Titan007OddsProviderTests(unittest.TestCase):
+    def test_page_validation_rejects_error_and_unrecognized_pages(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "blocked or error page"):
+            Titan007OddsProvider._validate_page_state(
+                {
+                    "title": "Access Denied",
+                    "bodyText": "Request blocked by WAF",
+                    "hasExpectedTable": False,
+                    "hasMarketShell": False,
+                    "hasMarketNavigation": False,
+                }
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "missing expected market structure"):
+            Titan007OddsProvider._validate_page_state(
+                {
+                    "title": "Unexpected page",
+                    "bodyText": "hello",
+                    "hasExpectedTable": False,
+                    "hasMarketShell": False,
+                    "hasMarketNavigation": False,
+                }
+            )
+
+    def test_page_validation_accepts_explicit_empty_market_shell(self) -> None:
+        has_table = Titan007OddsProvider._validate_page_state(
+            {
+                "title": "赔率变化",
+                "bodyText": "亚让 胜平负 进球数",
+                "hasExpectedTable": False,
+                "hasMarketShell": True,
+                "hasMarketNavigation": True,
+            }
+        )
+
+        self.assertFalse(has_table)
+
+    def test_failed_page_discards_only_its_company(self) -> None:
+        provider = Titan007OddsProvider(proxy_manager=FakeProxyManager())
+
+        async def fetch_rows(browser, match_id, company_id, market):
+            if company_id == 4 and market == "one_x_two":
+                raise RuntimeError("temporary page failure")
+            return []
+
+        provider._fetch_page_rows = AsyncMock(side_effect=fetch_rows)
+
+        with patch(
+            "fetch_data.providers.titan007_odds.async_playwright",
+            return_value=FakePlaywrightContext(),
+        ):
+            snapshot = asyncio.run(
+                provider.fetch_match_odds(3020831, company_ids=[3, 4])
+            )
+
+        self.assertEqual(snapshot.companies, {3: "Crow*"})
+        self.assertIn(4, snapshot.failed_companies)
+        self.assertIn("one_x_two", snapshot.failed_companies[4])
+        self.assertEqual(provider._fetch_page_rows.await_count, 6)
+
+    def test_all_companies_failing_raises_collection_error(self) -> None:
+        provider = Titan007OddsProvider(proxy_manager=FakeProxyManager())
+        provider._fetch_page_rows = AsyncMock(side_effect=RuntimeError("failed"))
+
+        with patch(
+            "fetch_data.providers.titan007_odds.async_playwright",
+            return_value=FakePlaywrightContext(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "all selected companies failed"):
+                asyncio.run(provider.fetch_match_odds(3020831, company_ids=[3]))
+
     def test_missing_market_table_is_represented_by_no_rows(self) -> None:
         self.assertEqual(
             Titan007OddsProvider.parse_rows(

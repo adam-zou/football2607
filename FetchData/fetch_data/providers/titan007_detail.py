@@ -8,6 +8,7 @@ from typing import AsyncIterator, Any, Dict, Iterable, List, Optional, Sequence,
 from playwright.async_api import Browser, async_playwright
 
 from ..models import MatchBasicInfo
+from ..observability import RuntimeObservability
 from ..proxy import ProxyManager
 
 
@@ -29,6 +30,7 @@ class Titan007MatchDetailProvider:
         timeout_ms: int = 30_000,
         max_concurrency: int = 2,
         proxy_manager: ProxyManager,
+        observability: Optional[RuntimeObservability] = None,
     ) -> None:
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be greater than zero")
@@ -37,6 +39,7 @@ class Titan007MatchDetailProvider:
         self.timeout_ms = timeout_ms
         self.max_concurrency = max_concurrency
         self.proxy_manager = proxy_manager
+        self.observability = observability
 
     async def fetch_match_detail_batches(
         self,
@@ -74,6 +77,12 @@ class Titan007MatchDetailProvider:
                         except asyncio.CancelledError:
                             raise
                         except Exception:
+                            if self.observability is not None:
+                                self.observability.increment(
+                                    "page_requests_total",
+                                    provider="titan007_detail",
+                                    result="failure",
+                                )
                             # 单个比赛失败不应丢掉整批成功结果，因此记录日志后
                             # 返回 None，由下面的列表推导过滤。
                             await self.proxy_manager.report_error()
@@ -83,6 +92,12 @@ class Titan007MatchDetailProvider:
                             )
                             return None
                         else:
+                            if self.observability is not None:
+                                self.observability.increment(
+                                    "page_requests_total",
+                                    provider="titan007_detail",
+                                    result="success",
+                                )
                             await self.proxy_manager.report_success()
                             return detail
 

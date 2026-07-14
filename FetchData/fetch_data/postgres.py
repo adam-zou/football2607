@@ -5,48 +5,35 @@
 """
 
 import asyncio
+from datetime import datetime
 from typing import List, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extensions import connection as Connection
 from psycopg2.extras import execute_values
 
+from .match_completion import mark_matches_completed
 from .models import Match, MatchBasicInfo
+from .schema import load_migrations
 
 
 SYNC_LOCK_NAME = "football2607:sync-match-status"
 
 
-INITIALIZE_MATCH_STATUS_TABLE = """
-CREATE TABLE IF NOT EXISTS match_status (
-    match_id BIGINT PRIMARY KEY,
-    crawl_status TEXT NOT NULL DEFAULT '未完成'
-        CHECK (crawl_status IN ('未完成', '已完成'))
-);
+def parse_scheduled_at(value: str) -> Optional[datetime]:
+    """把页面的北京时间文本转换成可写入 TIMESTAMPTZ 的时间。"""
 
-ALTER TABLE match_status
-ADD COLUMN IF NOT EXISTS crawl_status TEXT NOT NULL DEFAULT '未完成'
-    CHECK (crawl_status IN ('未完成', '已完成'));
+    try:
+        parsed = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+    except (AttributeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
 
-ALTER TABLE match_status DROP COLUMN IF EXISTS status_text;
-ALTER TABLE match_status DROP COLUMN IF EXISTS status;
 
-CREATE INDEX IF NOT EXISTS idx_match_status_crawl_status
-ON match_status(crawl_status);
-
-CREATE TABLE IF NOT EXISTS match_basic_info (
-    match_id BIGINT PRIMARY KEY REFERENCES match_status(match_id) ON DELETE CASCADE,
-    source TEXT NOT NULL,
-    league TEXT NOT NULL,
-    home_team TEXT NOT NULL,
-    away_team TEXT NOT NULL,
-    scheduled_time TEXT NOT NULL,
-    home_score SMALLINT,
-    away_score SMALLINT,
-    status_text TEXT NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
+INITIALIZE_MATCH_STATUS_TABLE = load_migrations(
+    ("001_match_status.sql", "002_match_basic_info.sql")
+)
 
 
 class PostgresMatchStore:
@@ -132,6 +119,7 @@ class PostgresMatchStore:
             (
                 int(match.match_id),
                 match.scheduled_time,
+                parse_scheduled_at(match.scheduled_time),
                 match.home_score,
                 match.away_score,
                 match.status_text or "未开始",
@@ -157,6 +145,7 @@ class PostgresMatchStore:
                     """
                     UPDATE match_basic_info AS detail
                     SET scheduled_time = snapshot.scheduled_time,
+                        scheduled_at = snapshot.scheduled_at::TIMESTAMPTZ,
                         home_score = snapshot.home_score::SMALLINT,
                         away_score = snapshot.away_score::SMALLINT,
                         status_text = snapshot.status_text,
@@ -164,6 +153,7 @@ class PostgresMatchStore:
                     FROM (VALUES %s) AS snapshot(
                         match_id,
                         scheduled_time,
+                        scheduled_at,
                         home_score,
                         away_score,
                         status_text
@@ -171,6 +161,10 @@ class PostgresMatchStore:
                     WHERE detail.match_id = snapshot.match_id::BIGINT
                     """,
                     dynamic_values,
+                )
+                mark_matches_completed(
+                    cursor,
+                    [int(match.match_id) for match in matches],
                 )
 
     def _fetch_pending_match_ids_sync(self) -> List[int]:
@@ -206,6 +200,7 @@ class PostgresMatchStore:
                 detail.home_team,
                 detail.away_team,
                 detail.scheduled_time,
+                parse_scheduled_at(detail.scheduled_time),
                 detail.home_score,
                 detail.away_score,
                 detail.status_text,
@@ -224,6 +219,7 @@ class PostgresMatchStore:
                         home_team,
                         away_team,
                         scheduled_time,
+                        scheduled_at,
                         home_score,
                         away_score,
                         status_text
@@ -235,9 +231,25 @@ class PostgresMatchStore:
                         league = EXCLUDED.league,
                         home_team = EXCLUDED.home_team,
                         away_team = EXCLUDED.away_team,
+                        scheduled_time = CASE
+                            WHEN match_basic_info.scheduled_time ~
+                                '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+                            THEN match_basic_info.scheduled_time
+                            ELSE EXCLUDED.scheduled_time
+                        END,
+                        scheduled_at = CASE
+                            WHEN match_basic_info.scheduled_time ~
+                                '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+                            THEN match_basic_info.scheduled_at
+                            ELSE EXCLUDED.scheduled_at
+                        END,
                         updated_at = NOW()
                     """,
                     values,
                 )
-                # 冲突更新刻意不覆盖 scheduled_time、比分和 status_text：这些
-                # 高频变化字段后续归列表任务所有，避免较旧详情页数据倒灌。
+                # 完整 scheduled_time 后续归列表任务所有；但旧版本写入的纯
+                # HH:MM 会由详情页自动修复。比分和状态仍不从详情页倒灌。
+                mark_matches_completed(
+                    cursor,
+                    [detail.match_id for detail in details],
+                )

@@ -1,6 +1,7 @@
 """Titan007 三类赔率变化页的抓取、DOM 提取与字段解析。"""
 
 import asyncio
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -13,6 +14,7 @@ from ..models import (
     OneXTwoChange,
     OverUnderChange,
 )
+from ..observability import RuntimeObservability
 from ..proxy import ProxyManager
 
 
@@ -21,6 +23,9 @@ from ..proxy import ProxyManager
 RawCell = Dict[str, Any]
 RawRow = Dict[str, Any]
 MarketChange = Union[HandicapChange, OneXTwoChange, OverUnderChange]
+
+
+logger = logging.getLogger(__name__)
 
 
 class Titan007OddsProvider:
@@ -83,6 +88,7 @@ class Titan007OddsProvider:
         timeout_ms: int = 30_000,
         max_concurrency: int = 6,
         proxy_manager: ProxyManager,
+        observability: Optional[RuntimeObservability] = None,
     ) -> None:
         if timeout_ms <= 0:
             raise ValueError("timeout_ms must be greater than zero")
@@ -92,6 +98,7 @@ class Titan007OddsProvider:
         self.timeout_ms = timeout_ms
         self.max_concurrency = max_concurrency
         self.proxy_manager = proxy_manager
+        self.observability = observability
 
     async def fetch_match_odds(
         self,
@@ -118,7 +125,7 @@ class Titan007OddsProvider:
                     async def fetch_one(
                         market: str,
                         company_id: int,
-                    ) -> Tuple[str, List[MarketChange]]:
+                    ) -> List[MarketChange]:
                         async with semaphore:
                             rows = await self._fetch_page_rows(
                                 browser,
@@ -126,21 +133,81 @@ class Titan007OddsProvider:
                                 company_id,
                                 market,
                             )
-                            return market, self.parse_rows(
+                            return self.parse_rows(
                                 market,
                                 rows,
                                 match_id=match_id,
                                 company_id=company_id,
                             )
 
-                    # gather 保留传入协程的顺序，因此每个市场内机构顺序稳定。
-                    results = await asyncio.gather(
+                    requests = [
+                        (company_id, market)
+                        for company_id in selected_companies
+                        for market in self.MARKETS
+                    ]
+                    # 单页失败不取消其他公司的请求。公司是最小原子单元：
+                    # 三个市场必须全部成功，本轮才会进入快照。
+                    page_results = await asyncio.gather(
                         *(
                             fetch_one(market, company_id)
-                            for market in self.MARKETS
-                            for company_id in selected_companies
-                        )
+                            for company_id, market in requests
+                        ),
+                        return_exceptions=True,
                     )
+                    failure_reasons: Dict[int, List[str]] = {}
+                    successful_results = []
+                    for (company_id, market), result in zip(requests, page_results):
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        if isinstance(result, BaseException):
+                            if self.observability is not None:
+                                self.observability.increment(
+                                    "page_requests_total",
+                                    result="failure",
+                                    provider="titan007_odds",
+                                    market=market,
+                                )
+                            failure_reasons.setdefault(company_id, []).append(
+                                f"{market}: {result}"
+                            )
+                            logger.warning(
+                                "discarding company %d for match %d because %s "
+                                "collection failed: %s",
+                                company_id,
+                                match_id,
+                                market,
+                                result,
+                            )
+                        else:
+                            if self.observability is not None:
+                                self.observability.increment(
+                                    "page_requests_total",
+                                    result="empty" if not result else "success",
+                                    provider="titan007_odds",
+                                    market=market,
+                                )
+                            successful_results.append((company_id, market, result))
+
+                    successful_companies = [
+                        company_id
+                        for company_id in selected_companies
+                        if company_id not in failure_reasons
+                    ]
+                    if not successful_companies:
+                        raise RuntimeError(
+                            f"all selected companies failed for match {match_id}"
+                        )
+                    if self.observability is not None:
+                        self.observability.increment(
+                            "odds_companies_total",
+                            len(successful_companies),
+                            result="success",
+                        )
+                        self.observability.increment(
+                            "odds_companies_total",
+                            len(failure_reasons),
+                            result="failure",
+                        )
                 finally:
                     await browser.close()
         except asyncio.CancelledError:
@@ -157,7 +224,9 @@ class Titan007OddsProvider:
         handicap_changes: List[HandicapChange] = []
         one_x_two_changes: List[OneXTwoChange] = []
         over_under_changes: List[OverUnderChange] = []
-        for market, changes in results:
+        for company_id, market, changes in successful_results:
+            if company_id not in successful_companies:
+                continue
             if market == "handicap":
                 handicap_changes.extend(changes)  # type: ignore[arg-type]
             elif market == "one_x_two":
@@ -169,11 +238,15 @@ class Titan007OddsProvider:
             match_id=match_id,
             companies={
                 company_id: self.COMPANIES[company_id]
-                for company_id in selected_companies
+                for company_id in successful_companies
             },
             handicap_changes=handicap_changes,
             one_x_two_changes=one_x_two_changes,
             over_under_changes=over_under_changes,
+            failed_companies={
+                company_id: "; ".join(reasons)
+                for company_id, reasons in failure_reasons.items()
+            },
         )
 
     async def _fetch_page_rows(
@@ -191,19 +264,87 @@ class Titan007OddsProvider:
         )
         try:
             selector = self.MARKETS[market][1]
-            await page.goto(
+            response = await page.goto(
                 self.build_url(match_id, company_id, market),
                 wait_until="domcontentloaded",
                 timeout=self.timeout_ms,
             )
-            table = page.locator(selector)
-            if await table.count() == 0:
+            if response is None or response.status >= 400:
+                status = "no response" if response is None else response.status
+                raise RuntimeError(f"odds page returned {status}")
+
+            try:
+                await page.wait_for_function(
+                    """selector => {
+                        const text = `${document.title} ${document.body?.innerText || ''}`
+                            .toLowerCase();
+                        const errors = [
+                            'access denied', 'forbidden', 'request blocked', 'waf',
+                            '访问被拒绝', '禁止访问', '安全验证', '验证码'
+                        ];
+                        return errors.some(marker => text.includes(marker))
+                            || Boolean(document.querySelector(selector))
+                            || Boolean(document.querySelector('#odds, #odds2'))
+                            || Boolean(document.querySelector(
+                                'a[href*="handicap.aspx"], '
+                                + 'a[href*="1x2.aspx"], '
+                                + 'a[href*="overunder.aspx"]'
+                            ));
+                    }""",
+                    selector,
+                    timeout=self.timeout_ms,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                raise RuntimeError(
+                    "odds page missing expected market structure"
+                ) from error
+
+            state = await page.evaluate(
+                """selector => ({
+                    title: document.title || '',
+                    bodyText: document.body?.innerText || '',
+                    hasExpectedTable: Boolean(document.querySelector(selector)),
+                    hasMarketShell: Boolean(document.querySelector('#odds, #odds2')),
+                    hasMarketNavigation: Boolean(document.querySelector(
+                        'a[href*="handicap.aspx"], '
+                        + 'a[href*="1x2.aspx"], '
+                        + 'a[href*="overunder.aspx"]'
+                    ))
+                })""",
+                selector,
+            )
+            if not self._validate_page_state(state):
                 # 有些机构没有为本场提供某个市场；页面仍有导航但没有赔率表。
-                # 这是合法的“空结果”，不能让整场比赛抓取失败。
+                # 只有验证过市场页面骨架后，才允许解释为合法空结果。
                 return []
             return await self._extract_rows(page, selector)
         finally:
             await page.close()
+
+    @staticmethod
+    def _validate_page_state(state: Dict[str, Any]) -> bool:
+        """确认这是赔率市场页，并区分合法空市场与错误/拦截页面。"""
+
+        text = f"{state.get('title', '')} {state.get('bodyText', '')}".lower()
+        error_markers = (
+            "access denied",
+            "forbidden",
+            "request blocked",
+            "waf",
+            "访问被拒绝",
+            "禁止访问",
+            "安全验证",
+            "验证码",
+        )
+        if any(marker in text for marker in error_markers):
+            raise RuntimeError("odds page is a blocked or error page")
+        if state.get("hasExpectedTable"):
+            return True
+        if state.get("hasMarketShell") or state.get("hasMarketNavigation"):
+            return False
+        raise RuntimeError("odds page missing expected market structure")
 
     @staticmethod
     async def _extract_rows(page: Page, selector: str) -> List[RawRow]:

@@ -7,11 +7,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from playwright.async_api import Page, async_playwright
 
 from ..models import Match, MatchStatus
+from ..observability import RuntimeObservability
 from ..proxy import ProxyManager
-from .base import MatchProvider
 
 
-class Titan007Provider(MatchProvider):
+class Titan007Provider:
     """从 Titan007 已渲染的实时比分表收集比赛。
 
     页面会通过 JavaScript/WebSocket 创建并更新比赛行。直接读取最终 DOM，可以
@@ -30,12 +30,14 @@ class Titan007Provider(MatchProvider):
         timeout_ms: int = 30_000,
         settle_ms: int = 1_000,
         proxy_manager: ProxyManager,
+        observability: Optional[RuntimeObservability] = None,
     ) -> None:
         self.url = url
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.settle_ms = settle_ms
         self.proxy_manager = proxy_manager
+        self.observability = observability
 
     async def fetch_matches(self) -> List[Match]:
         """用一个临时浏览器抓取快照，并向代理管理器报告成败。"""
@@ -60,9 +62,21 @@ class Titan007Provider(MatchProvider):
             # 程序关闭不算代理失败，继续把取消信号向上传递。
             raise
         except Exception:
+            if self.observability is not None:
+                self.observability.increment(
+                    "page_requests_total",
+                    provider="titan007_list",
+                    result="failure",
+                )
             await self.proxy_manager.report_error()
             raise
         else:
+            if self.observability is not None:
+                self.observability.increment(
+                    "page_requests_total",
+                    provider="titan007_list",
+                    result="success",
+                )
             await self.proxy_manager.report_success()
             return matches
 
@@ -85,17 +99,36 @@ class Titan007Provider(MatchProvider):
         if self.settle_ms:
             await page.wait_for_timeout(self.settle_ms)
 
-        # evaluate_all 中的 JavaScript 在网页里执行，只把行 ID 和文本传回
-        # Python；这样后续解析无需依赖 Playwright，单元测试也更简单。
+        # 列表的时间单元格只显示 HH:MM。页面用于渲染行的 A 数组还保留了
+        # 年、月日和时间，必须在这里合并，避免列表刷新把详情页提供的完整
+        # 开赛时间覆盖成只有时分的值。
         rows: List[Dict[str, Any]] = await page.locator(
             self.ROW_SELECTOR
         ).evaluate_all(
-            """rows => rows.map(row => ({
-                rowId: row.id,
-                cells: Array.from(row.cells).map(cell =>
-                    (cell.innerText || '').replace(/\\s+/g, ' ').trim()
-                )
-            }))"""
+            """rows => rows.map(row => {
+                const index = Number.parseInt(row.getAttribute('index'), 10);
+                const matchData = Number.isInteger(index) ? window.A?.[index] : null;
+                const year = String(matchData?.[43] ?? '').trim();
+                const monthDay = String(matchData?.[36] ?? '').trim();
+                const clock = String(matchData?.[11] ?? '').trim();
+                const dateMatch = /^(\\d{4})-(\\d{1,2})-(\\d{1,2})$/.exec(
+                    `${year}-${monthDay}`
+                );
+                const timeMatch = /^(\\d{1,2}):(\\d{2})$/.exec(clock);
+                const scheduledTime = dateMatch && timeMatch
+                    ? `${dateMatch[1]}-${dateMatch[2].padStart(2, '0')}-${
+                        dateMatch[3].padStart(2, '0')
+                    } ${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}`
+                    : '';
+
+                return {
+                    rowId: row.id,
+                    scheduledTime,
+                    cells: Array.from(row.cells).map(cell =>
+                        (cell.innerText || '').replace(/\\s+/g, ' ').trim()
+                    )
+                };
+            })"""
         )
         return self.parse_rows(rows)
 
@@ -128,13 +161,18 @@ class Titan007Provider(MatchProvider):
         # Titan007 表格的列含义由页面结构决定，索引映射详见 FetchData/README。
         values = [cls._clean_text(value) for value in cells]
         league = values[1]
-        scheduled_time = values[2]
+        scheduled_time = cls._clean_text(row.get("scheduledTime"))
         status_text = values[3]
         home_team = values[4]
         score_text = values[5]
         away_team = values[6]
 
-        if not league or not home_team or not away_team:
+        if (
+            not league
+            or not home_team
+            or not away_team
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", scheduled_time)
+        ):
             return None
 
         score, home_score, away_score = cls._parse_score(score_text)

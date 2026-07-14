@@ -9,6 +9,7 @@ class Titan007ProviderTests(unittest.TestCase):
         match = Titan007Provider.parse_row(
             {
                 "rowId": "tr1_2978276",
+                "scheduledTime": "2026-07-14 19:35",
                 "cells": [
                     "",
                     "闽超",
@@ -33,11 +34,13 @@ class Titan007ProviderTests(unittest.TestCase):
         self.assertEqual(match.away_score, 0)
         self.assertIs(match.status, MatchStatus.LIVE)
         self.assertEqual(match.status_text, "90+1")
+        self.assertEqual(match.scheduled_time, "2026-07-14 19:35")
 
     def test_parse_scheduled_match_without_score(self) -> None:
         match = Titan007Provider.parse_row(
             {
                 "rowId": "tr1_3021895",
+                "scheduledTime": "2026-07-14 22:00",
                 "cells": [
                     "",
                     "俄甲",
@@ -56,10 +59,12 @@ class Titan007ProviderTests(unittest.TestCase):
         self.assertIsNone(match.home_score)
         self.assertIsNone(match.away_score)
         self.assertIs(match.status, MatchStatus.SCHEDULED)
+        self.assertEqual(match.scheduled_time, "2026-07-14 22:00")
 
     def test_invalid_and_duplicate_rows_are_ignored(self) -> None:
         valid = {
             "rowId": "tr1_123",
+            "scheduledTime": "2026-07-14 20:00",
             "cells": ["", "英超", "20:00", "完", "主队", "3-1", "客队"],
         }
         matches = Titan007Provider.parse_rows(
@@ -73,6 +78,7 @@ class Titan007ProviderTests(unittest.TestCase):
         match = Titan007Provider.parse_row(
             {
                 "rowId": "tr1_456",
+                "scheduledTime": "2026-07-14 20:00",
                 "cells": ["", "测试联赛", "20:00", "待定", "主队", "-", "客队"],
             }
         )
@@ -81,6 +87,17 @@ class Titan007ProviderTests(unittest.TestCase):
         assert match is not None
         self.assertIs(match.status, MatchStatus.UNKNOWN)
         self.assertEqual(match.status_text, "待定")
+
+    def test_row_without_full_scheduled_time_is_ignored(self) -> None:
+        match = Titan007Provider.parse_row(
+            {
+                "rowId": "tr1_789",
+                "scheduledTime": "20:00",
+                "cells": ["", "测试联赛", "20:00", "", "主队", "-", "客队"],
+            }
+        )
+
+        self.assertIsNone(match)
 
 
 if __name__ == "__main__":

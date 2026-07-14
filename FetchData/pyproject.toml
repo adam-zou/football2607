@@ -14,10 +14,12 @@ dependencies = [
 ]
 
 [project.scripts]
-fetch-matches = "fetch_data.cli:main"
 fetch-odds = "fetch_data.odds_cli:main"
 sync-match-status = "fetch_data.status_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fetch_data*"]
+
+[tool.setuptools.package-data]
+"fetch_data.migrations" = ["*.sql"]

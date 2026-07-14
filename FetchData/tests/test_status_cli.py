@@ -16,6 +16,10 @@ class StatusCliTests(unittest.TestCase):
         self.assertEqual(args.list_refresh_seconds, 60.0)
         self.assertEqual(args.detail_refresh_seconds, 60.0)
         self.assertEqual(args.detail_batch_size, 10)
+        self.assertEqual(args.odds_refresh_seconds, 5.0)
+        self.assertEqual(args.odds_batch_size, 1)
+        self.assertEqual(args.health_host, "127.0.0.1")
+        self.assertEqual(args.health_port, 8080)
 
     def test_database_url_can_be_loaded_from_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

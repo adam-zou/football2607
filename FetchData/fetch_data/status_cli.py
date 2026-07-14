@@ -9,8 +9,14 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
+from .observability import RuntimeObservability
+from .odds_postgres import PostgresOddsStore
 from .postgres import PostgresMatchStore
-from .providers import Titan007MatchDetailProvider, Titan007Provider
+from .providers import (
+    Titan007MatchDetailProvider,
+    Titan007OddsProvider,
+    Titan007Provider,
+)
 from .proxy import ProxyManager
 from .status_sync import MatchSynchronizer
 
@@ -45,37 +51,87 @@ def build_parser() -> argparse.ArgumentParser:
         help="detail rows persisted per batch (default: 10)",
     )
     parser.add_argument(
+        "--odds-refresh-seconds",
+        type=float,
+        default=5.0,
+        help="pending-odds refresh interval (default: 5 seconds)",
+    )
+    parser.add_argument(
+        "--odds-batch-size",
+        type=int,
+        default=1,
+        help="matches fully fetched per odds iteration (default: 1)",
+    )
+    parser.add_argument(
+        "--health-host",
+        default="127.0.0.1",
+        help="health and metrics listen address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=8080,
+        help="health and metrics port; 0 disables HTTP (default: 8080)",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
-        help="show the browsers used for list and detail refreshes",
+        help="show the browsers used for list, detail, and odds refreshes",
     )
     return parser
 
 
 async def run(args: argparse.Namespace) -> int:
-    """在一个地方组装存储层、两个网页 Provider 和同步调度器。"""
+    """在一个地方组装两个存储层、三个网页 Provider 和同步调度器。"""
 
     if not args.database_url:
         raise ValueError("--database-url or DATABASE_URL is required")
+    if not 0 <= args.health_port <= 65535:
+        raise ValueError("--health-port must be between 0 and 65535")
 
-    # 两个 Provider 共享同一个 ProxyManager，因此会复用代理及失败计数。
-    proxy_manager = ProxyManager.from_env()
+    # 三个 Provider 共享同一个 ProxyManager，因此会复用代理及失败计数。
+    observability = RuntimeObservability()
+    proxy_manager = ProxyManager.from_env(observability=observability)
     synchronizer = MatchSynchronizer(
         store=PostgresMatchStore(args.database_url),
         match_list=Titan007Provider(
             headless=not args.headed,
             proxy_manager=proxy_manager,
+            observability=observability,
         ),
         match_details=Titan007MatchDetailProvider(
             headless=not args.headed,
             proxy_manager=proxy_manager,
+            observability=observability,
+        ),
+        odds_store=PostgresOddsStore(args.database_url),
+        match_odds=Titan007OddsProvider(
+            headless=not args.headed,
+            proxy_manager=proxy_manager,
+            observability=observability,
         ),
         list_refresh_seconds=args.list_refresh_seconds,
         detail_refresh_seconds=args.detail_refresh_seconds,
         detail_batch_size=args.detail_batch_size,
+        odds_refresh_seconds=args.odds_refresh_seconds,
+        odds_batch_size=args.odds_batch_size,
+        observability=observability,
     )
-    # run() 是常驻循环，正常情况下会一直运行到用户按 Ctrl+C。
-    await synchronizer.run()
+    server = None
+    if args.health_port:
+        server = await observability.start_server(args.health_host, args.health_port)
+        logging.getLogger(__name__).info(
+            "health endpoints listening on http://%s:%d",
+            args.health_host,
+            args.health_port,
+        )
+    try:
+        # run() 是常驻循环，正常情况下会一直运行到用户按 Ctrl+C。
+        await synchronizer.run()
+    finally:
+        if server is not None:
+            server.close()
+            await server.wait_closed()
     return 0
 
 

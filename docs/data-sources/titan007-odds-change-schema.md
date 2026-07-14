@@ -14,7 +14,10 @@
 - `titan007_1x2_changes`
 - `titan007_over_under_changes`
 
-本文使用逻辑类型描述字段；具体数据库类型由实现时根据所选数据库映射。
+另使用 `titan007_odds_fetch_status` 记录每个比赛、公司和市场的完场最终记录
+是否与数据库一致。该表记录核验结果和最后 `seq`，不重复保存赔率值。
+
+本文先使用逻辑类型描述字段，实际 PostgreSQL 映射见“PostgreSQL 实现”。
 
 ## 采集机构范围
 
@@ -180,3 +183,57 @@ movement = "上升" | "下降" | "不变" | null
 - 封盘行中间是一个 `colspan="3"` 的“封”单元格，物理上只有 5 个 `td`；解析器必须展开为三个 `null` 市场值。
 - 赛前行前两个单元格为空，应解析为 `match_minute = null`、`home_score = null`、`away_score = null`。
 - 解析颜色时读取各市场单元格内部的 `font[color]`；空 `color` 属性和缺失颜色均映射为 `不变`。
+
+## PostgreSQL 实现
+
+三张表由唯一迁移源
+`FetchData/fetch_data/migrations/003_titan007_odds_changes.sql` 创建，实际类型规则如下：
+
+- `match_id` 使用 `BIGINT`，`company_id` 和 `seq` 使用 `INTEGER`。
+- 比赛分钟和比分使用可空 `SMALLINT`。
+- `change_time` 和 `source_status` 使用 `TEXT`；`change_time` 原样保存页面文本。
+- 赔率使用 `NUMERIC(8, 3)`，转换后的盘口使用 `NUMERIC(6, 2)`。
+- movement 使用可空 `TEXT`，并通过检查约束限制为 `上升`、`下降`、`不变`。
+- 三张表分别以 `(match_id, company_id, seq)` 为主键。
+- 封盘检查约束保证三个市场值、转换值和 movement 均为 `null`。
+
+一次 `fetch-odds` 执行将成功公司的三个市场抓取结果放在同一个 PostgreSQL
+事务中 upsert。公司是最小原子单元：三个市场页面全部成功才纳入本轮快照；
+任一页面失败时放弃该公司本轮的三个市场，但不影响其他成功公司。所有选中公司
+都失败时不产生快照。主键冲突时更新该行所有页面字段。
+
+页面在 `domcontentloaded` 后还必须通过 HTTP 状态、错误/拦截页关键字、市场容器
+或市场导航验证。只有确认是赔率市场页面但没有目标表格时才视为合法空市场；空
+市场不执行 INSERT，也不删除数据库已有记录。
+
+赔率表和采集状态表不外键依赖 `match_status`，因此命令可以接收尚未进入比赛
+同步队列的 Titan007 比赛 ID。若该比赛已进入同步队列，赔率写入后会执行共享
+完成判定；只有比赛状态为“完”、北京时间开赛时间已过去至少 3 小时，并且六家
+公司的三个市场最后一条数据均与数据库一致时，`crawl_status` 才更新为“已完成”。
+
+## 赔率页面采集状态
+
+`titan007_odds_fetch_status` 以 `(match_id, company_id)` 为主键，包含：
+
+- `handicap_completed`：完场后亚让最新记录与数据库一致；
+- `one_x_two_completed`：完场后胜平负最新记录与数据库一致；
+- `over_under_completed`：完场后进球数最新记录与数据库一致；
+- `*_last_seq`：本次通过核验的市场最高 `seq`；
+- `verification_version`：核验语义版本；当前最终记录核验为 `1`；
+- `final_verified_at`：三个市场同时通过最终记录核验的时间；
+- `created_at`：该比赛、公司核验状态行的首次创建时间。
+- `updated_at`：最近一次核验尝试的写入时间。
+
+三张赔率变化表同样包含 `created_at` 和 `updated_at`：首次写入时两者由数据库
+赋值；相同 `(match_id, company_id, seq)` 再次写入时保留 `created_at` 并刷新
+`updated_at`。
+
+只有 `match_basic_info.status_text = '完'` 且开赛已超过 3 小时时，存储层才在
+写入本次快照之前，取每个公司、市场最高 `seq` 的页面记录，与数据库上一次保存
+的最高 `seq` 记录进行空值安全的逐字段比较；完全一致才把该市场标志设为
+`true` 并保存最高 `seq`。若不一致，本次快照仍正常 upsert，但保持未完成，
+等待下一次抓取再次比较。页面没有赔率表时，
+若数据库同一比赛、公司、市场也没有任何记录，则“空对空”一致，标志为 `true`
+且 `*_last_seq = null`；数据库仍有记录则标志为 `false`。网络错误、超时或解析
+异常不会产生快照。旧版“请求成功”或基于历史行数推断的完成状态使用
+`verification_version = 0`，不参与比赛完成判定，必须重新抓取核验。

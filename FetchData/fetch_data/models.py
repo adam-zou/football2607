@@ -4,7 +4,7 @@
 对象，存储层和命令行层只消费对象，不需要知道网页 DOM 长什么样。
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -129,13 +129,14 @@ class OverUnderChange(OddsChange):
 
 @dataclass(frozen=True)
 class OddsSnapshot:
-    """一次命令抓到的完整赔率快照，按三个市场分别保存。"""
+    """一次抓取的赔率快照，记录成功公司和被放弃公司的失败原因。"""
 
     match_id: int
     companies: Dict[int, str]
     handicap_changes: List[HandicapChange]
     one_x_two_changes: List[OneXTwoChange]
     over_under_changes: List[OverUnderChange]
+    failed_companies: Dict[int, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
