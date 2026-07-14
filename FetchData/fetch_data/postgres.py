@@ -36,6 +36,31 @@ INITIALIZE_MATCH_STATUS_TABLE = load_migrations(
 )
 
 
+FETCH_PENDING_DETAIL_IDS = """
+SELECT match_id
+FROM match_status
+WHERE detail_status = '未完成'
+ORDER BY match_id
+"""
+
+
+FETCH_FINAL_STATUS_REPAIR_IDS = """
+SELECT status.match_id
+FROM match_status AS status
+JOIN match_basic_info AS basic ON basic.match_id = status.match_id
+WHERE status.detail_status = '已完成'
+  AND status.crawl_status = '未完成'
+  AND basic.status_text <> '完'
+  AND basic.scheduled_at <= NOW() - INTERVAL '3 hours'
+  AND basic.dynamic_updated_at <= NOW() - INTERVAL '10 minutes'
+  AND (
+      status.final_status_checked_at IS NULL
+      OR status.final_status_checked_at <= NOW() - INTERVAL '30 minutes'
+  )
+ORDER BY basic.scheduled_at, status.match_id
+"""
+
+
 class PostgresMatchStore:
     """负责建表、查询待抓 ID，以及批量写入比赛信息。"""
 
@@ -44,12 +69,12 @@ class PostgresMatchStore:
         self._connection: Optional[Connection] = None
         # 两个同步任务共享一条 psycopg2 连接。Lock 保证同一时刻只有一个线程
         # 操作它，因为 psycopg2 连接上的事务不能在这里并发交错。
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
 
     async def initialize(self) -> None:
         """连接数据库、取得进程锁并初始化表结构。"""
 
-        async with self._lock:
+        async with self._get_lock():
             await asyncio.to_thread(self._initialize_sync)
 
     async def upsert_match_list(self, matches: Sequence[Match]) -> None:
@@ -57,14 +82,22 @@ class PostgresMatchStore:
 
         if not matches:
             return
-        async with self._lock:
+        async with self._get_lock():
             await asyncio.to_thread(self._upsert_match_list_sync, matches)
 
-    async def fetch_pending_match_ids(self) -> List[int]:
-        """查询尚未完成详情采集的比赛 ID。"""
+    async def fetch_pending_detail_ids(self) -> List[int]:
+        """查询静态详情尚未成功保存的比赛 ID。"""
 
-        async with self._lock:
-            return await asyncio.to_thread(self._fetch_pending_match_ids_sync)
+        async with self._get_lock():
+            return await asyncio.to_thread(self._fetch_pending_detail_ids_sync)
+
+    async def fetch_final_status_repair_ids(self) -> List[int]:
+        """查询列表动态信息过期、需要详情页补偿的比赛 ID。"""
+
+        async with self._get_lock():
+            return await asyncio.to_thread(
+                self._fetch_final_status_repair_ids_sync
+            )
 
     async def upsert_match_details(
         self,
@@ -74,16 +107,32 @@ class PostgresMatchStore:
 
         if not details:
             return
-        async with self._lock:
+        async with self._get_lock():
             await asyncio.to_thread(self._upsert_match_details_sync, details)
+
+    async def repair_final_statuses(
+        self,
+        details: Sequence[MatchBasicInfo],
+    ) -> None:
+        """使用详情页的完场结果修复列表任务错过的最终比分和状态。"""
+
+        if not details:
+            return
+        async with self._get_lock():
+            await asyncio.to_thread(self._repair_final_statuses_sync, details)
 
     async def close(self) -> None:
         """关闭共享连接；重复调用也安全。"""
 
-        async with self._lock:
+        async with self._get_lock():
             if self._connection is not None:
                 await asyncio.to_thread(self._connection.close)
                 self._connection = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def _initialize_sync(self) -> None:
         """同步版初始化逻辑，只应由上面的异步包装方法调用。"""
@@ -149,6 +198,7 @@ class PostgresMatchStore:
                         home_score = snapshot.home_score::SMALLINT,
                         away_score = snapshot.away_score::SMALLINT,
                         status_text = snapshot.status_text,
+                        dynamic_updated_at = NOW(),
                         updated_at = NOW()
                     FROM (VALUES %s) AS snapshot(
                         match_id,
@@ -167,20 +217,22 @@ class PostgresMatchStore:
                     [int(match.match_id) for match in matches],
                 )
 
-    def _fetch_pending_match_ids_sync(self) -> List[int]:
+    def _fetch_pending_detail_ids_sync(self) -> List[int]:
         if self._connection is None:
             raise RuntimeError("PostgresMatchStore is not initialized")
 
         with self._connection:
             with self._connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT match_id
-                    FROM match_status
-                    WHERE crawl_status = '未完成'
-                    ORDER BY match_id
-                    """
-                )
+                cursor.execute(FETCH_PENDING_DETAIL_IDS)
+                return [int(row[0]) for row in cursor.fetchall()]
+
+    def _fetch_final_status_repair_ids_sync(self) -> List[int]:
+        if self._connection is None:
+            raise RuntimeError("PostgresMatchStore is not initialized")
+
+        with self._connection:
+            with self._connection.cursor() as cursor:
+                cursor.execute(FETCH_FINAL_STATUS_REPAIR_IDS)
                 return [int(row[0]) for row in cursor.fetchall()]
 
     def _upsert_match_details_sync(
@@ -247,9 +299,74 @@ class PostgresMatchStore:
                     """,
                     values,
                 )
+                cursor.execute(
+                    """
+                    UPDATE match_status
+                    SET detail_status = '已完成',
+                        updated_at = NOW()
+                    WHERE match_id = ANY(%s::BIGINT[])
+                    """,
+                    ([detail.match_id for detail in details],),
+                )
                 # 完整 scheduled_time 后续归列表任务所有；但旧版本写入的纯
                 # HH:MM 会由详情页自动修复。比分和状态仍不从详情页倒灌。
                 mark_matches_completed(
                     cursor,
                     [detail.match_id for detail in details],
                 )
+
+    def _repair_final_statuses_sync(
+        self,
+        details: Sequence[MatchBasicInfo],
+    ) -> None:
+        if self._connection is None:
+            raise RuntimeError("PostgresMatchStore is not initialized")
+
+        values = [
+            (
+                detail.match_id,
+                detail.home_score,
+                detail.away_score,
+                detail.status_text,
+            )
+            for detail in details
+        ]
+        match_ids = [detail.match_id for detail in details]
+        with self._connection:
+            with self._connection.cursor() as cursor:
+                execute_values(
+                    cursor,
+                    """
+                    UPDATE match_basic_info AS basic
+                    SET home_score = COALESCE(
+                            repair.home_score::SMALLINT,
+                            basic.home_score
+                        ),
+                        away_score = COALESCE(
+                            repair.away_score::SMALLINT,
+                            basic.away_score
+                        ),
+                        status_text = repair.status_text,
+                        dynamic_updated_at = NOW(),
+                        updated_at = NOW()
+                    FROM (VALUES %s) AS repair(
+                        match_id,
+                        home_score,
+                        away_score,
+                        status_text
+                    )
+                    WHERE basic.match_id = repair.match_id::BIGINT
+                      AND repair.status_text = '完'
+                    """,
+                    values,
+                )
+                cursor.execute(
+                    """
+                    UPDATE match_status
+                    SET final_status_checked_at = NOW(),
+                        updated_at = NOW()
+                    WHERE match_id = ANY(%s::BIGINT[])
+                    """,
+                    (match_ids,),
+                )
+                mark_matches_completed(cursor, match_ids)

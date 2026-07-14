@@ -14,6 +14,7 @@ class FakeStore:
         self.matches = {}
         self.details = {}
         self.detail_batch_sizes: List[int] = []
+        self.repaired_details = {}
 
     async def initialize(self) -> None:
         self.initialized = True
@@ -22,8 +23,11 @@ class FakeStore:
         for match in matches:
             self.matches[int(match.match_id)] = match
 
-    async def fetch_pending_match_ids(self) -> List[int]:
+    async def fetch_pending_detail_ids(self) -> List[int]:
         return list(range(1, 13))
+
+    async def fetch_final_status_repair_ids(self) -> List[int]:
+        return [50]
 
     async def upsert_match_details(
         self,
@@ -32,6 +36,13 @@ class FakeStore:
         self.detail_batch_sizes.append(len(details))
         for detail in details:
             self.details[detail.match_id] = detail
+
+    async def repair_final_statuses(
+        self,
+        details: Sequence[MatchBasicInfo],
+    ) -> None:
+        for detail in details:
+            self.repaired_details[detail.match_id] = detail
 
     async def close(self) -> None:
         self.closed = True
@@ -59,6 +70,7 @@ class FakeMatchList:
 class FakeMatchDetails:
     def __init__(self) -> None:
         self.requested_match_ids: List[int] = []
+        self.requests: List[List[int]] = []
         self.batch_size = 0
 
     async def fetch_match_detail_batches(
@@ -68,6 +80,7 @@ class FakeMatchDetails:
         batch_size: int,
     ) -> AsyncIterator[List[MatchBasicInfo]]:
         self.requested_match_ids = list(match_ids)
+        self.requests.append(list(match_ids))
         self.batch_size = batch_size
         for start in range(0, len(match_ids), batch_size):
             yield [
@@ -174,10 +187,11 @@ class MatchSyncTests(unittest.TestCase):
         self.assertTrue(odds_store.initialized)
         self.assertTrue(odds_store.closed)
         self.assertEqual(list(store.matches), [100])
-        self.assertEqual(match_details.requested_match_ids, list(range(1, 13)))
+        self.assertEqual(match_details.requests, [list(range(1, 13)), [50]])
         self.assertEqual(match_details.batch_size, 10)
         self.assertEqual(store.detail_batch_sizes, [10, 2])
         self.assertEqual(store.details[12].home_team, "主队12")
+        self.assertEqual(store.repaired_details[50].home_team, "主队50")
         self.assertEqual(odds_store.requested_limits, [1])
         self.assertEqual(odds_store.attempted_match_ids, [200])
         self.assertEqual(match_odds.requested_match_ids, [200])
@@ -188,6 +202,9 @@ class MatchSyncTests(unittest.TestCase):
         )
         self.assertIn(
             'football_queue_pending{queue="match_odds"} 1', metrics
+        )
+        self.assertIn(
+            'football_queue_pending{queue="final_status_repair"} 1', metrics
         )
 
 

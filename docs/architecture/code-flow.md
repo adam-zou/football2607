@@ -15,6 +15,7 @@ flowchart LR
     SyncMatches["sync-match-status"]
     FetchOdds["fetch-odds"]
     Proxy["ProxyManager"]
+    Dashboard["Human dashboard /"]
     Health["/healthz"]
     Metrics["/metrics"]
 
@@ -33,6 +34,7 @@ flowchart LR
     SyncMatches --> OneXTwoOdds
     SyncMatches --> OverUnderOdds
     Proxy --> SyncMatches
+    SyncMatches --> Dashboard
     SyncMatches --> Health
     SyncMatches --> Metrics
     Proxy --> FetchOdds
@@ -82,14 +84,21 @@ flowchart TD
     end
 
     subgraph DetailTask["Match-detail task"]
-        D1["Query crawl_status = 未完成"] --> D2["Split IDs into configured batches<br/>default 10"]
+        D1["Query detail_status = 未完成"] --> D2["Split IDs into configured batches<br/>default 10"]
         D2 --> D3["Fetch {match_id}sb.htm<br/>concurrency 2"]
         D3 --> D4["Parse crown simplified names,<br/>league, time, score and page status"]
-        D4 --> D5["Immediately upsert this batch"]
+        D4 --> D5["Immediately upsert this batch<br/>Mark detail_status = 已完成"]
         D5 --> D6["Evaluate crawl completion"]
         D6 --> D7{"More ID batches?"}
         D7 -->|Yes| D3
-        D7 -->|No| D8["Wait detail_refresh_seconds<br/>default 60s"]
+        D7 -->|No| R1["Query stale final-status repairs"]
+        R1 --> R2["Take at most detail_batch_size"]
+        R2 --> R3["Fetch detail page again"]
+        R3 --> R4{"Page status = 完?"}
+        R4 -->|Yes| R5["Repair final score and status<br/>Refresh dynamic_updated_at"]
+        R4 -->|No| R6["Record final_status_checked_at only"]
+        R5 --> D8["Wait detail_refresh_seconds<br/>default 60s"]
+        R6 --> D8
         D8 --> D1
     end
 
@@ -107,6 +116,8 @@ another.
 | --- | --- | --- |
 | `match_id` | Match-list task | Match-list task discovers new IDs |
 | `crawl_status` | Database default `未完成` | Shared completion evaluator after list, detail, or odds writes |
+| `detail_status` | Database default `未完成` | Detail task changes it to `已完成` after required static fields are stored |
+| `final_status_checked_at` | Empty | Detail compensation records successful repair-page checks; candidates cool down for 30 minutes |
 | `source` | Detail task | Detail task |
 | `league` | Detail task | Detail task |
 | `home_team` / `away_team` | Detail task from `sb.htm` | Detail task |
@@ -114,6 +125,7 @@ another.
 | `scheduled_at` | Derived from `scheduled_time` in Asia/Shanghai | Updated by whichever task owns the accepted `scheduled_time` value |
 | `home_score` / `away_score` | Detail task initially | Match-list task |
 | `status_text` | Detail task initially | Match-list task |
+| `dynamic_updated_at` | Database default | Match-list task; detail compensation only when the detail page explicitly reports `完` |
 | `created_at` | Database default | Never changed after insert |
 | `updated_at` | Database default | Refreshed by each successful row update |
 
@@ -136,6 +148,9 @@ CREATE TABLE match_status (
     match_id BIGINT PRIMARY KEY,
     crawl_status TEXT NOT NULL DEFAULT '未完成'
         CHECK (crawl_status IN ('未完成', '已完成')),
+    detail_status TEXT NOT NULL DEFAULT '未完成'
+        CHECK (detail_status IN ('未完成', '已完成')),
+    final_status_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -153,6 +168,7 @@ CREATE TABLE match_basic_info (
     away_team TEXT NOT NULL,
     scheduled_time TEXT NOT NULL,
     scheduled_at TIMESTAMPTZ,
+    dynamic_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     home_score SMALLINT,
     away_score SMALLINT,
     status_text TEXT NOT NULL,
@@ -270,7 +286,7 @@ is also empty.
 | `fetch_data/proxy.py` | Proxy acquisition, validation, caching and rotation |
 | `fetch_data/status_sync.py` | Independent list, detail, and odds task orchestration |
 | `fetch_data/postgres.py` | Schema initialization, queries, transactions and upserts |
-| `fetch_data/observability.py` | Metrics registry, Prometheus rendering, and health HTTP server |
+| `fetch_data/observability.py` | Human dashboard, metrics registry, Prometheus rendering, and health HTTP server |
 | `fetch_data/status_cli.py` | Continuous synchronization composition root |
 | `fetch_data/odds_cli.py` | One-shot odds CLI |
 
@@ -286,22 +302,30 @@ is also empty.
 - Each task waits its configured interval after its current iteration finishes;
   the interval is not a wall-clock schedule.
 - Detail pages have a 30-second timeout and are fetched with concurrency 2.
-  Pending IDs are split into configurable batches (default 10), and each batch is
-  persisted as soon as it finishes without waiting for the entire pending queue.
+  Only `detail_status = 未完成` IDs enter the static-detail queue. IDs are split
+  into configurable batches (default 10), and each successful batch is persisted
+  and marked `detail_status = 已完成` immediately.
+- Final-status compensation is independent from static detail collection. A match
+  becomes eligible when it is still unfinished three hours after `scheduled_at`,
+  its list-owned dynamic data is at least 10 minutes old, and no repair check ran
+  in the last 30 minutes. At most `detail_batch_size` candidates are checked per
+  detail iteration. Only an explicit detail-page `status_text = 完` may repair the
+  final score/status; other successful checks only update the cooldown timestamp.
 - The odds task defaults to one complete match per iteration and waits 5 seconds
   after the iteration finishes. It selects unfinished matches by oldest odds-status
   attempt (never-attempted first). An attempt updates queue recency without clearing
   verification flags even when page collection fails, so a bad or ongoing match
   cannot starve later IDs. Each match uses the provider's six-page concurrency to
   collect 18 pages.
-- `sync-match-status` exposes `/healthz` and `/metrics` on `127.0.0.1:8080` by
-  default. `--health-host` changes the bind address and `--health-port 0` disables
-  HTTP. Metrics cover task attempts, failures and durations, page outcomes, detail
-  and final-verification backlog, proxy refresh/validation/invalidation, and partial
-  company failures.
-- Matches remain in the detail queue until the status, three-hour threshold, and
-  six-company final-odds verification conditions all hold. Completed matches are not
-  selected by subsequent detail-task iterations.
+- `sync-match-status` exposes a human-readable dashboard at `/`, JSON health at
+  `/healthz`, and Prometheus metrics at `/metrics` on `127.0.0.1:8080` by default.
+  The dashboard summarizes component health, task outcomes, latest durations, and
+  pending queues, and refreshes every 10 seconds. `--health-host` changes the bind
+  address and `--health-port 0` disables HTTP. Metrics cover task attempts,
+  failures and durations, page outcomes, detail and final-verification backlog,
+  proxy refresh/validation/invalidation, and partial company failures.
+- Static details leave the detail queue immediately after a successful write;
+  `crawl_status` and final odds verification no longer cause repeated detail fetches.
 - Packaged files under `fetch_data/migrations/` are the only PostgreSQL DDL source.
   Both stores load those resources at runtime, and package data configuration keeps
   them available in installed wheels.

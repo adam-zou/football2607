@@ -25,10 +25,19 @@ class MatchStore(Protocol):
     async def upsert_match_list(self, matches: Sequence[Match]) -> None:
         ...
 
-    async def fetch_pending_match_ids(self) -> List[int]:
+    async def fetch_pending_detail_ids(self) -> List[int]:
+        ...
+
+    async def fetch_final_status_repair_ids(self) -> List[int]:
         ...
 
     async def upsert_match_details(
+        self,
+        details: Sequence[MatchBasicInfo],
+    ) -> None:
+        ...
+
+    async def repair_final_statuses(
         self,
         details: Sequence[MatchBasicInfo],
     ) -> None:
@@ -200,7 +209,7 @@ class MatchSynchronizer:
             started = time.monotonic()
             self.observability.increment("fetch_attempts_total", task="match_detail")
             try:
-                match_ids = await self.store.fetch_pending_match_ids()
+                match_ids = await self.store.fetch_pending_detail_ids()
                 stored = 0
                 self.observability.set_gauge(
                     "queue_pending", len(match_ids), queue="match_detail"
@@ -227,7 +236,32 @@ class MatchSynchronizer:
                         stored,
                         len(match_ids),
                     )
-                if stored == len(match_ids):
+                repair_ids = await self.store.fetch_final_status_repair_ids()
+                self.observability.set_gauge(
+                    "queue_pending",
+                    len(repair_ids),
+                    queue="final_status_repair",
+                )
+                selected_repairs = repair_ids[: self.detail_batch_size]
+                repaired = 0
+                if selected_repairs:
+                    async for details in (
+                        self.match_details.fetch_match_detail_batches(
+                            selected_repairs,
+                            batch_size=self.detail_batch_size,
+                        )
+                    ):
+                        await self.store.repair_final_statuses(details)
+                        repaired += len(details)
+                    logger.info(
+                        "checked %d of %d stale final statuses",
+                        repaired,
+                        len(repair_ids),
+                    )
+
+                detail_healthy = stored == len(match_ids)
+                repair_healthy = repaired == len(selected_repairs)
+                if detail_healthy and repair_healthy:
                     self.observability.increment(
                         "fetch_success_total", task="match_detail"
                     )
@@ -239,7 +273,8 @@ class MatchSynchronizer:
                     self.observability.record_health(
                         "match_detail",
                         False,
-                        f"stored {stored} of {len(match_ids)} pending details",
+                        f"stored {stored} of {len(match_ids)} details; "
+                        f"repaired {repaired} of {len(selected_repairs)} finals",
                     )
             except asyncio.CancelledError:
                 raise

@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS match_basic_info (
     away_team TEXT NOT NULL,
     scheduled_time TEXT NOT NULL,
     scheduled_at TIMESTAMPTZ,
+    dynamic_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     home_score SMALLINT,
     away_score SMALLINT,
     status_text TEXT NOT NULL,
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS match_basic_info (
 
 ALTER TABLE match_basic_info
     ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS dynamic_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
@@ -22,3 +24,7 @@ UPDATE match_basic_info
 SET scheduled_at = scheduled_time::TIMESTAMP AT TIME ZONE 'Asia/Shanghai'
 WHERE scheduled_at IS NULL
   AND scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$';
+
+CREATE INDEX IF NOT EXISTS idx_match_basic_info_final_repair
+ON match_basic_info(scheduled_at, dynamic_updated_at)
+WHERE status_text <> '完';
