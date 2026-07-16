@@ -81,7 +81,7 @@ class RuntimeObservabilityTests(unittest.TestCase):
             observability.increment(
                 "fetch_success_total", amount=3, task="match_list"
             )
-            observability.increment("fetch_failures_total", task="match_list")
+            observability.increment("fetch_failure_total", task="match_list")
             observability.set_gauge("queue_pending", 12, queue="match_detail")
             server = await observability.start_server("127.0.0.1", 0)
             try:
@@ -103,8 +103,11 @@ class RuntimeObservabilityTests(unittest.TestCase):
             self.assertIn("足球数据采集状态", page)
             self.assertIn("部分异常", page)
             self.assertIn("比赛列表", page)
+            self.assertIn("从列表页发现新的比赛 ID", page)
+            self.assertIn("首次补充联赛和球队等基础信息", page)
             self.assertIn("列表页面超时", page)
             self.assertIn("成功 3 次", page)
+            self.assertIn("失败 1 次", page)
             self.assertIn("待处理 12 场", page)
 
         asyncio.run(exercise())

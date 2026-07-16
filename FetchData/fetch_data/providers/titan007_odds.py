@@ -10,6 +10,8 @@ from playwright.async_api import Browser, Page, async_playwright
 from ..models import (
     HandicapChange,
     Movement,
+    OddsMarketRequest,
+    OddsMarketResult,
     OddsSnapshot,
     OneXTwoChange,
     OverUnderChange,
@@ -44,6 +46,11 @@ class Titan007OddsProvider:
         "handicap": ("handicap.aspx", "#odds2 table"),
         "one_x_two": ("1x2.aspx", "#odds table"),
         "over_under": ("overunder.aspx", "#odds2 table"),
+    }
+    MARKET_LABELS = {
+        "handicap": "亚让",
+        "one_x_two": "胜平负",
+        "over_under": "进球数",
     }
 
     # 中文盘口转为可计算数值；“受让”符号在 parse_handicap_value 中处理。
@@ -85,7 +92,7 @@ class Titan007OddsProvider:
         self,
         *,
         headless: bool = True,
-        timeout_ms: int = 30_000,
+        timeout_ms: int = 10_000,
         max_concurrency: int = 6,
         proxy_manager: ProxyManager,
         observability: Optional[RuntimeObservability] = None,
@@ -99,16 +106,43 @@ class Titan007OddsProvider:
         self.max_concurrency = max_concurrency
         self.proxy_manager = proxy_manager
         self.observability = observability
+        # 一个 Provider 可同时抓多场比赛；信号量必须属于 Provider，才能限制
+        # 整个进程的赔率页面总并发，而不是让每场比赛各自获得一份额度。
+        self._page_semaphore: Optional[asyncio.Semaphore] = None
+
+    def _get_page_semaphore(self) -> asyncio.Semaphore:
+        if self._page_semaphore is None:
+            self._page_semaphore = asyncio.Semaphore(self.max_concurrency)
+        return self._page_semaphore
+
+    async def refresh_proxy(self) -> None:
+        """系统性整场失败后强制更新并验证共享代理。"""
+
+        await self.proxy_manager.force_refresh()
 
     async def fetch_match_odds(
         self,
         match_id: int,
         company_ids: Optional[Sequence[int]] = None,
+        market_requests: Optional[Sequence[OddsMarketRequest]] = None,
     ) -> OddsSnapshot:
-        """并发抓取“市场 × 机构”的全部页面，再按市场汇总为快照。"""
+        """并发抓取指定机构市场页面，并逐页保留成功和失败结果。"""
 
         match_id = self._validate_match_id(match_id)
-        selected_companies = self._validate_company_ids(company_ids)
+        if company_ids is not None and market_requests is not None:
+            raise ValueError("company_ids and market_requests cannot be used together")
+        if market_requests is None:
+            selected_companies = self._validate_company_ids(company_ids)
+            requests = [
+                OddsMarketRequest(company_id, market)
+                for company_id in selected_companies
+                for market in self.MARKETS
+            ]
+        else:
+            requests = self._validate_market_requests(market_requests)
+            selected_companies = list(
+                dict.fromkeys(request.company_id for request in requests)
+            )
 
         proxy = await self.proxy_manager.get_proxy()
         try:
@@ -118,9 +152,9 @@ class Titan007OddsProvider:
                     proxy=proxy.playwright_options(),
                 )
                 try:
-                    # 默认 6 家机构 × 3 个市场 = 18 页。Semaphore 防止 18 页
-                    # 同时打开，降低本机资源和目标网站压力。
-                    semaphore = asyncio.Semaphore(self.max_concurrency)
+                    # 默认 6 家机构 × 3 个市场 = 18 页。多个比赛共享同一
+                    # Semaphore，避免跨比赛并发时把页面数量成倍放大。
+                    semaphore = self._get_page_semaphore()
 
                     async def fetch_one(
                         market: str,
@@ -140,23 +174,19 @@ class Titan007OddsProvider:
                                 company_id=company_id,
                             )
 
-                    requests = [
-                        (company_id, market)
-                        for company_id in selected_companies
-                        for market in self.MARKETS
-                    ]
-                    # 单页失败不取消其他公司的请求。公司是最小原子单元：
-                    # 三个市场必须全部成功，本轮才会进入快照。
+                    # 单页失败不取消其他页面；机构市场页面是最小保存和重试单位。
                     page_results = await asyncio.gather(
                         *(
-                            fetch_one(market, company_id)
-                            for company_id, market in requests
+                            fetch_one(request.market, request.company_id)
+                            for request in requests
                         ),
                         return_exceptions=True,
                     )
-                    failure_reasons: Dict[int, List[str]] = {}
                     successful_results = []
-                    for (company_id, market), result in zip(requests, page_results):
+                    market_results: List[OddsMarketResult] = []
+                    for request, result in zip(requests, page_results):
+                        company_id = request.company_id
+                        market = request.market
                         if isinstance(result, asyncio.CancelledError):
                             raise result
                         if isinstance(result, BaseException):
@@ -167,15 +197,18 @@ class Titan007OddsProvider:
                                     provider="titan007_odds",
                                     market=market,
                                 )
-                            failure_reasons.setdefault(company_id, []).append(
-                                f"{market}: {result}"
+                            market_results.append(
+                                OddsMarketResult(
+                                    request=request,
+                                    succeeded=False,
+                                    error=str(result) or result.__class__.__name__,
+                                )
                             )
                             logger.warning(
-                                "discarding company %d for match %d because %s "
-                                "collection failed: %s",
-                                company_id,
+                                "比赛 %d 的公司 %d 的%s页面采集失败，本页稍后重试：%s",
                                 match_id,
-                                market,
+                                company_id,
+                                self.MARKET_LABELS[market],
                                 result,
                             )
                         else:
@@ -187,25 +220,25 @@ class Titan007OddsProvider:
                                     market=market,
                                 )
                             successful_results.append((company_id, market, result))
+                            market_results.append(
+                                OddsMarketResult(request=request, succeeded=True)
+                            )
 
-                    successful_companies = [
-                        company_id
-                        for company_id in selected_companies
-                        if company_id not in failure_reasons
-                    ]
-                    if not successful_companies:
-                        raise RuntimeError(
-                            f"all selected companies failed for match {match_id}"
+                    successful_companies = list(
+                        dict.fromkeys(
+                            company_id
+                            for company_id, _, _ in successful_results
                         )
+                    )
                     if self.observability is not None:
                         self.observability.increment(
-                            "odds_companies_total",
-                            len(successful_companies),
+                            "odds_market_pages_total",
+                            len(successful_results),
                             result="success",
                         )
                         self.observability.increment(
-                            "odds_companies_total",
-                            len(failure_reasons),
+                            "odds_market_pages_total",
+                            len(requests) - len(successful_results),
                             result="failure",
                         )
                 finally:
@@ -217,7 +250,13 @@ class Titan007OddsProvider:
             await self.proxy_manager.report_error()
             raise
         else:
-            await self.proxy_manager.report_success()
+            # 页面级异常会被保留在 OddsSnapshot 中，不会冒泡到上面的 except。
+            # 只有至少一个页面成功，才能证明当前代理链路仍然可用；全部页面
+            # 失败时必须累计代理错误，让配置的轮换阈值正常生效。
+            if successful_results:
+                await self.proxy_manager.report_success()
+            else:
+                await self.proxy_manager.report_error()
 
         # fetch_one 为了能统一并发返回联合类型；这里按 market 拆回三个强类型
         # 列表，供 OddsSnapshot 和 JSON 消费者使用。
@@ -225,8 +264,6 @@ class Titan007OddsProvider:
         one_x_two_changes: List[OneXTwoChange] = []
         over_under_changes: List[OverUnderChange] = []
         for company_id, market, changes in successful_results:
-            if company_id not in successful_companies:
-                continue
             if market == "handicap":
                 handicap_changes.extend(changes)  # type: ignore[arg-type]
             elif market == "one_x_two":
@@ -243,11 +280,27 @@ class Titan007OddsProvider:
             handicap_changes=handicap_changes,
             one_x_two_changes=one_x_two_changes,
             over_under_changes=over_under_changes,
-            failed_companies={
-                company_id: "; ".join(reasons)
-                for company_id, reasons in failure_reasons.items()
-            },
+            market_results=market_results,
         )
+
+    def _validate_market_requests(
+        self,
+        requests: Sequence[OddsMarketRequest],
+    ) -> List[OddsMarketRequest]:
+        if not requests:
+            raise ValueError("market_requests must not be empty")
+        validated: List[OddsMarketRequest] = []
+        seen = set()
+        for request in requests:
+            if request.company_id not in self.COMPANIES:
+                raise ValueError(f"unsupported company ID: {request.company_id}")
+            if request.market not in self.MARKETS:
+                raise ValueError(f"unsupported market: {request.market}")
+            key = (request.company_id, request.market)
+            if key not in seen:
+                validated.append(request)
+                seen.add(key)
+        return validated
 
     async def _fetch_page_rows(
         self,
@@ -270,8 +323,8 @@ class Titan007OddsProvider:
                 timeout=self.timeout_ms,
             )
             if response is None or response.status >= 400:
-                status = "no response" if response is None else response.status
-                raise RuntimeError(f"odds page returned {status}")
+                status = "无响应" if response is None else response.status
+                raise RuntimeError(f"赔率页面返回 HTTP {status}")
 
             try:
                 await page.wait_for_function(
@@ -291,14 +344,14 @@ class Titan007OddsProvider:
                                 + 'a[href*="overunder.aspx"]'
                             ));
                     }""",
-                    selector,
+                    arg=selector,
                     timeout=self.timeout_ms,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 raise RuntimeError(
-                    "odds page missing expected market structure"
+                    "赔率页面缺少预期的市场结构"
                 ) from error
 
             state = await page.evaluate(
@@ -339,12 +392,12 @@ class Titan007OddsProvider:
             "验证码",
         )
         if any(marker in text for marker in error_markers):
-            raise RuntimeError("odds page is a blocked or error page")
+            raise RuntimeError("赔率页面是拦截页或错误页")
         if state.get("hasExpectedTable"):
             return True
         if state.get("hasMarketShell") or state.get("hasMarketNavigation"):
             return False
-        raise RuntimeError("odds page missing expected market structure")
+        raise RuntimeError("赔率页面缺少预期的市场结构")
 
     @staticmethod
     async def _extract_rows(page: Page, selector: str) -> List[RawRow]:

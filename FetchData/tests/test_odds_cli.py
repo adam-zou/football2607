@@ -13,6 +13,7 @@ class OddsCliTests(unittest.TestCase):
 
         self.assertEqual(args.match_id, 3020831)
         self.assertIsNone(args.company_ids)
+        self.assertEqual(args.timeout, 10.0)
         self.assertEqual(args.concurrency, 6)
 
     def test_company_filter_can_be_repeated(self) -> None:
@@ -86,9 +87,9 @@ class OddsCliTests(unittest.TestCase):
         self.assertIs(store.snapshot, snapshot)
         self.assertTrue(store.closed)
         self.assertEqual(provider.request, (3020831, [3]))
-        self.assertIn("stored odds changes", output.call_args.args[0])
-        self.assertIn("companies=3", output.call_args.args[0])
-        self.assertIn("failed_companies=-", output.call_args.args[0])
+        self.assertIn("赔率变化已保存", output.call_args.args[0])
+        self.assertIn("成功页面=3", output.call_args.args[0])
+        self.assertIn("失败页面=-", output.call_args.args[0])
 
     def test_run_requires_database_url(self) -> None:
         args = argparse.Namespace(database_url=None)

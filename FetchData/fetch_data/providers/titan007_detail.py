@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import re
-from typing import AsyncIterator, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Any, Dict, List, Optional, Sequence, Tuple
 
 from playwright.async_api import Browser, async_playwright
 
@@ -27,7 +27,7 @@ class Titan007MatchDetailProvider:
         url_template: str = DEFAULT_URL_TEMPLATE,
         *,
         headless: bool = True,
-        timeout_ms: int = 30_000,
+        timeout_ms: int = 10_000,
         max_concurrency: int = 2,
         proxy_manager: ProxyManager,
         observability: Optional[RuntimeObservability] = None,
@@ -87,7 +87,7 @@ class Titan007MatchDetailProvider:
                             # 返回 None，由下面的列表推导过滤。
                             await self.proxy_manager.report_error()
                             logger.exception(
-                                "failed to fetch titan007 detail for match %d",
+                                "抓取比赛 %d 的 Titan007 详情失败",
                                 match_id,
                             )
                             return None
@@ -153,20 +153,6 @@ class Titan007MatchDetailProvider:
             return self.parse_detail(raw)
         finally:
             await page.close()
-
-    @classmethod
-    def parse_details(
-        cls,
-        rows: Iterable[Dict[str, Any]],
-    ) -> List[MatchBasicInfo]:
-        """批量解析测试或其他调用方提供的原始详情字典。"""
-
-        details: List[MatchBasicInfo] = []
-        for row in rows:
-            detail = cls.parse_detail(row)
-            if detail is not None:
-                details.append(detail)
-        return details
 
     @classmethod
     def parse_detail(cls, row: Dict[str, Any]) -> Optional[MatchBasicInfo]:

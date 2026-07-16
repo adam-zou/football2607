@@ -142,6 +142,29 @@ class ProxyManagerTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_force_refresh_replaces_and_validates_cached_proxy(self) -> None:
+        responses = iter(["127.0.0.1:8001", "127.0.0.1:8002"])
+        validated = []
+        manager = ProxyManager(
+            api_url="https://supplier.example/get",
+            username="user",
+            password="secret",
+            update_interval=300,
+            fetcher=lambda api_url, headers, timeout: next(responses),
+            validator=lambda proxy, url, headers, timeout: (
+                validated.append(proxy.server) or True
+            ),
+            clock=FakeClock(),
+        )
+
+        async def exercise() -> None:
+            first = await manager.get_proxy()
+            refreshed = await manager.force_refresh()
+            self.assertNotEqual(first.server, refreshed.server)
+
+        asyncio.run(exercise())
+        self.assertEqual(len(validated), 2)
+
     def test_proxy_refresh_validation_and_invalidation_are_observable(self) -> None:
         observability = RuntimeObservability()
         responses = iter(["127.0.0.1:8001", "127.0.0.1:8002"])

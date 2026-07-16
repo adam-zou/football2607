@@ -4,7 +4,6 @@ CREATE TABLE IF NOT EXISTS match_status (
         CHECK (crawl_status IN ('未完成', '已完成')),
     detail_status TEXT NOT NULL DEFAULT '未完成'
         CHECK (detail_status IN ('未完成', '已完成')),
-    final_status_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -15,8 +14,7 @@ ADD COLUMN IF NOT EXISTS crawl_status TEXT NOT NULL DEFAULT '未完成'
 
 ALTER TABLE match_status
     ADD COLUMN IF NOT EXISTS detail_status TEXT NOT NULL DEFAULT '未完成'
-        CHECK (detail_status IN ('未完成', '已完成')),
-    ADD COLUMN IF NOT EXISTS final_status_checked_at TIMESTAMPTZ;
+        CHECK (detail_status IN ('未完成', '已完成'));
 
 ALTER TABLE match_status
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

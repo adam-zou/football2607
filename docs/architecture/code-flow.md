@@ -24,6 +24,8 @@ flowchart LR
     HandicapOdds[("titan007_handicap_changes")]
     OneXTwoOdds[("titan007_1x2_changes")]
     OverUnderOdds[("titan007_over_under_changes")]
+    OddsSchedule[("titan007_odds_market_schedule")]
+    DynamicSchedule[("match_dynamic_schedule")]
 
     TitanList --> SyncMatches
     TitanDetail --> SyncMatches
@@ -33,6 +35,8 @@ flowchart LR
     SyncMatches --> HandicapOdds
     SyncMatches --> OneXTwoOdds
     SyncMatches --> OverUnderOdds
+    SyncMatches --> OddsSchedule
+    SyncMatches --> DynamicSchedule
     Proxy --> SyncMatches
     SyncMatches --> Dashboard
     SyncMatches --> Health
@@ -49,12 +53,12 @@ flowchart LR
 | Command | Python entrypoint | Purpose | Persistent write |
 | --- | --- | --- | --- |
 | `sync-match-status` | `fetch_data.status_cli:main` | Continuously synchronize match IDs, details, and odds | PostgreSQL |
-| `fetch-odds` | `fetch_data.odds_cli:main` | Fetch and persist three odds markets for one match and selected companies | Three PostgreSQL odds tables |
+| `fetch-odds` | `fetch_data.odds_cli:main` | Fetch and persist three odds markets for one match and selected companies | Three odds tables, verification status, and possibly match completion |
 
 ## Continuous match synchronization
 
-`MatchSynchronizer` starts three independent tasks. A slow detail or odds crawl
-does not await or schedule the list refresh task.
+`MatchSynchronizer` starts four independent tasks. List discovery, static detail,
+dynamic match information, and odds collection do not wait for one another.
 
 ```mermaid
 flowchart TD
@@ -62,24 +66,28 @@ flowchart TD
     Lock --> Init["Initialize PostgreSQL schema"]
     Init --> StartList["Start match-list task"]
     Init --> StartDetail["Start match-detail task"]
+    Init --> StartDynamic["Start match-dynamic task"]
     Init --> StartOdds["Start match-odds task"]
 
     subgraph ListTask["Match-list task"]
         L1["Open oldIndexall.aspx"] --> L2["Wait for rendered tr1_* rows"]
-        L2 --> L3["Combine page-array date with row time<br/>Parse Match values"]
-        L3 --> L4["Insert new match IDs into match_status"]
-        L4 --> L5["Update existing match_basic_info<br/>time, score, status_text"]
-        L5 --> L6["Evaluate crawl completion"]
-        L6 --> L7["Wait list_refresh_seconds<br/>default 60s"]
+        L2 --> L3["Parse valid match IDs"]
+        L3 --> L4["Insert new IDs into match_status only"]
+        L4 --> L7["Wait list_refresh_seconds<br/>default 60s"]
         L7 --> L1
     end
 
     subgraph OddsTask["Match-odds task"]
-        O1["Query odds-incomplete matches"] --> O2["Order never/oldest attempted first<br/>default batch 1"]
-        O2 --> O3["Record attempt, then fetch<br/>6 companies × 3 markets"]
-        O3 --> O4["Transactionally upsert three markets"]
+        O1["Query due odds-incomplete matches"] --> O2["Refill local queue by phase and next_attempt_at<br/>default refill 6"]
+        O2 --> O3["Continuous pool: up to 3 matches<br/>global page limit 12"]
+        O3 --> O4A["Claim due company × market pages<br/>with per-page leases"]
+        O4A --> O4["Persist every successful market page"]
         O4 --> O5["Verify final rows and evaluate completion"]
-        O5 --> O6["Wait odds_refresh_seconds<br/>default 5s"]
+        O5 --> O5A{"Each page result"}
+        O5A -->|Success| O5B["Schedule this page by match phase<br/>1 minute or 8 hours"]
+        O5A -->|Failure| O5C["Back off only this page: 1, 2, 5 minutes<br/>4th failure: abnormal for 3 hours"]
+        O5B --> O6["Refill each free slot immediately<br/>wait 5s only when idle"]
+        O5C --> O6
         O6 --> O1
     end
 
@@ -87,47 +95,55 @@ flowchart TD
         D1["Query detail_status = 未完成"] --> D2["Split IDs into configured batches<br/>default 10"]
         D2 --> D3["Fetch {match_id}sb.htm<br/>concurrency 2"]
         D3 --> D4["Parse crown simplified names,<br/>league, time, score and page status"]
-        D4 --> D5["Immediately upsert this batch<br/>Mark detail_status = 已完成"]
-        D5 --> D6["Evaluate crawl completion"]
-        D6 --> D7{"More ID batches?"}
+        D4 --> D5["Immediately upsert static fields<br/>Mark detail_status = 已完成"]
+        D5 --> D7{"More ID batches?"}
         D7 -->|Yes| D3
-        D7 -->|No| R1["Query stale final-status repairs"]
-        R1 --> R2["Take at most detail_batch_size"]
-        R2 --> R3["Fetch detail page again"]
-        R3 --> R4{"Page status = 完?"}
-        R4 -->|Yes| R5["Repair final score and status<br/>Refresh dynamic_updated_at"]
-        R4 -->|No| R6["Record final_status_checked_at only"]
-        R5 --> D8["Wait detail_refresh_seconds<br/>default 60s"]
-        R6 --> D8
+        D7 -->|No| D8["Wait detail_refresh_seconds<br/>default 60s"]
         D8 --> D1
+    end
+
+    subgraph DynamicTask["Match-dynamic task"]
+        M1["Query due database matches<br/>inside 24 hours, status != 完"] --> M2["Claim up to 10 matches<br/>with five-minute leases"]
+        M2 --> M3["Fetch {match_id}sb.htm<br/>concurrency 2"]
+        M3 --> M4["Update scheduled time, score and status"]
+        M4 --> M5{"Page result"}
+        M5 -->|Success| M6["Schedule by phase<br/>1 minute or 8 hours"]
+        M5 -->|Failure| M7["Back off 1, 2, 5 minutes<br/>then 3 hours"]
+        M6 --> M1
+        M7 --> M1
     end
 
     StartList --> L1
     StartDetail --> D1
+    StartDynamic --> M1
     StartOdds --> O1
 ```
 
 ### Field ownership
 
-The three tasks deliberately own different updates so they do not overwrite one
+The four tasks deliberately own different updates so they do not overwrite one
 another.
 
 | Field | Initial insert | Subsequent owner |
 | --- | --- | --- |
 | `match_id` | Match-list task | Match-list task discovers new IDs |
-| `crawl_status` | Database default `未完成` | Shared completion evaluator after list, detail, or odds writes |
+| `crawl_status` | Database default `未完成` | Shared completion evaluator after detail, dynamic, or odds writes |
 | `detail_status` | Database default `未完成` | Detail task changes it to `已完成` after required static fields are stored |
-| `final_status_checked_at` | Empty | Detail compensation records successful repair-page checks; candidates cool down for 30 minutes |
 | `source` | Detail task | Detail task |
 | `league` | Detail task | Detail task |
 | `home_team` / `away_team` | Detail task from `sb.htm` | Detail task |
-| `scheduled_time` | Detail task initially, as `YYYY-MM-DD HH:MM` | Match-list task, combining the rendered page array's year/date with the row time; detail task only repairs legacy time-only values |
-| `scheduled_at` | Derived from `scheduled_time` in Asia/Shanghai | Updated by whichever task owns the accepted `scheduled_time` value |
-| `home_score` / `away_score` | Detail task initially | Match-list task |
-| `status_text` | Detail task initially | Match-list task |
-| `dynamic_updated_at` | Database default | Match-list task; detail compensation only when the detail page explicitly reports `完` |
+| `scheduled_time` | Detail task initially | Dynamic task |
+| `scheduled_at` | Detail task, derived in Asia/Shanghai | Dynamic task |
+| `home_score` / `away_score` | Detail task initially | Dynamic task |
+| `status_text` | Detail task initially | Dynamic task |
+| `dynamic_updated_at` | Database default | Dynamic task |
 | `created_at` | Database default | Never changed after insert |
 | `updated_at` | Database default | Refreshed by each successful row update |
+
+The detail task initializes time, score, and status from its first valid detail
+page so newly discovered or already-finished matches immediately have a usable
+snapshot. Static-detail conflict updates do not overwrite score or status. All
+subsequent changes to these dynamic fields belong to the dynamic task.
 
 `crawl_status` changes monotonically from `未完成` to `已完成` only when all three
 conditions hold: `status_text = '完'`; the Asia/Shanghai scheduled time is at
@@ -150,11 +166,19 @@ CREATE TABLE match_status (
         CHECK (crawl_status IN ('未完成', '已完成')),
     detail_status TEXT NOT NULL DEFAULT '未完成'
         CHECK (detail_status IN ('未完成', '已完成')),
-    final_status_checked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
+
+### `match_dynamic_schedule`
+
+One row per match stores the dynamic-detail task's lease, next attempt, consecutive
+failures, last success/error, and abnormal state. Successful work uses the same
+phase cadence as odds: no work more than 24 hours before kickoff, an eight-hour
+cadence that wakes five minutes before kickoff, and one-minute updates near kickoff
+and while the match is not `完`. A finished match leaves this queue. Failures back
+off after 1, 2, and 5 minutes; the fourth failure changes to a three-hour cadence.
 
 ### `match_basic_info`
 
@@ -203,6 +227,20 @@ that are both empty also match. Six fully verified company rows are required by
 the match completion evaluator; legacy coverage-only rows use an older verification
 version and do not qualify.
 
+### `titan007_odds_market_schedule`
+
+This table is the retry and cadence state for the continuous odds queue. Its
+primary key is `(match_id, company_id, market)`, so every institution-market page
+owns its own `consecutive_failures`, `next_attempt_at`, `last_attempt_at`,
+`last_succeeded_at`, `last_error`, `is_abnormal`, and `abnormal_since`. A
+five-minute lease is written only for due pages claimed by the current collection.
+Success schedules that page by match phase and clears only its failure state.
+Failure retries only that page after 1, 2, and 5 minutes; the fourth consecutive
+failure marks the page abnormal and subsequent attempts cool down for three hours.
+The foreign key to `match_status` is added
+when that table exists so the standalone `fetch-odds` command can still initialize
+odds tables in isolation.
+
 ## Proxy acquisition and validation
 
 All three Titan007 providers share the same proxy lifecycle. `ProxyManager`
@@ -224,26 +262,38 @@ flowchart LR
     Validate -->|2xx or 3xx| Store["Cache proxy"]
     Store --> Browser
     Validate -->|Failure| Error["Raise ProxyError"]
+    SystemicFailure["3 consecutive full-match failures"] --> Force["Discard cached proxy"]
+    Force --> Supplier
 ```
+
+The odds provider treats a collection as proxy-successful when at least one
+claimed market page succeeds. When every claimed page fails, it reports one proxy
+error even though the individual page failures remain in `OddsSnapshot` for
+page-level retry. Reaching the configured proxy error threshold invalidates the
+cached proxy; the continuous synchronizer additionally forces and validates a new
+proxy after three consecutive full-match failures.
 
 ## Odds-change flow
 
 For one match, the default request set is six companies multiplied by three
-markets, for 18 pages.
+markets, for 18 pages. A single provider-level semaphore is shared by concurrent
+matches, so the configured page concurrency is a process-wide limit rather than
+a per-match multiplier.
 
 ```mermaid
 flowchart TD
     CLI["fetch-odds match_id"] --> Provider["Titan007OddsProvider"]
     Provider --> Proxy["Acquire and validate configured proxy"]
-    Proxy --> Companies["Companies 3, 4, 8, 24, 31, 47"]
-    Companies --> Handicap["Asian handicap pages"]
-    Companies --> OneXTwo["Win-draw-loss pages"]
-    Companies --> OverUnder["Total-goals pages"]
+    Proxy --> GlobalLimit["Acquire global page slot"]
+    GlobalLimit --> Companies["Companies 3, 4, 8, 24, 31, 47"]
+    Companies --> Handicap["Due Asian handicap pages"]
+    Companies --> OneXTwo["Due win-draw-loss pages"]
+    Companies --> OverUnder["Due total-goals pages"]
     Handicap --> Validate["Validate status, error markers,<br/>market shell and navigation"]
     OneXTwo --> Validate
     OverUnder --> Validate
     Validate --> Parse["Parse rows and assign stable seq"]
-    Parse --> Snapshot["OddsSnapshot"]
+    Parse --> Snapshot["OddsSnapshot<br/>per-page success and failure"]
     Snapshot --> Verify["Compare final rows with<br/>previous database snapshot"]
     Verify --> Store["Upsert current snapshot<br/>in the same transaction"]
     Verify --> FetchStatus[("titan007_odds_fetch_status")]
@@ -253,14 +303,14 @@ flowchart TD
     FetchStatus --> Complete["Evaluate crawl completion"]
 ```
 
-The odds command initializes the three tables and upserts the successful company
-snapshots in one transaction. Each company is atomic: all three market pages must
-succeed or that company is omitted from the current snapshot. A failed company
-does not prevent other complete companies from being stored. If every selected
-company fails, collection fails without producing a snapshot. The command emits
-only a human-readable count summary, including successful and failed company IDs,
-not odds JSON. `OddsSnapshot.failed_companies` retains the per-company failure
-reason for logs and callers; the persistence layer ignores failed companies.
+The odds command initializes the three tables and upserts every successful market
+page in one transaction. An institution-market page is the atomic persistence
+and retry unit: a failed over-under page does not discard successful handicap or
+win-draw-loss data from the same institution. `OddsSnapshot.market_results`
+retains each attempted page's success or failure reason, including successful
+empty markets. The continuous queue schedules successful pages normally and
+retries only failed pages; the one-shot command reports page counts and does not
+write retry state.
 Detailed field and DOM rules are maintained in
 `docs/data-sources/titan007-odds-change-schema.md`.
 When a company does not publish a market for the requested match, Titan007 renders
@@ -275,16 +325,16 @@ is also empty.
 
 | Module | Responsibility |
 | --- | --- |
-| `fetch_data/models.py` | Match and odds domain values |
+| `fetch_data/models.py` | Match-detail and odds domain values |
 | `fetch_data/migrations/*.sql` | Single source of truth for PostgreSQL schema |
 | `fetch_data/schema.py` | Packaged migration loader |
-| `fetch_data/providers/titan007.py` | Rendered match-list collection and parsing |
+| `fetch_data/providers/titan007.py` | Rendered match-list ID discovery |
 | `fetch_data/providers/titan007_detail.py` | Crown simplified match-detail collection |
 | `fetch_data/providers/titan007_odds.py` | Three-market odds-change collection and parsing |
-| `fetch_data/odds_postgres.py` | Odds table initialization and transactional snapshot upserts |
+| `fetch_data/odds_postgres.py` | Due-work selection, odds retry scheduling, and transactional snapshot upserts |
 | `fetch_data/match_completion.py` | Shared three-condition crawl completion rule |
 | `fetch_data/proxy.py` | Proxy acquisition, validation, caching and rotation |
-| `fetch_data/status_sync.py` | Independent list, detail, and odds task orchestration |
+| `fetch_data/status_sync.py` | Independent list, static-detail, dynamic-detail, and odds task orchestration |
 | `fetch_data/postgres.py` | Schema initialization, queries, transactions and upserts |
 | `fetch_data/observability.py` | Human dashboard, metrics registry, Prometheus rendering, and health HTTP server |
 | `fetch_data/status_cli.py` | Continuous synchronization composition root |
@@ -299,30 +349,55 @@ is also empty.
 - `fetch-odds` also requires `DATABASE_URL`. The continuous synchronizer and the
   one-shot command use a separate odds-store PostgreSQL connection; the continuous
   process is still covered by its match-store advisory lock.
-- Each task waits its configured interval after its current iteration finishes;
-  the interval is not a wall-clock schedule.
-- Detail pages have a 30-second timeout and are fetched with concurrency 2.
+- The list and static-detail tasks wait their configured interval after each
+  iteration. Dynamic and odds tasks keep draining due database work and wait their
+  configured idle interval only when no work is due. None uses a wall-clock schedule.
+- Match-list, match-detail, and odds pages each have a 10-second page timeout.
+  Detail pages are fetched with concurrency 2.
   Only `detail_status = 未完成` IDs enter the static-detail queue. IDs are split
   into configurable batches (default 10), and each successful batch is persisted
   and marked `detail_status = 已完成` immediately.
-- Final-status compensation is independent from static detail collection. A match
-  becomes eligible when it is still unfinished three hours after `scheduled_at`,
-  its list-owned dynamic data is at least 10 minutes old, and no repair check ran
-  in the last 30 minutes. At most `detail_batch_size` candidates are checked per
-  detail iteration. Only an explicit detail-page `status_text = 完` may repair the
-  final score/status; other successful checks only update the cooldown timestamp.
-- The odds task defaults to one complete match per iteration and waits 5 seconds
-  after the iteration finishes. It selects unfinished matches by oldest odds-status
-  attempt (never-attempted first). An attempt updates queue recency without clearing
-  verification flags even when page collection fails, so a bad or ongoing match
-  cannot starve later IDs. Each match uses the provider's six-page concurrency to
-  collect 18 pages.
+- The list task only inserts newly discovered IDs. Static detail collection owns
+  league and team fields and marks `detail_status = 已完成` after the first valid
+  write. The dynamic task then selects its range entirely from PostgreSQL and owns
+  scheduled time, score, and page status updates. It stops selecting a match once
+  `status_text = 完`.
+- The odds task only admits unfinished matches with stored basic information.
+  Matches more than 24 hours before kickoff are excluded. Non-finished matches
+  inside 24 hours are eligible; those within five minutes of kickoff or overdue
+  are ranked first and use a one-minute success cadence, while ordinary pre-match
+  work uses eight hours and is always woken five minutes before kickoff. Finished
+  matches pause until `scheduled_at` is at least three hours old, then rank ahead
+  of ordinary pre-match work for final-row
+  verification. Live/near-kickoff work remains first so historical final backlog
+  cannot starve current matches.
+- Every institution-market page has independent cadence and retry state. Failed
+  pages retry after 1, 2, and 5 minutes. The fourth consecutive failure marks only
+  that page abnormal and schedules it three hours later; further failures remain
+  on a three-hour cadence. A successful page resets only its own failure state.
+  A five-minute in-progress lease covers claimed pages during process interruption,
+  and queue metrics count matches with at least one page currently due.
+- Three consecutive full-match failures trigger a forced proxy refresh and
+  validation before new work fills freed slots. Full success or any page success
+  resets this process-level counter; partial collection therefore does
+  not misdiagnose a working proxy as globally unavailable.
+- The odds task refills its local queue with up to six matches at a time and keeps
+  up to three match jobs active. Completion of any one match immediately opens a
+  slot for the next queued or newly queried match; a slow match never creates a
+  whole-batch barrier. A hard per-match timeout defaults to 60 seconds, after
+  which the job is cancelled and enters normal failure backoff. The task waits
+  five seconds only when both the local queue and active pool are empty.
+- All active matches share one provider-level page semaphore, with a default
+  global maximum of 12 active odds pages. `--odds-batch-size`,
+  `--odds-match-concurrency`, `--odds-match-timeout-seconds`, and
+  `--odds-page-concurrency` configure queue refill, active matches, hard timeout,
+  and page pressure independently.
 - `sync-match-status` exposes a human-readable dashboard at `/`, JSON health at
   `/healthz`, and Prometheus metrics at `/metrics` on `127.0.0.1:8080` by default.
   The dashboard summarizes component health, task outcomes, latest durations, and
   pending queues, and refreshes every 10 seconds. `--health-host` changes the bind
   address and `--health-port 0` disables HTTP. Metrics cover task attempts,
-  failures and durations, page outcomes, detail and final-verification backlog,
+  failures and durations, page outcomes, static-detail, dynamic, and odds backlog,
   proxy refresh/validation/invalidation, and partial company failures.
 - Static details leave the detail queue immediately after a successful write;
   `crawl_status` and final odds verification no longer cause repeated detail fetches.

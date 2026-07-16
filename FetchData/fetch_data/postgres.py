@@ -14,7 +14,7 @@ from psycopg2.extensions import connection as Connection
 from psycopg2.extras import execute_values
 
 from .match_completion import mark_matches_completed
-from .models import Match, MatchBasicInfo
+from .models import MatchBasicInfo
 from .schema import load_migrations
 
 
@@ -32,7 +32,11 @@ def parse_scheduled_at(value: str) -> Optional[datetime]:
 
 
 INITIALIZE_MATCH_STATUS_TABLE = load_migrations(
-    ("001_match_status.sql", "002_match_basic_info.sql")
+    (
+        "001_match_status.sql",
+        "002_match_basic_info.sql",
+        "005_match_dynamic_schedule.sql",
+    )
 )
 
 
@@ -44,20 +48,96 @@ ORDER BY match_id
 """
 
 
-FETCH_FINAL_STATUS_REPAIR_IDS = """
+FETCH_PENDING_DYNAMIC_IDS = """
 SELECT status.match_id
 FROM match_status AS status
 JOIN match_basic_info AS basic ON basic.match_id = status.match_id
+LEFT JOIN match_dynamic_schedule AS schedule
+  ON schedule.match_id = status.match_id
 WHERE status.detail_status = '已完成'
   AND status.crawl_status = '未完成'
   AND basic.status_text <> '完'
-  AND basic.scheduled_at <= NOW() - INTERVAL '3 hours'
-  AND basic.dynamic_updated_at <= NOW() - INTERVAL '10 minutes'
-  AND (
-      status.final_status_checked_at IS NULL
-      OR status.final_status_checked_at <= NOW() - INTERVAL '30 minutes'
-  )
-ORDER BY basic.scheduled_at, status.match_id
+  AND basic.scheduled_at <= NOW() + INTERVAL '24 hours'
+  AND COALESCE(schedule.next_attempt_at, '-infinity'::TIMESTAMPTZ) <= NOW()
+ORDER BY CASE
+             WHEN basic.scheduled_at <= NOW() + INTERVAL '5 minutes' THEN 0
+             ELSE 1
+         END,
+         schedule.next_attempt_at ASC NULLS FIRST,
+         status.match_id
+LIMIT %s
+"""
+
+
+BEGIN_DYNAMIC_ATTEMPT = """
+INSERT INTO match_dynamic_schedule (
+    match_id, next_attempt_at, last_attempt_at
+)
+VALUES %s
+ON CONFLICT (match_id) DO UPDATE SET
+    next_attempt_at = NOW() + INTERVAL '5 minutes',
+    last_attempt_at = NOW(),
+    updated_at = NOW()
+"""
+
+
+RECORD_DYNAMIC_SUCCESS = """
+INSERT INTO match_dynamic_schedule (
+    match_id, consecutive_failures, next_attempt_at, last_attempt_at,
+    last_succeeded_at, last_error, is_abnormal, abnormal_since
+)
+SELECT basic.match_id,
+       0,
+       CASE
+           WHEN basic.status_text = '完' THEN NOW() + INTERVAL '1 minute'
+           WHEN basic.scheduled_at <= NOW() + INTERVAL '5 minutes'
+           THEN NOW() + INTERVAL '1 minute'
+           ELSE LEAST(
+               NOW() + INTERVAL '8 hours',
+               basic.scheduled_at - INTERVAL '5 minutes'
+           )
+       END,
+       NOW(), NOW(), NULL, FALSE, NULL
+FROM match_basic_info AS basic
+WHERE basic.match_id = ANY(%s::BIGINT[])
+ON CONFLICT (match_id) DO UPDATE SET
+    consecutive_failures = 0,
+    next_attempt_at = EXCLUDED.next_attempt_at,
+    last_attempt_at = EXCLUDED.last_attempt_at,
+    last_succeeded_at = EXCLUDED.last_succeeded_at,
+    last_error = NULL,
+    is_abnormal = FALSE,
+    abnormal_since = NULL,
+    updated_at = NOW()
+"""
+
+
+RECORD_DYNAMIC_FAILURE = """
+INSERT INTO match_dynamic_schedule (
+    match_id, consecutive_failures, next_attempt_at, last_attempt_at,
+    last_error, is_abnormal, abnormal_since
+)
+VALUES %s
+ON CONFLICT (match_id) DO UPDATE SET
+    consecutive_failures = match_dynamic_schedule.consecutive_failures + 1,
+    next_attempt_at = NOW() + CASE
+        WHEN match_dynamic_schedule.consecutive_failures + 1 = 1
+        THEN INTERVAL '1 minute'
+        WHEN match_dynamic_schedule.consecutive_failures + 1 = 2
+        THEN INTERVAL '2 minutes'
+        WHEN match_dynamic_schedule.consecutive_failures + 1 = 3
+        THEN INTERVAL '5 minutes'
+        ELSE INTERVAL '3 hours'
+    END,
+    last_attempt_at = NOW(),
+    last_error = EXCLUDED.last_error,
+    is_abnormal = match_dynamic_schedule.consecutive_failures + 1 >= 4,
+    abnormal_since = CASE
+        WHEN match_dynamic_schedule.consecutive_failures + 1 >= 4
+        THEN COALESCE(match_dynamic_schedule.abnormal_since, NOW())
+        ELSE NULL
+    END,
+    updated_at = NOW()
 """
 
 
@@ -77,13 +157,13 @@ class PostgresMatchStore:
         async with self._get_lock():
             await asyncio.to_thread(self._initialize_sync)
 
-    async def upsert_match_list(self, matches: Sequence[Match]) -> None:
-        """写入列表页结果：新增 ID，并更新已有详情的动态字段。"""
+    async def upsert_match_list(self, match_ids: Sequence[int]) -> None:
+        """把列表页发现的新比赛 ID 加入采集状态表。"""
 
-        if not matches:
+        if not match_ids:
             return
         async with self._get_lock():
-            await asyncio.to_thread(self._upsert_match_list_sync, matches)
+            await asyncio.to_thread(self._upsert_match_list_sync, match_ids)
 
     async def fetch_pending_detail_ids(self) -> List[int]:
         """查询静态详情尚未成功保存的比赛 ID。"""
@@ -91,13 +171,24 @@ class PostgresMatchStore:
         async with self._get_lock():
             return await asyncio.to_thread(self._fetch_pending_detail_ids_sync)
 
-    async def fetch_final_status_repair_ids(self) -> List[int]:
-        """查询列表动态信息过期、需要详情页补偿的比赛 ID。"""
+    async def fetch_pending_dynamic_ids(self, limit: int) -> List[int]:
+        """查询已到动态信息执行时间的比赛 ID。"""
 
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
         async with self._get_lock():
             return await asyncio.to_thread(
-                self._fetch_final_status_repair_ids_sync
+                self._fetch_pending_dynamic_ids_sync,
+                limit,
             )
+
+    async def begin_dynamic_attempts(self, match_ids: Sequence[int]) -> None:
+        """为本轮动态详情请求写入五分钟租约。"""
+
+        if not match_ids:
+            return
+        async with self._get_lock():
+            await asyncio.to_thread(self._begin_dynamic_attempts_sync, match_ids)
 
     async def upsert_match_details(
         self,
@@ -110,16 +201,32 @@ class PostgresMatchStore:
         async with self._get_lock():
             await asyncio.to_thread(self._upsert_match_details_sync, details)
 
-    async def repair_final_statuses(
+    async def upsert_match_dynamics(
         self,
         details: Sequence[MatchBasicInfo],
     ) -> None:
-        """使用详情页的完场结果修复列表任务错过的最终比分和状态。"""
+        """更新详情页提供的开赛时间、比分和比赛状态。"""
 
         if not details:
             return
         async with self._get_lock():
-            await asyncio.to_thread(self._repair_final_statuses_sync, details)
+            await asyncio.to_thread(self._upsert_match_dynamics_sync, details)
+
+    async def record_dynamic_failures(
+        self,
+        match_ids: Sequence[int],
+        error: str,
+    ) -> None:
+        """为未返回有效详情的比赛记录独立退避。"""
+
+        if not match_ids:
+            return
+        async with self._get_lock():
+            await asyncio.to_thread(
+                self._record_dynamic_failures_sync,
+                match_ids,
+                error,
+            )
 
     async def close(self) -> None:
         """关闭共享连接；重复调用也安全。"""
@@ -157,24 +264,12 @@ class PostgresMatchStore:
             self._connection = None
             raise
 
-    def _upsert_match_list_sync(self, matches: Sequence[Match]) -> None:
+    def _upsert_match_list_sync(self, match_ids: Sequence[int]) -> None:
         if self._connection is None:
             raise RuntimeError("PostgresMatchStore is not initialized")
 
         # execute_values 要求“行的序列”，即便只有一列也写成单元素元组。
-        match_ids = [(int(match.match_id),) for match in matches]
-        # 列表页最可靠的是实时变化字段；队名和联赛仍由详情页负责。
-        dynamic_values = [
-            (
-                int(match.match_id),
-                match.scheduled_time,
-                parse_scheduled_at(match.scheduled_time),
-                match.home_score,
-                match.away_score,
-                match.status_text or "未开始",
-            )
-            for match in matches
-        ]
+        values = [(int(match_id),) for match_id in match_ids]
         with self._connection:
             with self._connection.cursor() as cursor:
                 execute_values(
@@ -185,37 +280,10 @@ class PostgresMatchStore:
                     ON CONFLICT (match_id)
                     DO NOTHING
                     """,
-                    match_ids,
+                    values,
                 )
-                # 只有详情行已经存在时才更新。刚发现的比赛先进入 match_status
-                # 等待队列，之后由详情任务创建 match_basic_info 行。
-                execute_values(
-                    cursor,
-                    """
-                    UPDATE match_basic_info AS detail
-                    SET scheduled_time = snapshot.scheduled_time,
-                        scheduled_at = snapshot.scheduled_at::TIMESTAMPTZ,
-                        home_score = snapshot.home_score::SMALLINT,
-                        away_score = snapshot.away_score::SMALLINT,
-                        status_text = snapshot.status_text,
-                        dynamic_updated_at = NOW(),
-                        updated_at = NOW()
-                    FROM (VALUES %s) AS snapshot(
-                        match_id,
-                        scheduled_time,
-                        scheduled_at,
-                        home_score,
-                        away_score,
-                        status_text
-                    )
-                    WHERE detail.match_id = snapshot.match_id::BIGINT
-                    """,
-                    dynamic_values,
-                )
-                mark_matches_completed(
-                    cursor,
-                    [int(match.match_id) for match in matches],
-                )
+                # 列表页只发现比赛 ID。基础详情和动态字段均由数据库驱动的
+                # 详情任务负责，避免页面当前展示范围决定后续采集范围。
 
     def _fetch_pending_detail_ids_sync(self) -> List[int]:
         if self._connection is None:
@@ -226,14 +294,25 @@ class PostgresMatchStore:
                 cursor.execute(FETCH_PENDING_DETAIL_IDS)
                 return [int(row[0]) for row in cursor.fetchall()]
 
-    def _fetch_final_status_repair_ids_sync(self) -> List[int]:
+    def _fetch_pending_dynamic_ids_sync(self, limit: int) -> List[int]:
         if self._connection is None:
             raise RuntimeError("PostgresMatchStore is not initialized")
 
+        with self._connection.cursor() as cursor:
+            cursor.execute(FETCH_PENDING_DYNAMIC_IDS, (limit,))
+            return [int(row[0]) for row in cursor.fetchall()]
+
+    def _begin_dynamic_attempts_sync(self, match_ids: Sequence[int]) -> None:
+        if self._connection is None:
+            raise RuntimeError("PostgresMatchStore is not initialized")
         with self._connection:
             with self._connection.cursor() as cursor:
-                cursor.execute(FETCH_FINAL_STATUS_REPAIR_IDS)
-                return [int(row[0]) for row in cursor.fetchall()]
+                execute_values(
+                    cursor,
+                    BEGIN_DYNAMIC_ATTEMPT,
+                    [(int(match_id),) for match_id in match_ids],
+                    template="(%s, NOW() + INTERVAL '5 minutes', NOW())",
+                )
 
     def _upsert_match_details_sync(
         self,
@@ -308,29 +387,20 @@ class PostgresMatchStore:
                     """,
                     ([detail.match_id for detail in details],),
                 )
-                # 完整 scheduled_time 后续归列表任务所有；但旧版本写入的纯
-                # HH:MM 会由详情页自动修复。比分和状态仍不从详情页倒灌。
+                # 基础详情首次成功即完成；后续开赛时间、比分和状态由独立的
+                # 数据库驱动动态任务更新。
                 mark_matches_completed(
                     cursor,
                     [detail.match_id for detail in details],
                 )
 
-    def _repair_final_statuses_sync(
+    def _upsert_match_dynamics_sync(
         self,
         details: Sequence[MatchBasicInfo],
     ) -> None:
         if self._connection is None:
             raise RuntimeError("PostgresMatchStore is not initialized")
 
-        values = [
-            (
-                detail.match_id,
-                detail.home_score,
-                detail.away_score,
-                detail.status_text,
-            )
-            for detail in details
-        ]
         match_ids = [detail.match_id for detail in details]
         with self._connection:
             with self._connection.cursor() as cursor:
@@ -338,35 +408,56 @@ class PostgresMatchStore:
                     cursor,
                     """
                     UPDATE match_basic_info AS basic
-                    SET home_score = COALESCE(
-                            repair.home_score::SMALLINT,
-                            basic.home_score
-                        ),
-                        away_score = COALESCE(
-                            repair.away_score::SMALLINT,
-                            basic.away_score
-                        ),
-                        status_text = repair.status_text,
+                    SET scheduled_time = dynamic.scheduled_time,
+                        scheduled_at = dynamic.scheduled_at::TIMESTAMPTZ,
+                        home_score = dynamic.home_score::SMALLINT,
+                        away_score = dynamic.away_score::SMALLINT,
+                        status_text = dynamic.status_text,
                         dynamic_updated_at = NOW(),
                         updated_at = NOW()
-                    FROM (VALUES %s) AS repair(
+                    FROM (VALUES %s) AS dynamic(
                         match_id,
+                        scheduled_time,
+                        scheduled_at,
                         home_score,
                         away_score,
                         status_text
                     )
-                    WHERE basic.match_id = repair.match_id::BIGINT
-                      AND repair.status_text = '完'
+                    WHERE basic.match_id = dynamic.match_id::BIGINT
                     """,
-                    values,
+                    [
+                        (
+                            detail.match_id,
+                            detail.scheduled_time,
+                            parse_scheduled_at(detail.scheduled_time),
+                            detail.home_score,
+                            detail.away_score,
+                            detail.status_text,
+                        )
+                        for detail in details
+                    ],
                 )
                 cursor.execute(
-                    """
-                    UPDATE match_status
-                    SET final_status_checked_at = NOW(),
-                        updated_at = NOW()
-                    WHERE match_id = ANY(%s::BIGINT[])
-                    """,
+                    RECORD_DYNAMIC_SUCCESS,
                     (match_ids,),
                 )
                 mark_matches_completed(cursor, match_ids)
+
+    def _record_dynamic_failures_sync(
+        self,
+        match_ids: Sequence[int],
+        error: str,
+    ) -> None:
+        if self._connection is None:
+            raise RuntimeError("PostgresMatchStore is not initialized")
+        with self._connection:
+            with self._connection.cursor() as cursor:
+                execute_values(
+                    cursor,
+                    RECORD_DYNAMIC_FAILURE,
+                    [(int(match_id), str(error)[:1000]) for match_id in match_ids],
+                    template=(
+                        "(%s, 1, NOW() + INTERVAL '1 minute', NOW(), "
+                        "%s, FALSE, NULL)"
+                    ),
+                )

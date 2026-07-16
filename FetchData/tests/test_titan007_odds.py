@@ -3,7 +3,13 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from fetch_data.models import HandicapChange, Movement, OneXTwoChange, OverUnderChange
+from fetch_data.models import (
+    HandicapChange,
+    Movement,
+    OddsMarketRequest,
+    OneXTwoChange,
+    OverUnderChange,
+)
 from fetch_data.providers.titan007_odds import Titan007OddsProvider
 
 
@@ -26,6 +32,9 @@ class FakeProxyManager:
     async def report_error(self):
         return None
 
+    async def force_refresh(self):
+        return FakeProxy()
+
 
 class FakeBrowser:
     async def close(self):
@@ -46,8 +55,17 @@ class FakePlaywrightContext:
 
 
 class Titan007OddsProviderTests(unittest.TestCase):
+    def test_forced_proxy_refresh_is_delegated_to_proxy_manager(self) -> None:
+        proxy_manager = FakeProxyManager()
+        proxy_manager.force_refresh = AsyncMock(return_value=FakeProxy())
+        provider = Titan007OddsProvider(proxy_manager=proxy_manager)
+
+        asyncio.run(provider.refresh_proxy())
+
+        proxy_manager.force_refresh.assert_awaited_once()
+
     def test_page_validation_rejects_error_and_unrecognized_pages(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "blocked or error page"):
+        with self.assertRaisesRegex(RuntimeError, "拦截页或错误页"):
             Titan007OddsProvider._validate_page_state(
                 {
                     "title": "Access Denied",
@@ -58,7 +76,7 @@ class Titan007OddsProviderTests(unittest.TestCase):
                 }
             )
 
-        with self.assertRaisesRegex(RuntimeError, "missing expected market structure"):
+        with self.assertRaisesRegex(RuntimeError, "缺少预期的市场结构"):
             Titan007OddsProvider._validate_page_state(
                 {
                     "title": "Unexpected page",
@@ -82,8 +100,66 @@ class Titan007OddsProviderTests(unittest.TestCase):
 
         self.assertFalse(has_table)
 
-    def test_failed_page_discards_only_its_company(self) -> None:
+    def test_page_wait_passes_selector_as_keyword_argument(self) -> None:
+        class FakeResponse:
+            status = 200
+
+        class KeywordOnlyPage:
+            def __init__(self) -> None:
+                self.wait_argument = None
+
+            async def goto(self, url, *, wait_until, timeout):
+                return FakeResponse()
+
+            async def wait_for_function(
+                self,
+                expression,
+                *,
+                arg=None,
+                polling=None,
+                timeout=None,
+            ):
+                self.wait_argument = arg
+
+            async def evaluate(self, expression, arg):
+                return {
+                    "title": "赔率变化",
+                    "bodyText": "亚让 胜平负 进球数",
+                    "hasExpectedTable": False,
+                    "hasMarketShell": True,
+                    "hasMarketNavigation": True,
+                }
+
+            async def close(self):
+                return None
+
+        class BrowserWithPage:
+            def __init__(self, page) -> None:
+                self.page = page
+
+            async def new_page(self, **kwargs):
+                return self.page
+
         provider = Titan007OddsProvider(proxy_manager=FakeProxyManager())
+        page = KeywordOnlyPage()
+
+        rows = asyncio.run(
+            provider._fetch_page_rows(
+                BrowserWithPage(page),
+                3020831,
+                3,
+                "handicap",
+            )
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(page.wait_argument, "#odds2 table")
+
+    def test_failed_page_preserves_other_markets_from_same_company(self) -> None:
+        proxy_manager = FakeProxyManager()
+        proxy_manager.report_success = AsyncMock()
+        proxy_manager.report_error = AsyncMock()
+        provider = Titan007OddsProvider(proxy_manager=proxy_manager)
 
         async def fetch_rows(browser, match_id, company_id, market):
             if company_id == 4 and market == "one_x_two":
@@ -100,21 +176,94 @@ class Titan007OddsProviderTests(unittest.TestCase):
                 provider.fetch_match_odds(3020831, company_ids=[3, 4])
             )
 
-        self.assertEqual(snapshot.companies, {3: "Crow*"})
-        self.assertIn(4, snapshot.failed_companies)
-        self.assertIn("one_x_two", snapshot.failed_companies[4])
+        self.assertEqual(snapshot.companies, {3: "Crow*", 4: "立*"})
+        self.assertEqual(len(snapshot.successful_markets), 5)
+        self.assertEqual(
+            set(snapshot.failed_markets),
+            {OddsMarketRequest(4, "one_x_two")},
+        )
         self.assertEqual(provider._fetch_page_rows.await_count, 6)
+        proxy_manager.report_success.assert_awaited_once()
+        proxy_manager.report_error.assert_not_awaited()
 
-    def test_all_companies_failing_raises_collection_error(self) -> None:
-        provider = Titan007OddsProvider(proxy_manager=FakeProxyManager())
+    def test_all_pages_failing_returns_individual_failure_results(self) -> None:
+        proxy_manager = FakeProxyManager()
+        proxy_manager.report_success = AsyncMock()
+        proxy_manager.report_error = AsyncMock()
+        provider = Titan007OddsProvider(proxy_manager=proxy_manager)
         provider._fetch_page_rows = AsyncMock(side_effect=RuntimeError("failed"))
 
         with patch(
             "fetch_data.providers.titan007_odds.async_playwright",
             return_value=FakePlaywrightContext(),
         ):
-            with self.assertRaisesRegex(RuntimeError, "all selected companies failed"):
-                asyncio.run(provider.fetch_match_odds(3020831, company_ids=[3]))
+            snapshot = asyncio.run(
+                provider.fetch_match_odds(3020831, company_ids=[3])
+            )
+
+        self.assertEqual(snapshot.companies, {})
+        self.assertEqual(len(snapshot.successful_markets), 0)
+        self.assertEqual(len(snapshot.failed_markets), 3)
+        proxy_manager.report_error.assert_awaited_once()
+        proxy_manager.report_success.assert_not_awaited()
+
+    def test_explicit_market_requests_fetch_only_failed_page(self) -> None:
+        provider = Titan007OddsProvider(proxy_manager=FakeProxyManager())
+        provider._fetch_page_rows = AsyncMock(return_value=[])
+        request = OddsMarketRequest(4, "over_under")
+
+        with patch(
+            "fetch_data.providers.titan007_odds.async_playwright",
+            return_value=FakePlaywrightContext(),
+        ):
+            snapshot = asyncio.run(
+                provider.fetch_match_odds(
+                    3020831,
+                    market_requests=[request],
+                )
+            )
+
+        provider._fetch_page_rows.assert_awaited_once_with(
+            unittest.mock.ANY,
+            3020831,
+            4,
+            "over_under",
+        )
+        self.assertEqual(snapshot.successful_markets, (request,))
+
+    def test_page_concurrency_is_global_across_matches(self) -> None:
+        provider = Titan007OddsProvider(
+            proxy_manager=FakeProxyManager(),
+            max_concurrency=2,
+        )
+        active = 0
+        maximum_active = 0
+        original_sleep = asyncio.sleep
+
+        async def fetch_rows(browser, match_id, company_id, market):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await original_sleep(0)
+            active -= 1
+            return []
+
+        provider._fetch_page_rows = AsyncMock(side_effect=fetch_rows)
+
+        async def fetch_two_matches():
+            return await asyncio.gather(
+                provider.fetch_match_odds(3020831, company_ids=[3]),
+                provider.fetch_match_odds(3020832, company_ids=[3]),
+            )
+
+        with patch(
+            "fetch_data.providers.titan007_odds.async_playwright",
+            return_value=FakePlaywrightContext(),
+        ):
+            asyncio.run(fetch_two_matches())
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual(provider._fetch_page_rows.await_count, 6)
 
     def test_missing_market_table_is_represented_by_no_rows(self) -> None:
         self.assertEqual(

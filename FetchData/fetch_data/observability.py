@@ -199,8 +199,9 @@ class RuntimeObservability:
         component_labels = {
             "database": ("数据库", "PostgreSQL 连接与写入"),
             "proxy": ("代理", "代理获取与连通性验证"),
-            "match_list": ("比赛列表", "发现比赛并刷新比分状态"),
-            "match_detail": ("比赛详情", "补充球队、联赛与完场信息"),
+            "match_list": ("比赛列表", "从列表页发现新的比赛 ID"),
+            "match_detail": ("比赛详情", "首次补充联赛和球队等基础信息"),
+            "match_dynamic": ("动态信息", "更新开赛时间、比分和比赛状态"),
             "match_odds": ("赔率数据", "抓取并保存三类赔率变化"),
         }
         cards = []
@@ -243,6 +244,7 @@ class RuntimeObservability:
         task_labels = {
             "match_list": ("比赛列表", None),
             "match_detail": ("比赛详情", "match_detail"),
+            "match_dynamic": ("动态信息", "match_dynamic"),
             "match_odds": ("赔率数据", "match_odds"),
         }
         for task, (label, queue) in task_labels.items():
@@ -250,7 +252,7 @@ class RuntimeObservability:
                 counters, "fetch_success_total", task=task
             )
             failures = self._metric_value(
-                counters, "fetch_failures_total", task=task
+                counters, "fetch_failure_total", task=task
             )
             duration = self._metric_value(
                 gauges, "fetch_duration_seconds_latest", task=task
@@ -275,7 +277,7 @@ class RuntimeObservability:
 
         queue_labels = {
             "match_detail": "静态详情",
-            "final_status_repair": "完场补偿",
+            "match_dynamic": "动态信息",
             "match_odds": "赔率核验",
         }
         queue_items = []

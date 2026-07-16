@@ -25,6 +25,8 @@ SET scheduled_at = scheduled_time::TIMESTAMP AT TIME ZONE 'Asia/Shanghai'
 WHERE scheduled_at IS NULL
   AND scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$';
 
-CREATE INDEX IF NOT EXISTS idx_match_basic_info_final_repair
-ON match_basic_info(scheduled_at, dynamic_updated_at)
+DROP INDEX IF EXISTS idx_match_basic_info_final_repair;
+
+CREATE INDEX IF NOT EXISTS idx_match_basic_info_dynamic_work
+ON match_basic_info(scheduled_at, status_text)
 WHERE status_text <> '完';

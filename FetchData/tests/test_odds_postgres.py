@@ -5,16 +5,24 @@ from unittest.mock import patch
 from fetch_data.models import (
     HandicapChange,
     Movement,
+    OddsMarketRequest,
+    OddsMarketResult,
     OddsSnapshot,
     OneXTwoChange,
     OverUnderChange,
 )
 from fetch_data.odds_postgres import (
+    BEGIN_ODDS_ATTEMPT,
     COUNT_PENDING_MATCH_IDS,
+    FETCH_DUE_MARKETS,
     FETCH_PENDING_MATCH_IDS,
     INITIALIZE_ODDS_TABLES,
     PostgresOddsStore,
-    TOUCH_ODDS_ATTEMPT,
+    RECORD_ODDS_FAILURE,
+    RECORD_ODDS_SUCCESS,
+    UPSERT_HANDICAP_FETCH_STATUS,
+    UPSERT_ONE_X_TWO_FETCH_STATUS,
+    UPSERT_OVER_UNDER_FETCH_STATUS,
 )
 
 
@@ -117,7 +125,7 @@ class PostgresOddsStoreTests(unittest.TestCase):
 
         def verify(cursor, snapshot):
             events.append("verify")
-            return []
+            return {}
 
         def write(*args, **kwargs):
             events.append("write")
@@ -131,7 +139,7 @@ class PostgresOddsStoreTests(unittest.TestCase):
 
         self.assertEqual(events[0], "verify")
 
-    def test_pending_queue_rotates_by_oldest_odds_refresh(self) -> None:
+    def test_pending_queue_filters_and_prioritizes_by_match_phase(self) -> None:
         store = PostgresOddsStore("postgresql://example/football")
         store._connection = FakeConnection()
         store._connection.cursor_instance.fetchall_results = [(101,), (205,)]
@@ -142,7 +150,11 @@ class PostgresOddsStoreTests(unittest.TestCase):
         statement, parameters = store._connection.cursor_instance.executions[0]
         self.assertEqual(statement, FETCH_PENDING_MATCH_IDS)
         self.assertEqual(parameters, (2,))
-        self.assertIn("MAX(odds_status.updated_at) ASC NULLS FIRST", statement)
+        self.assertIn("INTERVAL '24 hours'", statement)
+        self.assertIn("INTERVAL '5 minutes'", statement)
+        self.assertIn("INTERVAL '3 hours'", statement)
+        self.assertIn("schedule.next_attempt_at", statement)
+        self.assertIn("WHEN basic.status_text = '完' THEN 1", statement)
         self.assertIn("verification_version = 1", statement)
 
     def test_pending_queue_count_supports_backlog_metrics(self) -> None:
@@ -158,35 +170,108 @@ class PostgresOddsStoreTests(unittest.TestCase):
             COUNT_PENDING_MATCH_IDS,
         )
 
-    def test_attempt_touch_rotates_failed_match_without_erasing_flags(self) -> None:
+    def test_begin_attempt_creates_a_five_minute_lease(self) -> None:
         store = PostgresOddsStore("postgresql://example/football")
         store._connection = FakeConnection()
+        store._connection.cursor_instance.fetchall_results = [
+            (4, "over_under")
+        ]
 
-        store._touch_match_attempt_sync(3020831)
+        with patch("fetch_data.odds_postgres.execute_values") as execute:
+            requests = store._begin_match_attempt_sync(3020831)
 
         statement, parameters = store._connection.cursor_instance.executions[0]
-        self.assertEqual(statement, TOUCH_ODDS_ATTEMPT)
-        self.assertEqual(parameters[0], 3020831)
-        self.assertEqual(parameters[1], [3, 4, 8, 24, 31, 47])
-        self.assertNotIn("handicap_completed =", statement)
+        self.assertEqual(statement, FETCH_DUE_MARKETS)
+        self.assertEqual(parameters, (3020831,))
+        self.assertEqual(requests, [OddsMarketRequest(4, "over_under")])
+        self.assertEqual(execute.call_args.args[1], BEGIN_ODDS_ATTEMPT)
+        self.assertIn("INTERVAL '5 minutes'", execute.call_args.kwargs["template"])
+
+    def test_market_success_resets_only_its_backoff_and_uses_phase_cadence(self) -> None:
+        store = PostgresOddsStore("postgresql://example/football")
+        store._connection = FakeConnection()
+        request = OddsMarketRequest(4, "over_under")
+        snapshot = OddsSnapshot(
+            match_id=3020831,
+            companies={4: "立*"},
+            handicap_changes=[],
+            one_x_two_changes=[],
+            over_under_changes=[],
+            market_results=[OddsMarketResult(request, True)],
+        )
+
+        with patch("fetch_data.odds_postgres.execute_values") as execute:
+            store._record_market_outcomes_sync(snapshot)
+
+        statement = execute.call_args.args[1]
+        values = execute.call_args.args[2]
+        self.assertEqual(statement, RECORD_ODDS_SUCCESS)
+        self.assertEqual(values, [(3020831, 4, "over_under")])
+        self.assertIn("INTERVAL '1 minute'", statement)
+        self.assertIn("INTERVAL '8 hours'", statement)
+        self.assertIn("basic.scheduled_at - INTERVAL '5 minutes'", statement)
+        self.assertIn("consecutive_failures = 0", statement)
+        self.assertIn("is_abnormal = FALSE", statement)
+        self.assertIn("abnormal_since = NULL", statement)
+
+    def test_market_failure_uses_independent_bounded_backoff(self) -> None:
+        store = PostgresOddsStore("postgresql://example/football")
+        store._connection = FakeConnection()
+        request = OddsMarketRequest(4, "over_under")
+
+        with patch("fetch_data.odds_postgres.execute_values") as execute:
+            store._record_market_failures_sync(
+                3020831,
+                [request],
+                "temporary failure",
+            )
+
+        statement = execute.call_args.args[1]
+        parameters = execute.call_args.args[2]
+        self.assertEqual(statement, RECORD_ODDS_FAILURE)
+        self.assertEqual(
+            parameters,
+            [(3020831, 4, "over_under", "temporary failure")],
+        )
+        self.assertIn("consecutive_failures + 1 = 1", statement)
+        for delay in ("1 minute", "2 minutes", "5 minutes"):
+            self.assertIn(delay, statement)
+        self.assertIn("INTERVAL '3 hours'", statement)
+        self.assertIn("is_abnormal", statement)
+        self.assertIn("consecutive_failures + 1 >= 4", statement)
 
     def test_migration_matches_runtime_schema(self) -> None:
-        migration = (
+        odds_migration = (
             Path(__file__).parents[1]
             / "fetch_data"
             / "migrations"
             / "003_titan007_odds_changes.sql"
         ).read_text(encoding="utf-8")
+        schedule_migration = (
+            Path(__file__).parents[1]
+            / "fetch_data"
+            / "migrations"
+            / "004_odds_schedule.sql"
+        ).read_text(encoding="utf-8")
+        migration = odds_migration.strip() + "\n\n" + schedule_migration.strip()
 
         self.assertEqual(migration.strip(), INITIALIZE_ODDS_TABLES.strip())
         self.assertIn("change_time TEXT NOT NULL", migration)
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS titan007_odds_market_schedule",
+            migration,
+        )
+        self.assertIn("PRIMARY KEY (match_id, company_id, market)", migration)
+        self.assertIn("next_attempt_at TIMESTAMPTZ NOT NULL", migration)
+        self.assertIn("is_abnormal BOOLEAN NOT NULL DEFAULT FALSE", migration)
+        self.assertIn("abnormal_since TIMESTAMPTZ", migration)
         self.assertEqual(
             migration.count("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
-            8,
+            9,
         )
         self.assertEqual(
             migration.count("updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
-            8,
+            9,
         )
         self.assertEqual(
             migration.count("PRIMARY KEY (match_id, company_id, seq)"),
@@ -258,12 +343,19 @@ class PostgresOddsStoreTests(unittest.TestCase):
         with patch("fetch_data.odds_postgres.execute_values") as execute:
             store._upsert_snapshot_sync(snapshot)
 
-        self.assertEqual(execute.call_count, 4)
+        self.assertEqual(execute.call_count, 6)
         statements = [call.args[1] for call in execute.call_args_list]
         self.assertIn("titan007_handicap_changes", statements[0])
         self.assertIn("titan007_1x2_changes", statements[1])
         self.assertIn("titan007_over_under_changes", statements[2])
-        self.assertIn("titan007_odds_fetch_status", statements[3])
+        self.assertEqual(
+            statements[3:6],
+            [
+                UPSERT_HANDICAP_FETCH_STATUS,
+                UPSERT_ONE_X_TWO_FETCH_STATUS,
+                UPSERT_OVER_UNDER_FETCH_STATUS,
+            ],
+        )
         self.assertIn("updated_at = NOW()", statements[0])
         self.assertIn("updated_at = NOW()", statements[1])
         self.assertIn("updated_at = NOW()", statements[2])
@@ -272,16 +364,51 @@ class PostgresOddsStoreTests(unittest.TestCase):
         self.assertEqual(handicap_values[10], "上升")
         self.assertEqual(handicap_values[13], "不变")
         self.assertEqual(handicap_values[15], "下降")
-        fetch_status = execute.call_args_list[3].args[2][0]
         self.assertEqual(
-            fetch_status[:9],
-            (3020831, 3, True, True, True, 1, 1, 1, 1),
+            [call.args[2][0] for call in execute.call_args_list[3:6]],
+            [
+                (3020831, 3, True, 1, 1),
+                (3020831, 3, True, 1, 1),
+                (3020831, 3, True, 1, 1),
+            ],
         )
-        self.assertIsNotNone(fetch_status[9])
         completion_statements = store._connection.cursor_instance.executions
         self.assertIn("status_text = '完'", completion_statements[1][0])
         self.assertIn("IS NOT DISTINCT FROM", completion_statements[2][0])
         self.assertIn("crawl_status = '已完成'", completion_statements[-1][0])
+
+    def test_partial_snapshot_writes_only_successful_market(self) -> None:
+        complete = build_complete_snapshot()
+        successful = OddsMarketRequest(3, "handicap")
+        failed = OddsMarketRequest(3, "over_under")
+        snapshot = OddsSnapshot(
+            match_id=complete.match_id,
+            companies=complete.companies,
+            handicap_changes=complete.handicap_changes,
+            one_x_two_changes=[],
+            over_under_changes=[],
+            market_results=[
+                OddsMarketResult(successful, True),
+                OddsMarketResult(failed, False, "temporary failure"),
+            ],
+        )
+        store = PostgresOddsStore("postgresql://example/football")
+        store._connection = FakeConnection()
+        store._connection.cursor_instance.fetchone_results = [
+            ("match_basic_info",),
+            (False,),
+            ("match_status", "match_basic_info"),
+        ]
+
+        with patch("fetch_data.odds_postgres.execute_values") as execute:
+            store._upsert_snapshot_sync(snapshot)
+
+        statements = [call.args[1] for call in execute.call_args_list]
+        self.assertEqual(len(statements), 2)
+        self.assertIn("titan007_handicap_changes", statements[0])
+        self.assertEqual(statements[1], UPSERT_HANDICAP_FETCH_STATUS)
+        self.assertNotIn("titan007_1x2_changes", "".join(statements))
+        self.assertNotIn("titan007_over_under_changes", "".join(statements))
 
     def test_final_empty_markets_matching_empty_database_are_complete(self) -> None:
         store = PostgresOddsStore("postgresql://example/football")
@@ -305,13 +432,14 @@ class PostgresOddsStoreTests(unittest.TestCase):
         with patch("fetch_data.odds_postgres.execute_values") as execute:
             store._upsert_snapshot_sync(snapshot)
 
-        execute.assert_called_once()
-        fetch_status = execute.call_args.args[2][0]
         self.assertEqual(
-            fetch_status[:9],
-            (3020831, 47, True, True, True, None, None, None, 1),
+            [call.args[2][0] for call in execute.call_args_list],
+            [
+                (3020831, 47, True, None, 1),
+                (3020831, 47, True, None, 1),
+                (3020831, 47, True, None, 1),
+            ],
         )
-        self.assertIsNotNone(fetch_status[9])
 
     def test_unfinished_match_does_not_verify_final_odds(self) -> None:
         store = PostgresOddsStore("postgresql://example/football")
@@ -322,7 +450,11 @@ class PostgresOddsStoreTests(unittest.TestCase):
 
         self.assertEqual(
             values,
-            [(3020831, 3, False, False, False, None, None, None, 1, None)],
+            {
+                "handicap": [(3020831, 3, False, None, 1)],
+                "one_x_two": [(3020831, 3, False, None, 1)],
+                "over_under": [(3020831, 3, False, None, 1)],
+            },
         )
         self.assertFalse(
             any("IS NOT DISTINCT FROM" in statement for statement, _ in cursor.executions)
@@ -351,7 +483,11 @@ class PostgresOddsStoreTests(unittest.TestCase):
 
         self.assertEqual(
             values,
-            [(3020831, 47, False, True, True, None, None, None, 1, None)],
+            {
+                "handicap": [(3020831, 47, False, None, 1)],
+                "one_x_two": [(3020831, 47, True, None, 1)],
+                "over_under": [(3020831, 47, True, None, 1)],
+            },
         )
 
     def test_mismatched_latest_market_row_is_not_complete(self) -> None:
@@ -369,5 +505,9 @@ class PostgresOddsStoreTests(unittest.TestCase):
 
         self.assertEqual(
             values,
-            [(3020831, 3, False, True, True, None, 1, 1, 1, None)],
+            {
+                "handicap": [(3020831, 3, False, None, 1)],
+                "one_x_two": [(3020831, 3, True, 1, 1)],
+                "over_under": [(3020831, 3, True, 1, 1)],
+            },
         )

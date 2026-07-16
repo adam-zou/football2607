@@ -192,12 +192,12 @@ class ProxyManager:
                 )
             except (ProxyError, ValueError):
                 if self.observability is not None:
-                    self.observability.record_health("proxy", False, "fetch failed")
+                    self.observability.record_health("proxy", False, "获取代理失败")
                 raise
             except Exception:
                 if self.observability is not None:
-                    self.observability.record_health("proxy", False, "fetch failed")
-                raise ProxyError("failed to fetch proxy from supplier") from None
+                    self.observability.record_health("proxy", False, "获取代理失败")
+                raise ProxyError("从代理供应商获取代理失败") from None
 
             try:
                 is_valid = await asyncio.to_thread(
@@ -213,18 +213,18 @@ class ProxyManager:
                         "proxy_validation_total", result="failure"
                     )
                     self.observability.record_health(
-                        "proxy", False, "validation failed"
+                        "proxy", False, "代理验证失败"
                     )
-                raise ProxyError("proxy validation failed") from None
+                raise ProxyError("代理验证失败") from None
             if not is_valid:
                 if self.observability is not None:
                     self.observability.increment(
                         "proxy_validation_total", result="failure"
                     )
                     self.observability.record_health(
-                        "proxy", False, "validation failed"
+                        "proxy", False, "代理验证失败"
                     )
-                raise ProxyError("proxy validation failed")
+                raise ProxyError("代理验证失败")
 
             # 只有“成功获取 + 成功验证”后才替换旧缓存。
             self._proxy = proxy
@@ -242,6 +242,17 @@ class ProxyManager:
 
         async with self._get_lock():
             self._consecutive_errors = 0
+
+    async def force_refresh(self) -> ProxySettings:
+        """立即丢弃缓存代理，并获取、验证一个新代理。"""
+
+        async with self._get_lock():
+            self._proxy = None
+            self._updated_at = 0.0
+            self._consecutive_errors = 0
+            if self.observability is not None:
+                self.observability.increment("proxy_invalidations_total")
+        return await self.get_proxy()
 
     async def report_error(self) -> None:
         """累计连续失败；达到阈值后让下一次请求强制获取新代理。"""
@@ -321,7 +332,7 @@ class ProxyManager:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read().decode("utf-8")
         except Exception:
-            raise ProxyError("failed to fetch proxy from supplier") from None
+            raise ProxyError("从代理供应商获取代理失败") from None
 
     @staticmethod
     def _validate_proxy(

@@ -2,9 +2,7 @@
 
 from .models import (
     HandicapChange,
-    Match,
     MatchBasicInfo,
-    MatchStatus,
     Movement,
     OddsSnapshot,
     OneXTwoChange,
@@ -13,9 +11,7 @@ from .models import (
 
 __all__ = [
     "HandicapChange",
-    "Match",
     "MatchBasicInfo",
-    "MatchStatus",
     "Movement",
     "OddsSnapshot",
     "OneXTwoChange",

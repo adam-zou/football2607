@@ -17,13 +17,13 @@ def build_parser() -> argparse.ArgumentParser:
     """声明比赛 ID、机构、并发量等命令行参数。"""
 
     parser = argparse.ArgumentParser(
-        description="Fetch Titan007 odds changes for one match into PostgreSQL"
+        description="抓取一场 Titan007 比赛的赔率变化并写入 PostgreSQL"
     )
-    parser.add_argument("match_id", type=int, help="Titan007 match ID")
+    parser.add_argument("match_id", type=int, help="Titan007 比赛 ID")
     parser.add_argument(
         "--database-url",
         default=os.environ.get("DATABASE_URL"),
-        help="PostgreSQL DSN; defaults to DATABASE_URL",
+        help="PostgreSQL 连接地址；默认读取 DATABASE_URL",
     )
     parser.add_argument(
         "--company-id",
@@ -31,24 +31,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="company_ids",
         type=int,
         choices=list(Titan007OddsProvider.COMPANIES),
-        help="fetch only this company; repeat for multiple companies",
+        help="只抓取指定公司；可重复传入多个公司",
     )
     parser.add_argument(
         "--headed",
         action="store_true",
-        help="show the browser window (useful when diagnosing anti-bot checks)",
+        help="显示浏览器窗口，用于排查反爬拦截",
     )
     parser.add_argument(
         "--timeout",
         type=float,
-        default=30.0,
-        help="page timeout in seconds (default: 30)",
+        default=10.0,
+        help="单个页面超时秒数（默认：10）",
     )
     parser.add_argument(
         "--concurrency",
         type=int,
         default=6,
-        help="maximum pages fetched concurrently (default: 6)",
+        help="最大页面并发数（默认：6）",
     )
     return parser
 
@@ -57,7 +57,7 @@ async def run(args: argparse.Namespace) -> int:
     """抓取赔率快照，并在一个数据库事务中写入三张表。"""
 
     if not args.database_url:
-        raise ValueError("--database-url or DATABASE_URL is required")
+        raise ValueError("必须提供 --database-url 或 DATABASE_URL")
 
     proxy_manager = ProxyManager.from_env()
     provider = Titan007OddsProvider(
@@ -78,14 +78,14 @@ async def run(args: argparse.Namespace) -> int:
         await store.close()
 
     print(
-        "stored odds changes: "
-        f"match_id={snapshot.match_id} "
-        f"companies={','.join(str(value) for value in snapshot.companies) or '-'} "
-        f"failed_companies="
-        f"{','.join(str(value) for value in snapshot.failed_companies) or '-'} "
-        f"handicap={len(snapshot.handicap_changes)} "
-        f"one_x_two={len(snapshot.one_x_two_changes)} "
-        f"over_under={len(snapshot.over_under_changes)}"
+        "赔率变化已保存："
+        f"比赛ID={snapshot.match_id} "
+        f"成功页面={len(snapshot.successful_markets)} "
+        f"失败页面="
+        f"{','.join(f'{item.company_id}/{item.market}' for item in snapshot.failed_markets) or '-'} "
+        f"亚让={len(snapshot.handicap_changes)} "
+        f"胜平负={len(snapshot.one_x_two_changes)} "
+        f"进球数={len(snapshot.over_under_changes)}"
     )
     return 0
 
@@ -101,7 +101,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 用户主动按 Ctrl+C 不打印错误堆栈，直接返回标准中断码。
         return 130
     except Exception as error:
-        print(f"odds fetch failed: {error}", file=sys.stderr)
+        print(f"赔率采集失败：{error}", file=sys.stderr)
         return 1
 
 

@@ -6,20 +6,7 @@
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
-
-
-class MatchStatus(str, Enum):
-    """统一后的比赛状态，屏蔽不同数据源使用的不同原始文字。"""
-
-    SCHEDULED = "scheduled"
-    LIVE = "live"
-    HALF_TIME = "half_time"
-    FINISHED = "finished"
-    POSTPONED = "postponed"
-    CANCELLED = "cancelled"
-    ABANDONED = "abandoned"
-    UNKNOWN = "unknown"
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class Movement(str, Enum):
@@ -28,32 +15,6 @@ class Movement(str, Enum):
     UP = "上升"
     DOWN = "下降"
     UNCHANGED = "不变"
-
-
-@dataclass(frozen=True)
-class Match:
-    """从比赛列表页得到的一场比赛快照。
-
-    ``frozen=True`` 表示对象创建后不能修改，避免异步任务之间意外篡改同一份
-    抓取结果。``status_text`` 保留网页原文，``status`` 则方便程序统一判断。
-    """
-
-    source: str
-    match_id: str
-    league: str
-    home_team: str
-    away_team: str
-    score: Optional[str]
-    home_score: Optional[int]
-    away_score: Optional[int]
-    status: MatchStatus
-    status_text: str
-    scheduled_time: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为可交给 ``json.dumps`` 的普通字典。"""
-
-        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -128,15 +89,51 @@ class OverUnderChange(OddsChange):
 
 
 @dataclass(frozen=True)
+class OddsMarketRequest:
+    """一个可独立抓取、保存和重试的机构市场页面。"""
+
+    company_id: int
+    market: str
+
+
+@dataclass(frozen=True)
+class OddsMarketResult:
+    """一个机构市场页面的采集结果；空市场也属于成功。"""
+
+    request: OddsMarketRequest
+    succeeded: bool
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class OddsSnapshot:
-    """一次抓取的赔率快照，记录成功公司和被放弃公司的失败原因。"""
+    """一次抓取的赔率快照，按机构市场记录每个页面的成败。"""
 
     match_id: int
     companies: Dict[int, str]
     handicap_changes: List[HandicapChange]
     one_x_two_changes: List[OneXTwoChange]
     over_under_changes: List[OverUnderChange]
-    failed_companies: Dict[int, str] = field(default_factory=dict)
+    market_results: List[OddsMarketResult] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    @property
+    def successful_markets(self) -> Tuple[OddsMarketRequest, ...]:
+        """返回成功页面；兼容旧调用者构造的完整公司快照。"""
+
+        if not self.market_results:
+            return tuple(
+                OddsMarketRequest(company_id, market)
+                for company_id in self.companies
+                for market in ("handicap", "one_x_two", "over_under")
+            )
+        return tuple(
+            result.request for result in self.market_results if result.succeeded
+        )
+
+    @property
+    def failed_markets(self) -> Dict[OddsMarketRequest, str]:
+        return {
+            result.request: result.error or "未知错误"
+            for result in self.market_results
+            if not result.succeeded
+        }

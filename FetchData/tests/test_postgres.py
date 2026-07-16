@@ -4,9 +4,11 @@ from unittest.mock import patch
 
 from fetch_data.models import MatchBasicInfo
 from fetch_data.postgres import (
-    FETCH_FINAL_STATUS_REPAIR_IDS,
+    FETCH_PENDING_DYNAMIC_IDS,
     FETCH_PENDING_DETAIL_IDS,
     INITIALIZE_MATCH_STATUS_TABLE,
+    RECORD_DYNAMIC_FAILURE,
+    RECORD_DYNAMIC_SUCCESS,
     parse_scheduled_at,
 )
 
@@ -80,16 +82,17 @@ class PostgresMatchStoreTests(unittest.TestCase):
         self.assertIn("detail_status = '未完成'", FETCH_PENDING_DETAIL_IDS)
         self.assertNotIn("crawl_status = '未完成'", FETCH_PENDING_DETAIL_IDS)
 
-        self.assertIn("detail_status = '已完成'", FETCH_FINAL_STATUS_REPAIR_IDS)
-        self.assertIn("crawl_status = '未完成'", FETCH_FINAL_STATUS_REPAIR_IDS)
-        self.assertIn("dynamic_updated_at", FETCH_FINAL_STATUS_REPAIR_IDS)
-        self.assertIn("INTERVAL '3 hours'", FETCH_FINAL_STATUS_REPAIR_IDS)
-        self.assertIn("final_status_checked_at", FETCH_FINAL_STATUS_REPAIR_IDS)
+        self.assertIn("detail_status = '已完成'", FETCH_PENDING_DYNAMIC_IDS)
+        self.assertIn("crawl_status = '未完成'", FETCH_PENDING_DYNAMIC_IDS)
+        self.assertIn("INTERVAL '24 hours'", FETCH_PENDING_DYNAMIC_IDS)
+        self.assertIn("next_attempt_at", FETCH_PENDING_DYNAMIC_IDS)
 
     def test_migrations_define_detail_and_dynamic_tracking(self) -> None:
         self.assertIn("detail_status TEXT", INITIALIZE_MATCH_STATUS_TABLE)
-        self.assertIn("final_status_checked_at TIMESTAMPTZ", INITIALIZE_MATCH_STATUS_TABLE)
         self.assertIn("dynamic_updated_at TIMESTAMPTZ", INITIALIZE_MATCH_STATUS_TABLE)
+        self.assertIn("CREATE TABLE IF NOT EXISTS match_dynamic_schedule", INITIALIZE_MATCH_STATUS_TABLE)
+        self.assertIn("INTERVAL '8 hours'", RECORD_DYNAMIC_SUCCESS)
+        self.assertIn("INTERVAL '3 hours'", RECORD_DYNAMIC_FAILURE)
 
     def test_successful_detail_write_marks_detail_status_completed(self) -> None:
         from fetch_data.postgres import PostgresMatchStore
@@ -108,25 +111,24 @@ class PostgresMatchStoreTests(unittest.TestCase):
             any("detail_status = '已完成'" in statement for statement in statements)
         )
 
-    def test_final_repair_only_applies_finished_detail_and_records_check(self) -> None:
+    def test_dynamic_write_updates_current_fields_and_schedules_success(self) -> None:
         from fetch_data.postgres import PostgresMatchStore
 
         store = PostgresMatchStore("postgresql://example/football")
         store._connection = FakeConnection()
 
         with patch("fetch_data.postgres.execute_values") as execute:
-            store._repair_final_statuses_sync([detail("完")])
+            store._upsert_match_dynamics_sync([detail("完")])
 
-        repair_statement = execute.call_args.args[1]
-        self.assertIn("repair.status_text = '完'", repair_statement)
-        self.assertIn("dynamic_updated_at = NOW()", repair_statement)
+        dynamic_statement = execute.call_args.args[1]
+        self.assertIn("scheduled_time = dynamic.scheduled_time", dynamic_statement)
+        self.assertIn("status_text = dynamic.status_text", dynamic_statement)
+        self.assertIn("dynamic_updated_at = NOW()", dynamic_statement)
         statements = [
             statement
             for statement, _ in store._connection.cursor_instance.executions
         ]
-        self.assertTrue(
-            any("final_status_checked_at = NOW()" in statement for statement in statements)
-        )
+        self.assertIn(RECORD_DYNAMIC_SUCCESS, statements)
 
 
 if __name__ == "__main__":
