@@ -12,6 +12,14 @@ flowchart LR
     TitanDetail["Titan007 crown-name detail page<br/>{match_id}sb.htm"]
     TitanOdds["Titan007 odds-change pages"]
 
+    SimpleList["SimpleCrawler/fetch_match_ids.py"]
+    SimpleDetail["SimpleCrawler/fetch_match_details.py"]
+    SimpleOdds["SimpleCrawler/fetch_odds_pages.py"]
+    SimpleCompletion["SimpleCrawler/check_match_completion.py"]
+    SimpleProxy["SimpleCrawler/proxy_scheduler.py"]
+    SimpleRuntime["SimpleCrawler/run_scheduler.py"]
+    SimpleDashboard["SimpleCrawler dashboard<br/>127.0.0.1:8081"]
+    ProxyApi["51Daili proxy API<br/>10 IPs every 2 seconds"]
     SyncMatches["sync-match-status"]
     FetchOdds["fetch-odds"]
     Proxy["ProxyManager"]
@@ -26,8 +34,33 @@ flowchart LR
     OverUnderOdds[("titan007_over_under_changes")]
     OddsSchedule[("titan007_odds_market_schedule")]
     DynamicSchedule[("match_dynamic_schedule")]
+    SimpleMatchIds[("SimpleCrawler database<br/>match_ids")]
+    SimpleMatchDetails[("SimpleCrawler database<br/>match_details")]
+    SimpleOddsRows[("SimpleCrawler database<br/>three Titan007 odds-change tables")]
 
     TitanList --> SyncMatches
+    TitanList --> SimpleList
+    SimpleList --> SimpleMatchIds
+    SimpleMatchIds --> SimpleDetail
+    TitanDetail --> SimpleDetail
+    SimpleDetail --> SimpleMatchDetails
+    SimpleMatchIds --> SimpleOdds
+    TitanOdds --> SimpleOdds
+    SimpleOdds --> SimpleOddsRows
+    SimpleMatchDetails --> SimpleCompletion
+    SimpleOddsRows --> SimpleCompletion
+    SimpleCompletion --> SimpleMatchIds
+    ProxyApi --> SimpleProxy
+    SimpleRuntime --> SimpleProxy
+    SimpleRuntime --> SimpleList
+    SimpleRuntime --> SimpleDetail
+    SimpleRuntime --> SimpleOdds
+    SimpleRuntime --> SimpleCompletion
+    SimpleRuntime --> SimpleDashboard
+    SimpleProxy --> SimpleList
+    SimpleProxy --> SimpleDetail
+    SimpleProxy --> SimpleOdds
+    SimpleProxy --> SimpleCompletion
     TitanDetail --> SyncMatches
     TitanOdds --> SyncMatches
     SyncMatches --> MatchStatus
@@ -52,8 +85,169 @@ flowchart LR
 
 | Command | Python entrypoint | Purpose | Persistent write |
 | --- | --- | --- | --- |
+| `python3 SimpleCrawler/run_scheduler.py` | `SimpleCrawler/run_scheduler.py:main` | Run the proxy service and the four independent, single-instance crawler loops | None directly; child jobs own their writes |
+| `python3 SimpleCrawler/fetch_match_ids.py` | `SimpleCrawler/fetch_match_ids.py:main` | Fetch the currently rendered Titan007 match IDs, print them, and store unseen IDs | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
+| `python3 SimpleCrawler/fetch_match_details.py [match_id ...]` | `SimpleCrawler/fetch_match_details.py:main` | Fetch and store detail-page fields for selected IDs or every database ID | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
+| `python3 SimpleCrawler/fetch_odds_pages.py [match_id ...]` | `SimpleCrawler/fetch_odds_pages.py:main` | Fetch, parse, and store three odds markets for each configured company and selected match | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
+| `python3 SimpleCrawler/check_match_completion.py` | `SimpleCrawler/check_match_completion.py:main` | Re-fetch odds-page row counts for finished matches and mark stable matches complete | Updates `match_ids.crawl_status` in the dedicated PostgreSQL database |
+| `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
 | `sync-match-status` | `fetch_data.status_cli:main` | Continuously synchronize match IDs, details, and odds | PostgreSQL |
 | `fetch-odds` | `fetch_data.odds_cli:main` | Fetch and persist three odds markets for one match and selected companies | Three odds tables, verification status, and possibly match completion |
+
+## Standalone match-ID discovery
+
+`SimpleCrawler/run_scheduler.py` is the long-running supervisor for the standalone
+crawler. A non-blocking process lock allows only one supervisor instance. It reuses
+an already healthy proxy lease service or starts `proxy_scheduler.py`, then starts
+four independent worker threads and one proxy-health sampling thread. The sampler
+queries the proxy service `/health` endpoint every ten seconds and appends the pool,
+lease, availability, page-slot, received, and validated counts to the proxy dashboard
+log. A failed sample marks that panel unhealthy until the next successful sample.
+Each worker runs its existing one-shot script as
+a child process, captures its merged stdout/stderr while preserving prefixed terminal
+output, waits for that child to finish, waits its post-round interval, and
+only then starts the next round. Consequently, a slow round never overlaps the next
+round of the same job, and no `--limit` is passed by the supervisor. Child processes
+inherit the parent environment without adding `FetchData` to `PYTHONPATH`;
+SimpleCrawler is independently installable from its own `pyproject.toml`.
+
+The supervisor also owns a read-only human dashboard on `127.0.0.1:8081` by
+default. `/` renders separate panels for the proxy service and all four jobs;
+`/api/status` returns their current state, latest timing and exit information, and
+the most recent 400 log lines per component. The browser polls once per second and
+auto-scrolls active logs. `SIMPLE_CRAWLER_MONITOR_HOST` changes the bind address,
+and `SIMPLE_CRAWLER_MONITOR_PORT=0` disables HTTP. State and logs are process-local
+and disappear when the supervisor stops. An externally managed proxy service has
+health state but only supervisor lifecycle messages because its stdout is not owned
+by this process.
+
+The default post-round intervals are 60 seconds for match-ID discovery, 5 seconds
+for details, 5 seconds for odds, and 60 seconds for completion checks. They can be
+overridden with `SIMPLE_CRAWLER_ID_INTERVAL_SECONDS`,
+`SIMPLE_CRAWLER_DETAIL_INTERVAL_SECONDS`,
+`SIMPLE_CRAWLER_ODDS_INTERVAL_SECONDS`, and
+`SIMPLE_CRAWLER_COMPLETION_INTERVAL_SECONDS`. Odds and completion workers do not
+share a lock and may run concurrently. The completion worker can therefore invoke
+the one-shot `fetch_odds_pages.py <match_id>` child for an overdue match even while
+the normal odds worker is active. SIGINT or SIGTERM stops active children and the
+proxy service started by the supervisor. An independently managed healthy proxy
+service is reused and left running.
+
+`SimpleCrawler/fetch_match_ids.py` remains a one-shot entrypoint. It launches one
+Chromium browser through a lease from the shared proxy service, waits for the
+rendered `tr1_<match_id>` rows on `oldIndexall.aspx`, prints the unique positive
+IDs in ascending order, inserts unseen IDs into its dedicated PostgreSQL database,
+and exits.
+
+The connection string comes only from `SIMPLE_CRAWLER_DATABASE_URL` in
+`SimpleCrawler/.env`. The script creates `match_ids` on first use. Its `match_id`
+column is the primary key, so repeated list fetches use `ON CONFLICT DO NOTHING`
+and preserve the original `created_at` discovery time. `crawl_status` defaults to
+`未完成` and is restricted to `未完成`, `已完成`, `暂停爬取`, or `异常`;
+completion checks update it together with `updated_at`.
+
+All standalone scripts take their persistent defaults from `SimpleCrawler/.env`.
+`SIMPLE_CRAWLER_ACTIVE_CRAWL_STATUSES` is a comma-separated scope shared by the
+detail, odds, and completion scripts and defaults to only `未完成`. Database-wide
+selection and explicitly supplied match IDs are both filtered through this scope,
+so `已完成`, `暂停爬取`, and `异常` do not re-enter those workflows by default. The
+match-list script only discovers IDs and inserts unseen rows as `未完成`; conflicts
+preserve the existing status.
+The file configures the list and detail URLs, per-step timeouts, list settle delay,
+optional detail limit, detail and odds page concurrency, headed mode, and mandatory
+proxy supplier credentials. Explicit command line arguments override environment
+defaults; `--headed` and `--headless` can override the configured browser mode in
+either direction.
+
+Every standalone network page must acquire a lease from
+`SimpleCrawler/proxy_scheduler.py`; direct and fixed-proxy modes are not available.
+The scheduler is one long-running localhost HTTP service and is the only process
+that calls the supplier. It calls immediately and then every two seconds; each
+response contributes up to ten `host:port` addresses to the one shared in-memory
+pool only after validation. The ten candidates are checked concurrently through
+their authenticated HTTPS proxy against `PROXY_TEST_URL`; only a 2xx or 3xx
+response enters the pool. `/health` reports the latest received and validated
+counts, distinct available proxies, and remaining page-assignment slots. An
+address expires 30 seconds after its supplier request started and may be assigned
+to at most five pages across all crawler processes, including five concurrent
+browser contexts. The fifth assignment permanently retires that address; an
+earlier page exception retires it immediately. Existing concurrent pages may
+finish, but releases never restore consumed assignment slots, and later supplier
+responses cannot re-add a retired address during the scheduler process lifetime.
+Expired addresses and abandoned leases are reaped before another allocation.
+
+The list, detail, odds, and completion scripts are lease clients only. They call
+the configured `PROXY_SCHEDULER_URL` for `/lease` and `/release`, then create a
+fresh proxy-bound Chromium context for each page. They never read
+`PROXY_API_URL`, never maintain a local pool, and fail instead of crawling when
+the central service is unavailable. Start `proxy_scheduler.py` before any crawler.
+
+`SimpleCrawler/fetch_match_details.py` reads IDs from the same database. With
+positional IDs it inserts unseen IDs and fetches only IDs whose status is in the
+configured active-status scope; without positional IDs it applies that same scope
+to `match_ids`. `--limit` optionally bounds either mode. One Chromium browser is
+reused by a bounded worker queue. Up to
+`SIMPLE_CRAWLER_DETAIL_CONCURRENCY` matches are active at once (default 2), and
+each receives its own proxy lease, browser context, and page. Scripts remain
+enabled because the detail page uses them to populate score and status; styles,
+images, media, and fonts are blocked. Results are handled in completion order by
+one database connection. Successful details are committed individually, so one
+page failure does not discard other work.
+
+The standalone `match_details` table owns league, home and away team, original
+scheduled-time text, optional scores, and page status. `match_id` is both its
+primary key and a cascading foreign key to `match_ids`; `created_at` records the
+first successful detail fetch and conflict updates refresh `updated_at`.
+
+`SimpleCrawler/fetch_odds_pages.py` reads active-status `match_ids` unless
+positional IDs or `SIMPLE_CRAWLER_ODDS_MATCH_LIMIT` further restrict the run.
+Positional IDs cannot bypass the active-status filter. Company IDs are configured
+as a comma-separated list. Every match-company-market combination is one page job
+in a bounded queue. One Chromium browser runs up to
+`SIMPLE_CRAWLER_ODDS_PAGE_CONCURRENCY` jobs at once (default 4); every active job
+has an independent proxy lease and browser context. Parsed results return in
+completion order and are written serially through one database connection. Each
+successful page is committed independently.
+
+The standalone odds script owns its parser and field model under
+`SimpleCrawler/simple_crawler`. This local module intentionally preserves the same
+Titan007 row semantics as the main collector without importing `fetch_data`. It
+writes the local company-name mapping in `simple_crawler/companies.py`; odds and
+completion logs render both ID and name from this single interface. Every child
+job prefixes output with its scheduler task name so interleaved concurrent logs
+remain attributable. It
+writes 亚让 to `titan007_handicap_changes`, 胜平负 to
+`titan007_1x2_changes`, and 进球数 to `titan007_over_under_changes`. DOM order is
+reversed into stable `seq` values, scores are split, red/green/no-color becomes
+上升/下降/不变, 封 rows use null market fields, and raw plus numeric line values are
+preserved. It does not add scheduling, retry state, or page-status tracking.
+Before parsing, the script rejects HTTP errors and pages containing access-denied,
+WAF, or CAPTCHA markers. A page without the target table is accepted as a valid
+empty market only when the odds shell or market navigation is present; otherwise
+it is a failure.
+
+`SimpleCrawler/check_match_completion.py` remains one-shot; the supervisor provides
+its 60-second post-round interval. It selects only rows in the configured
+active-status scope, then keeps
+finished matches plus non-finished matches whose parseable Asia/Shanghai scheduled
+time is at least four hours in the past. Finished matches are ordered
+first and checked across every configured company and all three markets. Only when
+every page succeeds and every fetched row count equals the corresponding stored
+table count does a finished match become `已完成`; a failed page or count mismatch
+leaves it `未完成` for the next run. After those checks, the completion worker first
+runs `SimpleCrawler/fetch_match_details.py <match_id>` for each overdue
+non-finished match and reloads the stored page status. If the detail refresh fails,
+the crawl status is left unchanged. If it updates the match to `完`, the match is
+left active and deferred to the next completion round, where it enters the normal
+finished-match odds verification path. Otherwise, the worker passes the match once
+to `SimpleCrawler/fetch_odds_pages.py <match_id>` for a final odds refresh. A
+successful final refresh marks it `暂停爬取`; any failed market page
+produces a nonzero child result, but the match is still marked `暂停爬取` while failed
+pages are at most half of all attempted pages. Only a strict majority of failed
+pages marks the match `异常`. Configuration, database, browser, or child-process
+failures that prevent a reliable page count do not update `crawl_status`, leaving
+the match in its current active state for a later retry. Neither terminal status
+re-enters the default active scope.
 
 ## Continuous match synchronization
 
@@ -325,6 +519,11 @@ is also empty.
 
 | Module | Responsibility |
 | --- | --- |
+| `SimpleCrawler/simple_crawler/companies.py` | Standalone Titan007 company IDs, names, and log labels |
+| `SimpleCrawler/simple_crawler/models.py` | Standalone odds-change domain values |
+| `SimpleCrawler/simple_crawler/odds_parser.py` | Standalone Titan007 row validation and three-market parsing |
+| `SimpleCrawler/simple_crawler/monitoring.py` | Bounded runtime state plus the local monitoring dashboard and JSON endpoint |
+| `SimpleCrawler/pyproject.toml` | SimpleCrawler package metadata and complete runtime dependency declaration |
 | `fetch_data/models.py` | Match-detail and odds domain values |
 | `fetch_data/migrations/*.sql` | Single source of truth for PostgreSQL schema |
 | `fetch_data/schema.py` | Packaged migration loader |
