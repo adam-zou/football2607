@@ -18,12 +18,8 @@ from typing import Callable, Optional, Sequence, TextIO
 
 from dotenv import load_dotenv
 from simple_crawler.dashboard_statistics import fetch_daily_statistics
+from simple_crawler.file_lock import ExclusiveFileLock, FileAlreadyLocked
 from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - SimpleCrawler is deployed on Linux/macOS
-    fcntl = None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -58,32 +54,34 @@ class SchedulerAlreadyRunning(RuntimeError):
 class SchedulerLock:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock: Optional[ExclusiveFileLock] = None
         self._file: Optional[TextIO] = None
 
     def __enter__(self) -> "SchedulerLock":
-        if fcntl is None:
-            raise RuntimeError("当前平台不支持调度器单实例文件锁")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = self.path.open("a+", encoding="utf-8")
+        lock = ExclusiveFileLock(self.path, timeout=0)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            lock_file.close()
+            lock_file = lock.acquire()
+        except FileAlreadyLocked as error:
             raise SchedulerAlreadyRunning(
                 "SimpleCrawler 调度器已经在运行"
             ) from error
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write(str(os.getpid()))
-        lock_file.flush()
+        try:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(os.getpid()))
+            lock_file.flush()
+        except Exception:
+            lock.release()
+            raise
+        self._lock = lock
         self._file = lock_file
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        if self._file is None:
+        if self._lock is None:
             return
-        fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-        self._file.close()
+        self._lock.release()
+        self._lock = None
         self._file = None
 
 

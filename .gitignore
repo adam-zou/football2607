@@ -1,4 +1,5 @@
 /.venv/
 /SimpleCrawler/.env
+/MatchWeb/.env
 *.egg-info/
 .DS_Store

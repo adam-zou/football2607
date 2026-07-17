@@ -20,6 +20,7 @@ flowchart LR
     SimpleProxy["SimpleCrawler/proxy_scheduler.py"]
     SimpleRuntime["SimpleCrawler/run_scheduler.py"]
     SimpleDashboard["SimpleCrawler dashboard<br/>127.0.0.1:8081"]
+    MatchWeb["MatchWeb authenticated match view<br/>127.0.0.1:8082"]
     ProxyApi["51Daili proxy API<br/>10 IPs every 2 seconds"]
     SimpleMatchIds[("SimpleCrawler database<br/>match_ids")]
     SimpleMatchDetails[("SimpleCrawler database<br/>match_details")]
@@ -47,6 +48,8 @@ flowchart LR
     SimpleRuntime --> SimpleOdds
     SimpleRuntime --> SimpleCompletion
     SimpleRuntime --> SimpleDashboard
+    SimpleMatchIds --> MatchWeb
+    SimpleMatchDetails --> MatchWeb
     SimpleProxy --> SimpleList
     SimpleProxy --> SimpleDetail
     SimpleProxy --> SimpleOdds
@@ -63,6 +66,22 @@ flowchart LR
 | `python3 SimpleCrawler/fetch_odds_pages.py [match_id ...]` | `SimpleCrawler/fetch_odds_pages.py:main` | Fetch, parse, and store three odds markets for each configured company and selected match | Three odds-change tables and `titan007_odds_market_state` in the dedicated PostgreSQL database |
 | `python3 SimpleCrawler/check_match_completion.py` | `SimpleCrawler/check_match_completion.py:main` | Persist resumable 18-page final snapshots for matches whose finished detail has been stable for five minutes or whose kickoff is more than four hours old | Three odds-change tables, `titan007_odds_market_state`, and `match_ids.crawl_status` |
 | `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
+| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve the authenticated, read-only match list with date/status filters and 60-second browser refresh | None |
+
+## Authenticated match view
+
+`MatchWeb/server.py` is an independently started, read-only presentation service.
+It loads the same `SIMPLE_CRAWLER_DATABASE_URL` used by the crawler, accepts a
+Shanghai-calendar date and one of four presentation status groups, then joins
+`match_details` to `match_ids`. The status groups preserve the dashboard domain
+rules: minute/phase values are presented as in progress, `未开始` and `完` are
+exact groups, and every remaining source status is grouped as other. No crawler
+schedule or persisted record is changed.
+
+All HTML and JSON match routes require a server-validated, HMAC-signed login
+session. The configured username and password remain in environment settings.
+After the first query, the browser repeats the same read-only request every 60
+seconds. Match IDs link to Titan007's company-47 three-market odds page.
 
 ## Standalone match-ID discovery
 
@@ -79,7 +98,9 @@ output, waits for that child to finish, waits its post-round interval, and
 only then starts the next round. Consequently, a slow round never overlaps the next
 round of the same job, and no `--limit` is passed by the supervisor. Child processes
 inherit the parent environment, and SimpleCrawler is independently installable
-from its own `pyproject.toml`.
+from its own `pyproject.toml`. The supervisor lock uses the shared `portalocker`-
+backed file-lock adapter, so the same single-instance behavior applies on Windows,
+Linux, and macOS.
 
 The supervisor also owns a read-only human dashboard on `127.0.0.1:8081` by
 default. `/` renders separate panels for the proxy service and all four jobs;
@@ -174,6 +195,9 @@ permanently retires that address; an earlier page exception retires it immediate
 Existing concurrent pages may finish, but releases never restore consumed assignment slots, and later supplier
 responses cannot re-add a retired address during the scheduler process lifetime.
 Expired addresses and abandoned leases are reaped before another allocation.
+The supplier request timestamp is protected by the same cross-platform exclusive
+file-lock adapter, so independently started proxy-scheduler processes share the
+configured API minimum interval on Windows, Linux, and macOS.
 
 The list, detail, odds, and completion scripts are lease clients only. They call
 the configured `PROXY_SCHEDULER_URL` for `/lease` and `/release`. List and detail
@@ -308,6 +332,7 @@ assigns new `暂停爬取`/`异常` terminal outcomes.
 | Module | Responsibility |
 | --- | --- |
 | `SimpleCrawler/simple_crawler/companies.py` | Standalone Titan007 company IDs, names, and log labels |
+| `SimpleCrawler/simple_crawler/file_lock.py` | Cross-platform exclusive process file locks backed by `portalocker` |
 | `SimpleCrawler/simple_crawler/models.py` | Standalone odds-change domain values |
 | `SimpleCrawler/simple_crawler/odds_parser.py` | Standalone Titan007 row validation and three-market parsing |
 | `SimpleCrawler/simple_crawler/monitoring.py` | Bounded runtime state plus the local monitoring dashboard and JSON endpoint |

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>登录</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="login-page">
+    <main class="login-card">
+      <form method="post" action="/login" autocomplete="on">
+        <label class="sr-only" for="username">账号</label>
+        <input id="username" name="username" type="text" placeholder="账号" autocomplete="username" required autofocus />
+        <label class="sr-only" for="password">密码</label>
+        <input id="password" name="password" type="password" placeholder="密码" autocomplete="current-password" required />
+        <p class="login-error" id="login-error" hidden>账号或密码错误</p>
+        <button type="submit">登录</button>
+      </form>
+    </main>
+    <script>
+      document.getElementById('login-error').hidden = !new URLSearchParams(location.search).has('error');
+    </script>
+  </body>
+</html>

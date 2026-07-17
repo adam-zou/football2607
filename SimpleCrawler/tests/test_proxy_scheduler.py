@@ -1,8 +1,32 @@
 import threading
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from proxy_scheduler import ProxyClient, ProxyScheduler, ProxySchedulerError
+
+
+class GlobalApiRateLimitTests(unittest.TestCase):
+    def test_waits_and_records_timestamp_while_holding_process_lock(self) -> None:
+        scheduler = ProxyScheduler(
+            api_url="https://proxy.example.test",
+            username="user",
+            password="password",
+            api_min_interval_seconds=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "proxy-api.lock"
+            path.write_text("99", encoding="utf-8")
+            with (
+                patch("proxy_scheduler.GLOBAL_RATE_LIMIT_FILE", path),
+                patch("proxy_scheduler.time.time", side_effect=[100, 101]),
+                patch("proxy_scheduler.time.sleep") as sleep,
+            ):
+                scheduler._wait_for_global_api_slot()
+
+            sleep.assert_called_once_with(1)
+            self.assertEqual(path.read_text(encoding="utf-8"), "101")
 
 
 class FiveUseProxyTests(unittest.TestCase):

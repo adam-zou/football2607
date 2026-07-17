@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>比赛数据</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="dashboard">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Titan007 数据看板</p>
+          <h1>比赛数据</h1>
+        </div>
+        <div class="header-meta">
+          <span id="refresh-state">每 60 秒自动刷新</span>
+          <a href="/logout">退出</a>
+        </div>
+      </header>
+
+      <section class="filters" aria-label="查询参数">
+        <div class="field">
+          <label for="match-date">日期</label>
+          <input id="match-date" type="date" />
+        </div>
+        <fieldset class="status-filter">
+          <legend>比赛状态</legend>
+          <div class="segmented">
+            <input id="status-not-started" name="status" type="radio" value="未开始" />
+            <label for="status-not-started">未开始</label>
+            <input id="status-live" name="status" type="radio" value="进行中" checked />
+            <label for="status-live">进行中</label>
+            <input id="status-finished" name="status" type="radio" value="完" />
+            <label for="status-finished">完</label>
+            <input id="status-other" name="status" type="radio" value="其它" />
+            <label for="status-other">其它</label>
+          </div>
+        </fieldset>
+        <button id="query-button" class="query-button" type="button">查询</button>
+      </section>
+
+      <section class="results" aria-live="polite">
+        <div class="results-heading">
+          <div>
+            <h2>比赛列表</h2>
+            <p id="result-summary">正在读取比赛数据…</p>
+          </div>
+          <p id="updated-at"></p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>比赛 ID</th>
+                <th>联赛</th>
+                <th>开赛时间</th>
+                <th>状态</th>
+                <th>主队</th>
+                <th>比分</th>
+                <th>客队</th>
+                <th>爬取状态</th>
+                <th>数据更新时间</th>
+              </tr>
+            </thead>
+            <tbody id="match-rows"></tbody>
+          </table>
+          <div id="empty-state" class="empty-state" hidden>当前条件下没有比赛</div>
+          <div id="error-state" class="empty-state error-state" hidden></div>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

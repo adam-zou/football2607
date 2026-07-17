@@ -19,11 +19,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional
 
 from dotenv import load_dotenv
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
+from simple_crawler.file_lock import ExclusiveFileLock
 
 
 ENV_FILE = Path(__file__).with_name(".env")
@@ -427,27 +423,25 @@ class ProxyScheduler:
     def _wait_for_global_api_slot(self) -> None:
         if self.api_min_interval_seconds == 0:
             return
-        GLOBAL_RATE_LIMIT_FILE.touch(exist_ok=True)
-        with GLOBAL_RATE_LIMIT_FILE.open("r+", encoding="utf-8") as lock_file:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                raw = lock_file.read().strip()
-                last_request_at = float(raw) if raw else 0.0
-                wait_seconds = (
-                    self.api_min_interval_seconds
-                    - (time.time() - last_request_at)
-                )
-                if wait_seconds > 0:
-                    time.sleep(wait_seconds)
-                request_at = time.time()
-                lock_file.seek(0)
-                lock_file.truncate()
-                lock_file.write(str(request_at))
-                lock_file.flush()
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_timeout = self.api_min_interval_seconds + 5.0
+        with ExclusiveFileLock(
+            GLOBAL_RATE_LIMIT_FILE,
+            timeout=lock_timeout,
+        ) as lock_file:
+            lock_file.seek(0)
+            raw = lock_file.read().strip()
+            last_request_at = float(raw) if raw else 0.0
+            wait_seconds = (
+                self.api_min_interval_seconds
+                - (time.time() - last_request_at)
+            )
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            request_at = time.time()
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(request_at))
+            lock_file.flush()
 
     def _remove_expired(self, now: float) -> None:
         expired = [

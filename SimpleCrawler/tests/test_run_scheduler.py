@@ -202,7 +202,6 @@ class DailyStatisticsMonitorTests(unittest.TestCase):
         self.assertIsNone(statistics["error"])
 
 
-@unittest.skipIf(os.name == "nt", "fcntl lock is unavailable on Windows")
 class SchedulerLockTests(unittest.TestCase):
     def test_second_scheduler_cannot_acquire_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
