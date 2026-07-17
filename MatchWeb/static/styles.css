@@ -29,9 +29,7 @@ a { color: var(--green); text-underline-offset: 3px; }
 .login-error { margin: -2px 2px 0; color: #a23127; font-size: 14px; }
 
 .dashboard { width: min(1500px, calc(100% - 48px)); margin: 0 auto; padding: 36px 0 56px; }
-.page-header { display: flex; justify-content: space-between; align-items: end; margin-bottom: 26px; }
-.eyebrow { margin: 0 0 7px; color: var(--green); font-size: 12px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
-h1 { margin: 0; font-size: clamp(28px, 3vw, 42px); letter-spacing: -.04em; }
+.page-header { display: flex; justify-content: flex-end; align-items: end; margin-bottom: 18px; }
 .header-meta { display: flex; gap: 20px; color: var(--muted); font-size: 14px; }
 
 .filters, .results { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 10px 35px rgba(22,36,28,.045); }
