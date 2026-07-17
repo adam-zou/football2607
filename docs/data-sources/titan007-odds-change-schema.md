@@ -14,8 +14,8 @@
 - `titan007_1x2_changes`
 - `titan007_over_under_changes`
 
-另使用 `titan007_odds_fetch_status` 记录每个比赛、公司和市场的完场最终记录
-是否与数据库一致。该表记录核验结果和最后 `seq`，不重复保存赔率值。
+另使用 `titan007_odds_market_state` 记录每个比赛、公司和市场页面最近一次采集
+状态、记录数和内容摘要，不重复保存赔率值。
 
 本文先使用逻辑类型描述字段，实际 PostgreSQL 映射见“PostgreSQL 实现”。
 
@@ -186,8 +186,7 @@ movement = "上升" | "下降" | "不变" | null
 
 ## PostgreSQL 实现
 
-三张表由唯一迁移源
-`FetchData/fetch_data/migrations/003_titan007_odds_changes.sql` 创建，实际类型规则如下：
+三张表由 `SimpleCrawler/fetch_odds_pages.py` 中的建表语句创建，实际类型规则如下：
 
 - `match_id` 使用 `BIGINT`，`company_id` 和 `seq` 使用 `INTEGER`。
 - 比赛分钟和比分使用可空 `SMALLINT`。
@@ -197,46 +196,44 @@ movement = "上升" | "下降" | "不变" | null
 - 三张表分别以 `(match_id, company_id, seq)` 为主键。
 - 封盘检查约束保证三个市场值、转换值和 movement 均为 `null`。
 
-一次 `fetch-odds` 执行将所有成功市场页面的抓取结果放在同一个 PostgreSQL
-事务中 upsert。“机构 × 市场”页面是最小原子单元：亚让或胜平负成功就立即
-保存，即使同一机构的进球数页面失败也不会丢弃前两者。失败页面不执行写入，
-常驻同步任务只对该页面执行后续退避重试。主键冲突时更新该行所有页面字段。
+`SimpleCrawler/fetch_odds_pages.py` 以“机构 × 市场”页面作为最小采集和事务单元。
+成功页面的赔率变动记录按最多 500 行一批写入，并在同一事务更新页面采集状态；
+失败页面不写赔率数据，只单独提交失败状态。因此单个进球数页面失败不会丢弃
+同一轮中已经成功保存的亚让或胜平负页面。主键冲突时只有页面字段实际变化才
+更新记录并刷新 `updated_at`，未变化的历史记录保留原更新时间。
 
-页面在 `domcontentloaded` 后还必须通过 HTTP 状态、错误/拦截页关键字、市场容器
-或市场导航验证。只有确认是赔率市场页面但没有目标表格时才视为合法空市场；空
-市场不执行 INSERT，也不删除数据库已有记录。
+采集器从服务器返回的主文档 HTML 解析数据，并验证 HTTP 状态、错误或拦截页
+关键字、市场容器及市场导航。只有确认是赔率市场页面但没有目标表格时才视为
+合法空市场；空市场不执行 INSERT，也不删除数据库已有记录。
 
-赔率表和采集状态表不外键依赖 `match_status`，因此命令可以接收尚未进入比赛
-同步队列的 Titan007 比赛 ID。若该比赛已进入同步队列，赔率写入后会执行共享
-完成判定；只有比赛状态为“完”、北京时间开赛时间已过去至少 3 小时，并且六家
-公司的三个市场最后一条数据均与数据库一致时，`crawl_status` 才更新为“已完成”。
+三张赔率表不设置到 `match_ids` 的外键；页面状态表通过 `match_id` 关联
+`match_ids`。正常选择和显式 ID 模式都要求比赛处于启用的采集状态、已有
+`match_details`，且可解析的北京时间位于当前时间前 4 小时至后
+30 分钟。普通队列优先处理进行中、即将开赛和最近完场比赛。
 
 ## 赔率页面采集状态
 
-`titan007_odds_fetch_status` 以 `(match_id, company_id)` 为主键，包含：
+`titan007_odds_market_state` 以 `(match_id, company_id, market)` 为主键，包含：
 
-- `handicap_completed`：完场后亚让最新记录与数据库一致；
-- `one_x_two_completed`：完场后胜平负最新记录与数据库一致；
-- `over_under_completed`：完场后进球数最新记录与数据库一致；
-- `*_last_seq`：本次通过核验的市场最高 `seq`；
-- `verification_version`：核验语义版本；当前最终记录核验为 `1`；
-- `final_verified_at`：三个市场同时通过最终记录核验的时间；
-- `created_at`：该比赛、公司核验状态行的首次创建时间。
-- `updated_at`：最近一次核验尝试的写入时间。
+- `last_attempt_at`：最近一次页面采集时间；
+- `last_success_at`：最近一次成功时间；
+- `fetch_status`：`待抓取`、`成功` 或 `失败`；
+- `row_count`：最近一次成功解析的赔率变动记录数；
+- `content_hash`：规范化解析结果的 SHA-256 摘要；
+- `last_error`：最近一次失败原因；
+- `final_required`、`final_success_at`：最终快照是否待处理及成功时间；
+- `created_at`、`updated_at`：状态行的创建和更新时间。
 
-三个核验字段也按市场独立更新。某个市场页面失败时，另外两个成功市场本轮的
-核验结果仍会保存，失败市场原有核验状态不会被本轮错误覆盖。
+成功会刷新记录数、摘要和成功时间并清空错误；失败会保留上一次成功的记录数、
+摘要和成功时间，只更新尝试时间、状态和错误。
 
 三张赔率变化表同样包含 `created_at` 和 `updated_at`：首次写入时两者由数据库
 赋值；相同 `(match_id, company_id, seq)` 再次写入时保留 `created_at` 并刷新
 `updated_at`。
 
-只有 `match_basic_info.status_text = '完'` 且开赛已超过 3 小时时，存储层才在
-写入本次快照之前，取每个公司、市场最高 `seq` 的页面记录，与数据库上一次保存
-的最高 `seq` 记录进行空值安全的逐字段比较；完全一致才把该市场标志设为
-`true` 并保存最高 `seq`。若不一致，本次快照仍正常 upsert，但保持未完成，
-等待下一次抓取再次比较。页面没有赔率表时，
-若数据库同一比赛、公司、市场也没有任何记录，则“空对空”一致，标志为 `true`
-且 `*_last_seq = null`；数据库仍有记录则标志为 `false`。网络错误、超时或解析
-异常不会产生快照。旧版“请求成功”或基于赔率变动记录数量推断的完成状态使用
-`verification_version = 0`，不参与比赛完成判定，必须重新抓取核验。
+最终快照由 `SimpleCrawler/check_match_completion.py` 单独执行。北京时间开赛至少
+四小时后，它固定采集六家公司三个市场的 18 个页面。每个成功页面都在
+同一事务中写入赔率变动记录并设置 `final_success_at`；失败页面保持
+`final_required = true`。同一公司的待处理市场共用一个 Chromium context，
+但仍各自维护状态；重试批次只包含失败市场。只有全部 18 页成功写入后才把
+`crawl_status` 更新为 `已完成`，不再额外访问相同页面比较记录数。
