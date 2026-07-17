@@ -14,6 +14,7 @@ from run_scheduler import (
     monitor_address,
     positive_env_float,
     run_proxy_health_monitor,
+    run_daily_statistics_monitor,
     run_worker_loop,
     worker_specs,
 )
@@ -147,6 +148,60 @@ class ProxyHealthMonitorTests(unittest.TestCase):
         self.assertIn("当前代理 0 个", format_proxy_health({}))
 
 
+class DailyStatisticsMonitorTests(unittest.TestCase):
+    def test_updates_monitor_from_database_fetcher(self) -> None:
+        stop_event = threading.Event()
+        monitor = RuntimeMonitor()
+
+        def fetcher(database_url):
+            self.assertEqual(database_url, "postgresql://example")
+            stop_event.set()
+            return {
+                "date": "2026-07-17",
+                "match_count": 12,
+                "not_started_count": 2,
+                "finished_count": 7,
+                "in_progress_count": 2,
+                "postponed_count": 1,
+                "cancelled_count": 0,
+                "pending_count": 0,
+                "other_status_count": 0,
+                "crawl_unfinished_count": 6,
+                "crawl_completed_count": 6,
+                "abnormal_count": 1,
+                "paused_count": 2,
+                "finished_unfinished_count": 3,
+                "historical_match_count": 230,
+                "historical_not_started_count": 0,
+                "historical_in_progress_count": 0,
+                "historical_finished_count": 220,
+                "historical_postponed_count": 3,
+                "historical_cancelled_count": 2,
+                "historical_pending_count": 1,
+                "historical_other_status_count": 4,
+                "historical_unfinished_count": 8,
+                "historical_completed_count": 210,
+                "historical_paused_count": 10,
+                "historical_abnormal_count": 2,
+                "historical_finished_unfinished_count": 7,
+                "missing_details_count": 76,
+                "invalid_scheduled_time_count": 3,
+                "odds_counts": [],
+            }
+
+        run_daily_statistics_monitor(
+            stop_event,
+            monitor,
+            "postgresql://example",
+            0.001,
+            fetcher,
+        )
+
+        statistics = monitor.snapshot()["daily_statistics"]
+        self.assertEqual(statistics["match_count"], 12)
+        self.assertIsNone(statistics["error"])
+
+
 @unittest.skipIf(os.name == "nt", "fcntl lock is unavailable on Windows")
 class SchedulerLockTests(unittest.TestCase):
     def test_second_scheduler_cannot_acquire_lock(self) -> None:
@@ -176,8 +231,14 @@ class DashboardServerTests(unittest.TestCase):
             server.close()
 
         self.assertIn("SimpleCrawler 总监控", html)
+        self.assertIn("比赛数据统计", html)
+        self.assertIn("历史比赛", html)
+        self.assertIn("时间异常", html)
+        self.assertIn("待获取详情", html)
+        self.assertIn("完场但爬取未完成", html)
         self.assertIn("c.logs.join('\\n')", html)
         self.assertIn("抓取到 12 场比赛", payload)
+        self.assertIn('"daily_statistics"', payload)
 
 
 if __name__ == "__main__":

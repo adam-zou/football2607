@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import threading
 import time
+from copy import deepcopy
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Deque, Dict, Iterable, Optional, Tuple
+
+from .dashboard_statistics import empty_odds_counts
 
 
 COMPONENTS: Tuple[Tuple[str, str], ...] = (
@@ -55,6 +58,40 @@ class RuntimeMonitor:
             )
             for key, name in components
         }
+        self._daily_statistics: Dict[str, object] = {
+            "date": None,
+            "match_count": 0,
+            "not_started_count": 0,
+            "finished_count": 0,
+            "in_progress_count": 0,
+            "postponed_count": 0,
+            "cancelled_count": 0,
+            "pending_count": 0,
+            "other_status_count": 0,
+            "crawl_unfinished_count": 0,
+            "crawl_completed_count": 0,
+            "abnormal_count": 0,
+            "paused_count": 0,
+            "finished_unfinished_count": 0,
+            "historical_match_count": 0,
+            "historical_not_started_count": 0,
+            "historical_in_progress_count": 0,
+            "historical_finished_count": 0,
+            "historical_postponed_count": 0,
+            "historical_cancelled_count": 0,
+            "historical_pending_count": 0,
+            "historical_other_status_count": 0,
+            "historical_unfinished_count": 0,
+            "historical_completed_count": 0,
+            "historical_paused_count": 0,
+            "historical_abnormal_count": 0,
+            "historical_finished_unfinished_count": 0,
+            "missing_details_count": 0,
+            "invalid_scheduled_time_count": 0,
+            "odds_counts": empty_odds_counts(),
+            "updated_at": None,
+            "error": "正在读取当日统计",
+        }
 
     def append_log(self, key: str, message: str) -> None:
         timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
@@ -70,6 +107,18 @@ class RuntimeMonitor:
                 if not hasattr(component, name):
                     raise AttributeError(name)
                 setattr(component, name, value)
+
+    def update_daily_statistics(self, statistics: Dict[str, object]) -> None:
+        with self._lock:
+            self._daily_statistics = {
+                **statistics,
+                "updated_at": time.time(),
+                "error": None,
+            }
+
+    def set_daily_statistics_error(self, message: str) -> None:
+        with self._lock:
+            self._daily_statistics["error"] = message
 
     def snapshot(self) -> Dict[str, object]:
         with self._lock:
@@ -89,7 +138,12 @@ class RuntimeMonitor:
                         "logs": list(component.logs),
                     }
                 )
-        return {"generated_at": time.time(), "components": components}
+            daily_statistics = deepcopy(self._daily_statistics)
+        return {
+            "generated_at": time.time(),
+            "components": components,
+            "daily_statistics": daily_statistics,
+        }
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -115,6 +169,30 @@ DASHBOARD_HTML = """<!doctype html>
       padding:20px 24px 32px; }
     article { min-width:0; overflow:hidden; background:rgba(13,26,36,.94);
       border:1px solid var(--line); border-radius:12px; box-shadow:0 18px 45px #0004; }
+    .summary { margin:20px 24px 0; padding:16px; background:rgba(13,26,36,.94);
+      border:1px solid var(--line); border-radius:12px; box-shadow:0 18px 45px #0004; }
+    .summary-head { display:flex; justify-content:space-between; gap:12px;
+      align-items:baseline; margin-bottom:14px; }
+    .quality,.periods { display:grid; gap:12px; }
+    .quality { grid-template-columns:repeat(2,minmax(0,1fr)); margin-bottom:16px; }
+    .periods { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .period { padding:14px; border:1px solid var(--line); border-radius:10px;
+      background:#09141c; }
+    .period-title { display:flex; align-items:baseline; justify-content:space-between;
+      gap:10px; margin-bottom:12px; }
+    .period-title strong { font:650 16px/1.2 system-ui,sans-serif; }
+    .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+    .metric { padding:12px 14px; border:1px solid var(--line); border-radius:9px;
+      background:#09141c; }
+    .metric strong { display:block; margin-top:3px; color:var(--text); font-size:24px; }
+    .period .metric { padding:9px 10px; background:#071018; }
+    .period .metric strong { font-size:19px; }
+    .group-title { margin:14px 0 7px; color:var(--muted); font-size:12px; }
+    .warning-stat { display:flex; justify-content:space-between; margin-top:10px;
+      padding:9px 10px; border:1px solid #6b5425; border-radius:8px; color:var(--warn); }
+    table { width:100%; border-collapse:collapse; }
+    th,td { padding:8px 10px; border-top:1px solid var(--line); text-align:right; }
+    th:first-child,td:first-child { text-align:left; }
     .card-head { display:flex; justify-content:space-between; align-items:flex-start;
       gap:12px; padding:14px 16px; border-bottom:1px solid var(--line); }
     h2 { margin:0 0 4px; font:650 16px/1.2 system-ui,sans-serif; }
@@ -130,12 +208,54 @@ DASHBOARD_HTML = """<!doctype html>
     button { border:1px solid var(--line); border-radius:7px; padding:6px 10px;
       background:#10222e; color:var(--text); cursor:pointer; }
     @media (max-width:900px) { main { grid-template-columns:1fr; padding:14px; }
-      header { padding:16px; } pre { height:260px; } }
+      header { padding:16px; } .summary { margin:14px 14px 0; overflow:auto; }
+      .periods { grid-template-columns:1fr; } table { min-width:620px; } pre { height:260px; } }
   </style>
 </head>
 <body>
   <header><div><h1>SimpleCrawler 总监控</h1><div class="sub">各采集脚本运行状态与滚动日志</div></div>
     <div><button id="follow">自动滚动：开</button> <span id="clock" class="meta">连接中…</span></div></header>
+  <section class="summary"><div class="summary-head"><h2>比赛数据统计</h2><span id="stats-meta" class="meta">读取中…</span></div>
+    <div class="quality"><div class="metric"><span class="meta">待获取详情</span><strong id="missing-details-count">—</strong></div>
+      <div class="metric"><span class="meta">时间异常</span><strong id="invalid-scheduled-time-count">—</strong></div></div>
+    <div class="periods">
+      <div class="period"><div class="period-title"><strong>今日比赛</strong><span id="today-date" class="meta">—</span></div>
+        <div class="metric"><span class="meta">比赛总数</span><strong id="match-count">—</strong></div>
+        <div class="group-title">比赛状态</div><div class="metrics">
+          <div class="metric"><span class="meta">未开始</span><strong id="not-started-count">—</strong></div>
+          <div class="metric"><span class="meta">进行中</span><strong id="in-progress-count">—</strong></div>
+          <div class="metric"><span class="meta">完场</span><strong id="finished-count">—</strong></div>
+          <div class="metric"><span class="meta">推迟</span><strong id="postponed-count">—</strong></div>
+          <div class="metric"><span class="meta">取消</span><strong id="cancelled-count">—</strong></div>
+          <div class="metric"><span class="meta">待定</span><strong id="pending-count">—</strong></div>
+          <div class="metric"><span class="meta">其他状态</span><strong id="other-status-count">—</strong></div></div>
+        <div class="group-title">爬取状态</div><div class="metrics">
+          <div class="metric"><span class="meta">未完成</span><strong id="crawl-unfinished-count">—</strong></div>
+          <div class="metric"><span class="meta">已完成</span><strong id="crawl-completed-count">—</strong></div>
+          <div class="metric"><span class="meta">暂停爬取</span><strong id="paused-count">—</strong></div>
+          <div class="metric"><span class="meta">异常</span><strong id="abnormal-count">—</strong></div></div>
+        <div class="warning-stat"><span>完场但爬取未完成</span><strong id="finished-unfinished-count">—</strong></div></div>
+      <div class="period"><div class="period-title"><strong>历史比赛</strong><span id="historical-date" class="meta">今日之前</span></div>
+        <div class="metric"><span class="meta">比赛总数</span><strong id="historical-match-count">—</strong></div>
+        <div class="group-title">比赛状态</div><div class="metrics">
+          <div class="metric"><span class="meta">未开始</span><strong id="historical-not-started-count">—</strong></div>
+          <div class="metric"><span class="meta">进行中</span><strong id="historical-in-progress-count">—</strong></div>
+          <div class="metric"><span class="meta">完场</span><strong id="historical-finished-count">—</strong></div>
+          <div class="metric"><span class="meta">推迟</span><strong id="historical-postponed-count">—</strong></div>
+          <div class="metric"><span class="meta">取消</span><strong id="historical-cancelled-count">—</strong></div>
+          <div class="metric"><span class="meta">待定</span><strong id="historical-pending-count">—</strong></div>
+          <div class="metric"><span class="meta">其他状态</span><strong id="historical-other-status-count">—</strong></div></div>
+        <div class="group-title">爬取状态</div><div class="metrics">
+          <div class="metric"><span class="meta">未完成</span><strong id="historical-unfinished-count">—</strong></div>
+          <div class="metric"><span class="meta">已完成</span><strong id="historical-completed-count">—</strong></div>
+          <div class="metric"><span class="meta">暂停爬取</span><strong id="historical-paused-count">—</strong></div>
+          <div class="metric"><span class="meta">异常</span><strong id="historical-abnormal-count">—</strong></div></div>
+        <div class="warning-stat"><span>完场但爬取未完成</span><strong id="historical-finished-unfinished-count">—</strong></div></div>
+    </div>
+    <div class="group-title">今日赔率变动记录</div>
+    <table><thead><tr><th>公司</th><th>亚让</th><th>胜平负</th><th>进球数</th><th>合计</th></tr></thead>
+      <tbody id="odds-counts"></tbody><tfoot id="odds-totals"></tfoot></table>
+  </section>
   <main id="grid"></main>
   <script>
     const grid=document.querySelector('#grid'), clock=document.querySelector('#clock');
@@ -143,6 +263,30 @@ DASHBOARD_HTML = """<!doctype html>
     followButton.onclick=()=>{follow=!follow;followButton.textContent=`自动滚动：${follow?'开':'关'}`};
     const statusText={starting:'启动中',running:'运行中',waiting:'等待下轮',error:'异常',stopped:'已停止'};
     const fmt=t=>t?new Date(t*1000).toLocaleTimeString('zh-CN',{hour12:false}):'—';
+    function statistics(s){
+      const show=(id,key)=>document.querySelector(`#${id}`).textContent=Number(s[key]||0).toLocaleString('zh-CN');
+      const fields={
+        'match-count':'match_count','not-started-count':'not_started_count','in-progress-count':'in_progress_count',
+        'finished-count':'finished_count','postponed-count':'postponed_count','cancelled-count':'cancelled_count',
+        'pending-count':'pending_count','other-status-count':'other_status_count','crawl-unfinished-count':'crawl_unfinished_count',
+        'crawl-completed-count':'crawl_completed_count','paused-count':'paused_count','abnormal-count':'abnormal_count',
+        'finished-unfinished-count':'finished_unfinished_count','historical-match-count':'historical_match_count',
+        'historical-not-started-count':'historical_not_started_count','historical-in-progress-count':'historical_in_progress_count',
+        'historical-finished-count':'historical_finished_count','historical-postponed-count':'historical_postponed_count',
+        'historical-cancelled-count':'historical_cancelled_count','historical-pending-count':'historical_pending_count',
+        'historical-other-status-count':'historical_other_status_count','historical-unfinished-count':'historical_unfinished_count',
+        'historical-completed-count':'historical_completed_count','historical-paused-count':'historical_paused_count',
+        'historical-abnormal-count':'historical_abnormal_count','historical-finished-unfinished-count':'historical_finished_unfinished_count',
+        'missing-details-count':'missing_details_count','invalid-scheduled-time-count':'invalid_scheduled_time_count'};
+      Object.entries(fields).forEach(([id,key])=>show(id,key));
+      document.querySelector('#today-date').textContent=s.date||'—';
+      document.querySelector('#stats-meta').textContent=s.error?`读取失败：${s.error}`:`${s.date} · 更新 ${fmt(s.updated_at)}`;
+      const odds=s.odds_counts||[], n=value=>Number(value||0), f=value=>n(value).toLocaleString('zh-CN');
+      document.querySelector('#odds-counts').innerHTML=odds.map(c=>
+        `<tr><td>公司 ${c.company_id}（${c.company_name}）</td><td>${f(c.handicap)}</td><td>${f(c.one_x_two)}</td><td>${f(c.over_under)}</td><td>${f(n(c.handicap)+n(c.one_x_two)+n(c.over_under))}</td></tr>`).join('');
+      const totals=odds.reduce((a,c)=>[a[0]+n(c.handicap),a[1]+n(c.one_x_two),a[2]+n(c.over_under)],[0,0,0]);
+      document.querySelector('#odds-totals').innerHTML=`<tr><th>合计</th><th>${f(totals[0])}</th><th>${f(totals[1])}</th><th>${f(totals[2])}</th><th>${f(totals.reduce((a,b)=>a+b,0))}</th></tr>`;
+    }
     function card(c){let el=document.querySelector(`[data-key="${c.key}"]`);
       if(!el){el=document.createElement('article');el.dataset.key=c.key;
         el.innerHTML='<div class="card-head"><div><h2></h2><div class="meta message"></div></div><span class="badge"></span></div><pre></pre><footer><span class="timing"></span><span class="exit"></span></footer>';
@@ -158,7 +302,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
     async function refresh(){try{const response=await fetch('/api/status',{cache:'no-store'});
       if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();
-      data.components.forEach(card);clock.textContent=`更新 ${fmt(data.generated_at)}`;
+      data.components.forEach(card);statistics(data.daily_statistics);clock.textContent=`更新 ${fmt(data.generated_at)}`;
     }catch(error){clock.textContent=`连接失败：${error.message}`}}
     refresh();setInterval(refresh,1000);
   </script>

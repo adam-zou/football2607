@@ -76,12 +76,18 @@ async def iter_bounded(
 
 
 @asynccontextmanager
-async def async_proxy_lease(proxy_client, *, min_remaining_seconds: float):
+async def async_proxy_lease(
+    proxy_client,
+    *,
+    min_remaining_seconds: float,
+    page_assignments: int = 1,
+):
     """Use the blocking localhost proxy lease client without blocking Playwright."""
 
-    lease = proxy_client.lease(
-        min_remaining_seconds=min_remaining_seconds,
-    )
+    lease_options = {"min_remaining_seconds": min_remaining_seconds}
+    if page_assignments != 1:
+        lease_options["page_assignments"] = page_assignments
+    lease = proxy_client.lease(**lease_options)
     enter_task = asyncio.create_task(asyncio.to_thread(lease.__enter__))
     try:
         proxy = await asyncio.shield(enter_task)

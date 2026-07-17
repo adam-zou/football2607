@@ -10,7 +10,7 @@ from typing import List, Optional, Sequence
 
 import psycopg2
 from dotenv import load_dotenv
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from psycopg2.extras import execute_values
 
@@ -21,11 +21,14 @@ except ImportError:
 
 
 DEFAULT_URL = "https://live.titan007.com/oldIndexall.aspx"
-ROW_SELECTOR = 'tr[id^="tr1_"]'
-ROW_ID_PATTERN = re.compile(r"tr1_(\d+)")
+MATCH_DATA_URL_MARKER = "/vbsxml/bfdata_ut.js"
+MATCH_DATA_ID_PATTERN = re.compile(r'A\[\d+\]\s*=\s*"(\d+)\^')
+MATCH_DATA_COUNT_PATTERN = re.compile(r"\bmatchcount\s*=\s*(\d+)\s*;")
+BLOCKED_RESOURCE_TYPES = {"stylesheet", "image", "media", "font"}
 ENV_FILE = Path(__file__).with_name(".env")
 DATABASE_ENV_NAME = "SIMPLE_CRAWLER_DATABASE_URL"
 TASK_PREFIX = "[比赛 ID]"
+MAX_FETCH_ATTEMPTS = 3
 TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 CREATE_MATCH_IDS_TABLE_SQL = """
@@ -64,7 +67,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--settle",
         type=float,
         default=env_float(parser, "SIMPLE_CRAWLER_LIST_SETTLE_SECONDS", 1.0),
-        help="列表出现后继续等待的秒数（默认：1）",
+        help="兼容参数；响应解析模式不再额外等待（默认：1）",
     )
     browser_mode = parser.add_mutually_exclusive_group()
     browser_mode.add_argument(
@@ -123,22 +126,112 @@ def env_bool(
     raise AssertionError("argparse.error should exit")
 
 
-def extract_match_ids(page: Page, url: str, timeout_ms: int, settle_ms: int) -> List[int]:
-    page.goto(url, wait_until="commit", timeout=timeout_ms)
-    page.wait_for_selector(ROW_SELECTOR, state="attached", timeout=timeout_ms)
-    if settle_ms:
-        page.wait_for_timeout(settle_ms)
+def route_list_resource(route) -> None:
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    else:
+        route.continue_()
 
-    row_ids = page.locator(ROW_SELECTOR).evaluate_all(
-        "rows => rows.map(row => row.id)"
+
+def extract_match_ids_from_bfdata(source: str) -> List[int]:
+    count_match = MATCH_DATA_COUNT_PATTERN.search(source)
+    if count_match is None:
+        raise RuntimeError("比赛数据响应缺少 matchcount")
+    declared_count = int(count_match.group(1))
+    match_ids = sorted(
+        {
+            int(value)
+            for value in MATCH_DATA_ID_PATTERN.findall(source)
+            if int(value) > 0
+        }
     )
-    match_ids = {
-        int(matched.group(1))
-        for row_id in row_ids
-        if (matched := ROW_ID_PATTERN.fullmatch(str(row_id))) is not None
-        and int(matched.group(1)) > 0
-    }
-    return sorted(match_ids)
+    if len(match_ids) != declared_count:
+        raise RuntimeError(
+            "比赛数据响应声明数量与解析 ID 数量不一致："
+            f"声明 {declared_count}，解析 {len(match_ids)}"
+        )
+    return match_ids
+
+
+def extract_match_ids(
+    page: Page,
+    url: str,
+    timeout_ms: int,
+    settle_ms: int,
+) -> List[int]:
+    """Read the complete match set from bfdata without querying the DOM."""
+
+    del settle_ms  # Retained in the public CLI for configuration compatibility.
+    page.route("**/*", route_list_resource)
+    with page.expect_response(
+        lambda response: MATCH_DATA_URL_MARKER in response.url,
+        timeout=timeout_ms,
+    ) as response_info:
+        navigation_response = page.goto(
+            url,
+            wait_until="commit",
+            timeout=timeout_ms,
+        )
+    if navigation_response is None or navigation_response.status >= 400:
+        status = (
+            "无响应"
+            if navigation_response is None
+            else navigation_response.status
+        )
+        raise RuntimeError(f"比赛列表页返回 HTTP {status}")
+    data_response = response_info.value
+    if data_response.status >= 400:
+        raise RuntimeError(f"比赛数据响应返回 HTTP {data_response.status}")
+    return extract_match_ids_from_bfdata(data_response.text())
+
+
+def fetch_match_ids_with_retries(
+    browser: Browser,
+    proxy_client: ProxyClient,
+    args: argparse.Namespace,
+) -> List[int]:
+    """Fetch the list with at most two same-round proxy replacements."""
+
+    timeout_ms = int(args.timeout * 1000)
+    settle_ms = int(args.settle * 1000)
+    minimum_lifetime = min(
+        args.timeout + 2,
+        proxy_client.ttl_seconds - 1,
+    )
+
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        try:
+            with proxy_client.lease(
+                min_remaining_seconds=minimum_lifetime
+            ) as proxy:
+                context = browser.new_context(
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    proxy=proxy.playwright_options(),
+                )
+                try:
+                    return extract_match_ids(
+                        context.new_page(),
+                        args.url,
+                        timeout_ms,
+                        settle_ms,
+                    )
+                finally:
+                    context.close()
+        except Exception as error:
+            print(
+                f"{TASK_PREFIX} 第 {attempt}/{MAX_FETCH_ATTEMPTS} 次"
+                f"获取失败：{error}",
+                file=sys.stderr,
+            )
+            if attempt == MAX_FETCH_ATTEMPTS:
+                raise
+            print(
+                f"{TASK_PREFIX} 切换代理，开始第 "
+                f"{attempt + 1}/{MAX_FETCH_ATTEMPTS} 次尝试。",
+                file=sys.stderr,
+            )
+    raise AssertionError("unreachable")
 
 
 def save_match_ids(database_url: str, match_ids: Sequence[int]) -> int:
@@ -174,46 +267,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
-    timeout_ms = int(args.timeout * 1000)
-    settle_ms = int(args.settle * 1000)
-
     try:
         proxy_client = ProxyClient.from_env()
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=not args.headed)
             try:
-                minimum_lifetime = min(
-                    args.timeout + args.settle + 2,
-                    proxy_client.ttl_seconds - 1,
+                match_ids = fetch_match_ids_with_retries(
+                    browser,
+                    proxy_client,
+                    args,
                 )
-                with proxy_client.lease(
-                    min_remaining_seconds=minimum_lifetime
-                ) as proxy:
-                    context = browser.new_context(
-                        locale="zh-CN",
-                        timezone_id="Asia/Shanghai",
-                        proxy=proxy.playwright_options(),
-                    )
-                    try:
-                        page = context.new_page()
-                        match_ids = extract_match_ids(
-                            page,
-                            args.url,
-                            timeout_ms,
-                            settle_ms,
-                        )
-                    finally:
-                        context.close()
             finally:
                 browser.close()
     except PlaywrightTimeoutError:
         print(
-            f"{TASK_PREFIX} 错误：{args.timeout:g} 秒内没有获取到比赛列表。",
+            f"{TASK_PREFIX} 连续 {MAX_FETCH_ATTEMPTS} 次失败："
+            f"最后一次在 {args.timeout:g} 秒内没有获取到比赛列表。",
             file=sys.stderr,
         )
         return 1
     except Exception as error:
-        print(f"{TASK_PREFIX} 错误：{error}", file=sys.stderr)
+        print(
+            f"{TASK_PREFIX} 连续 {MAX_FETCH_ATTEMPTS} 次失败：{error}",
+            file=sys.stderr,
+        )
         return 1
 
     try:

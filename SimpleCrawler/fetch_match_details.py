@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg2
 from dotenv import load_dotenv
+from playwright.async_api import Browser as AsyncBrowser
 from playwright.async_api import Page as AsyncPage
 from playwright.async_api import async_playwright
 from psycopg2.extensions import connection as Connection
@@ -31,6 +32,7 @@ HEADER_SELECTOR = "#header .analyhead"
 ENV_FILE = Path(__file__).with_name(".env")
 DATABASE_ENV_NAME = "SIMPLE_CRAWLER_DATABASE_URL"
 TASK_PREFIX = "[比赛详情]"
+MAX_DETAIL_FETCH_ATTEMPTS = 3
 BLOCKED_RESOURCE_TYPES = {"stylesheet", "image", "media", "font"}
 TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 FALSE_ENV_VALUES = {"0", "false", "no", "off"}
@@ -252,8 +254,38 @@ def select_match_ids(
         statement = """
             SELECT ids.match_id
             FROM match_ids AS ids
+            LEFT JOIN match_details AS details USING (match_id)
             WHERE ids.crawl_status = ANY(%s)
-            ORDER BY ids.match_id
+              AND (
+                  details.match_id IS NULL
+                  OR (
+                      details.status_text <> '完'
+                      AND details.updated_at
+                          <= NOW() - INTERVAL '1 minute'
+                      AND (
+                          (
+                              details.scheduled_time ~
+                                  '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+                              AND details.scheduled_time::TIMESTAMP
+                                  AT TIME ZONE 'Asia/Shanghai'
+                                  >= NOW() - INTERVAL '4 hours'
+                              AND details.scheduled_time::TIMESTAMP
+                                  AT TIME ZONE 'Asia/Shanghai'
+                                  <= NOW() + INTERVAL '30 minutes'
+                          )
+                          OR details.scheduled_time !~
+                              '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+                      )
+                  )
+              )
+            ORDER BY (details.match_id IS NULL) DESC,
+                     CASE
+                         WHEN details.scheduled_time ~
+                             '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+                         THEN details.scheduled_time::TIMESTAMP
+                             AT TIME ZONE 'Asia/Shanghai'
+                     END NULLS LAST,
+                     ids.match_id
         """
         parameters: Tuple[object, ...] = (list(active_crawl_statuses),)
         if limit is not None:
@@ -395,6 +427,59 @@ def format_detail(detail: MatchDetail) -> str:
     )
 
 
+async def fetch_detail_with_retries(
+    browser: AsyncBrowser,
+    proxy_client: ProxyClient,
+    args: argparse.Namespace,
+    match_id: int,
+) -> MatchDetail:
+    """Fetch one detail page with at most two proxy replacements."""
+
+    minimum_lifetime = min(
+        args.timeout + 2,
+        proxy_client.ttl_seconds - 1,
+    )
+    for attempt in range(1, MAX_DETAIL_FETCH_ATTEMPTS + 1):
+        try:
+            async with async_proxy_lease(
+                proxy_client,
+                min_remaining_seconds=minimum_lifetime,
+            ) as proxy:
+                context = await browser.new_context(
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    proxy=proxy.playwright_options(),
+                )
+                try:
+                    page = await context.new_page()
+                    await page.route(
+                        "**/*",
+                        block_unneeded_resources_async,
+                    )
+                    return await fetch_detail_async(
+                        page,
+                        match_id,
+                        args.url_template,
+                        int(args.timeout * 1000),
+                    )
+                finally:
+                    await context.close()
+        except Exception as error:
+            print(
+                f"{TASK_PREFIX} {match_id} | 第 "
+                f"{attempt}/{MAX_DETAIL_FETCH_ATTEMPTS} 次获取失败：{error}",
+                file=sys.stderr,
+            )
+            if attempt == MAX_DETAIL_FETCH_ATTEMPTS:
+                raise
+            print(
+                f"{TASK_PREFIX} {match_id} | 切换代理，开始第 "
+                f"{attempt + 1}/{MAX_DETAIL_FETCH_ATTEMPTS} 次尝试。",
+                file=sys.stderr,
+            )
+    raise AssertionError("unreachable")
+
+
 async def crawl_details(
     connection: Connection,
     match_ids: Sequence[int],
@@ -408,33 +493,12 @@ async def crawl_details(
         browser = await playwright.chromium.launch(headless=not args.headed)
         try:
             async def fetch(match_id: int) -> MatchDetail:
-                minimum_lifetime = min(
-                    args.timeout + 2,
-                    proxy_client.ttl_seconds - 1,
-                )
-                async with async_proxy_lease(
+                return await fetch_detail_with_retries(
+                    browser,
                     proxy_client,
-                    min_remaining_seconds=minimum_lifetime,
-                ) as proxy:
-                    context = await browser.new_context(
-                        locale="zh-CN",
-                        timezone_id="Asia/Shanghai",
-                        proxy=proxy.playwright_options(),
-                    )
-                    try:
-                        page = await context.new_page()
-                        await page.route(
-                            "**/*",
-                            block_unneeded_resources_async,
-                        )
-                        return await fetch_detail_async(
-                            page,
-                            match_id,
-                            args.url_template,
-                            int(args.timeout * 1000),
-                        )
-                    finally:
-                        await context.close()
+                    args,
+                    match_id,
+                )
 
             async for outcome in iter_bounded(
                 match_ids,

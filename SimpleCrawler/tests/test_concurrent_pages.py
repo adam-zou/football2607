@@ -18,8 +18,15 @@ class FakeLease:
 class FakeProxyClient:
     def __init__(self) -> None:
         self.last_lease = None
+        self.page_assignments = None
 
-    def lease(self, *, min_remaining_seconds: float) -> FakeLease:
+    def lease(
+        self,
+        *,
+        min_remaining_seconds: float,
+        page_assignments: int = 1,
+    ) -> FakeLease:
+        self.page_assignments = page_assignments
         self.last_lease = FakeLease()
         return self.last_lease
 
@@ -88,6 +95,18 @@ class BoundedSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("page failed")
 
         self.assertTrue(client.last_lease.failed)
+
+    async def test_proxy_lease_forwards_page_assignments(self) -> None:
+        client = FakeProxyClient()
+
+        async with async_proxy_lease(
+            client,
+            min_remaining_seconds=5,
+            page_assignments=3,
+        ):
+            pass
+
+        self.assertEqual(client.page_assignments, 3)
 
 
 if __name__ == "__main__":

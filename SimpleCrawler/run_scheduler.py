@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence, TextIO
 
 from dotenv import load_dotenv
+from simple_crawler.dashboard_statistics import fetch_daily_statistics
 from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
 
 try:
@@ -37,6 +38,7 @@ CHILD_POLL_SECONDS = 0.25
 DEFAULT_MONITOR_HOST = "127.0.0.1"
 DEFAULT_MONITOR_PORT = 8081
 PROXY_MONITOR_INTERVAL_SECONDS = 10.0
+DAILY_STATISTICS_INTERVAL_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -328,6 +330,24 @@ def run_proxy_health_monitor(
             )
 
 
+def run_daily_statistics_monitor(
+    stop_event: threading.Event,
+    monitor: RuntimeMonitor,
+    database_url: str,
+    interval_seconds: float = DAILY_STATISTICS_INTERVAL_SECONDS,
+    fetcher: Callable[[str], dict[str, object]] = fetch_daily_statistics,
+) -> None:
+    """Refresh dashboard database statistics without blocking HTTP requests."""
+
+    while not stop_event.is_set():
+        try:
+            monitor.update_daily_statistics(fetcher(database_url))
+        except Exception as error:
+            monitor.set_daily_statistics_error(str(error))
+        if stop_event.wait(interval_seconds):
+            break
+
+
 def ensure_proxy_service(
     stop_event: threading.Event,
     monitor: Optional[RuntimeMonitor] = None,
@@ -428,6 +448,7 @@ def main() -> int:
             proxy_process = None
             threads = []
             proxy_monitor_thread = None
+            statistics_monitor_thread = None
             try:
                 if monitor_port != 0:
                     dashboard = DashboardServer(monitor, monitor_host, monitor_port)
@@ -436,6 +457,16 @@ def main() -> int:
                         f"[监控页面] http://{monitor_host}:{dashboard.address[1]}/",
                         flush=True,
                     )
+                    statistics_monitor_thread = threading.Thread(
+                        target=run_daily_statistics_monitor,
+                        args=(
+                            stop_event,
+                            monitor,
+                            os.environ.get("SIMPLE_CRAWLER_DATABASE_URL", ""),
+                        ),
+                        name="simple-crawler-daily-statistics-monitor",
+                    )
+                    statistics_monitor_thread.start()
                 proxy_process = ensure_proxy_service(stop_event, monitor)
                 proxy_monitor_thread = threading.Thread(
                     target=run_proxy_health_monitor,
@@ -476,6 +507,8 @@ def main() -> int:
                     thread.join()
                 if proxy_monitor_thread is not None:
                     proxy_monitor_thread.join()
+                if statistics_monitor_thread is not None:
+                    statistics_monitor_thread.join()
                 stop_process(proxy_process)
                 monitor.update(
                     "proxy_scheduler",

@@ -40,7 +40,7 @@ PROXY_PATTERN = re.compile(
 GLOBAL_RATE_LIMIT_FILE = Path(tempfile.gettempdir()) / (
     "football2607-simple-crawler-proxy-api.lock"
 )
-MAX_PAGE_ASSIGNMENTS_PER_PROXY = 5
+DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY = 5
 
 
 class ProxySchedulerError(RuntimeError):
@@ -68,7 +68,7 @@ ProxyValidator = Callable[[ProxyEndpoint, str, float], bool]
 
 
 class ProxyScheduler:
-    """Refresh a proxy pool and assign each address to at most five pages."""
+    """Refresh a proxy pool and limit page assignments per address."""
 
     def __init__(
         self,
@@ -85,6 +85,9 @@ class ProxyScheduler:
         test_url: str = "https://live.titan007.com/oldIndexall.aspx",
         test_timeout_seconds: float = 5.0,
         validation_workers: int = 10,
+        max_page_assignments_per_proxy: int = (
+            DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY
+        ),
         validator: Optional[ProxyValidator] = None,
     ) -> None:
         if not api_url.strip():
@@ -107,6 +110,10 @@ class ProxyScheduler:
             raise ValueError("PROXY_TEST_TIMEOUT_SECONDS 必须大于 0")
         if validation_workers <= 0:
             raise ValueError("PROXY_VALIDATION_WORKERS 必须大于 0")
+        if max_page_assignments_per_proxy <= 0:
+            raise ValueError(
+                "PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP 必须大于 0"
+            )
 
         self.api_url = api_url
         self.username = username.strip()
@@ -120,6 +127,7 @@ class ProxyScheduler:
         self.test_url = test_url
         self.test_timeout_seconds = test_timeout_seconds
         self.validation_workers = validation_workers
+        self.max_page_assignments_per_proxy = max_page_assignments_per_proxy
         self._validator = validator or self._validate_proxy
         self._condition = threading.Condition()
         self._refresh_lock = threading.Lock()
@@ -174,6 +182,10 @@ class ProxyScheduler:
                 "PROXY_VALIDATION_WORKERS",
                 10,
             ),
+            max_page_assignments_per_proxy=cls._int_env(
+                "PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP",
+                DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY,
+            ),
         )
 
     def __enter__(self) -> "ProxyScheduler":
@@ -211,8 +223,12 @@ class ProxyScheduler:
         self,
         *,
         min_remaining_seconds: float = 1.0,
+        page_assignments: int = 1,
     ) -> Iterator[ProxyEndpoint]:
-        proxy = self.acquire(min_remaining_seconds=min_remaining_seconds)
+        proxy = self.acquire(
+            min_remaining_seconds=min_remaining_seconds,
+            page_assignments=page_assignments,
+        )
         try:
             yield proxy
         except BaseException:
@@ -221,13 +237,22 @@ class ProxyScheduler:
         else:
             self.release(proxy, failed=False)
 
-    def acquire(self, *, min_remaining_seconds: float = 1.0) -> ProxyEndpoint:
+    def acquire(
+        self,
+        *,
+        min_remaining_seconds: float = 1.0,
+        page_assignments: int = 1,
+    ) -> ProxyEndpoint:
         if self._thread is None:
             raise ProxySchedulerError("代理调度器尚未启动")
         if min_remaining_seconds <= 0:
             raise ValueError("min_remaining_seconds 必须大于 0")
         if min_remaining_seconds >= self.ttl_seconds:
             raise ValueError("页面所需代理时间必须小于代理有效期")
+        if page_assignments <= 0:
+            raise ValueError("页面分配数量必须大于 0")
+        if page_assignments > self.max_page_assignments_per_proxy:
+            raise ValueError("页面分配数量不能超过单个代理上限")
 
         deadline = time.monotonic() + self.acquire_timeout_seconds
         with self._condition:
@@ -238,14 +263,20 @@ class ProxyScheduler:
                     if server in self._retired:
                         continue
                     assignment_count = self._assignment_counts.get(server, 0)
-                    if assignment_count >= MAX_PAGE_ASSIGNMENTS_PER_PROXY:
+                    if (
+                        assignment_count + page_assignments
+                        > self.max_page_assignments_per_proxy
+                    ):
                         continue
                     if proxy.expires_at - now < min_remaining_seconds:
                         continue
                     self._leased[server] = self._leased.get(server, 0) + 1
-                    assignment_count += 1
+                    assignment_count += page_assignments
                     self._assignment_counts[server] = assignment_count
-                    if assignment_count >= MAX_PAGE_ASSIGNMENTS_PER_PROXY:
+                    if (
+                        assignment_count
+                        >= self.max_page_assignments_per_proxy
+                    ):
                         self._retired.add(server)
                     return proxy
 
@@ -293,7 +324,7 @@ class ProxyScheduler:
                 for server in self._proxies
                 if server not in self._retired
                 and self._assignment_counts.get(server, 0)
-                < MAX_PAGE_ASSIGNMENTS_PER_PROXY
+                < self.max_page_assignments_per_proxy
             )
 
     @property
@@ -301,7 +332,7 @@ class ProxyScheduler:
         with self._condition:
             self._remove_expired(time.monotonic())
             return sum(
-                MAX_PAGE_ASSIGNMENTS_PER_PROXY
+                self.max_page_assignments_per_proxy
                 - self._assignment_counts.get(server, 0)
                 for server in self._proxies
                 if server not in self._retired
@@ -511,10 +542,15 @@ class ProxyLeaseService:
         self._lock = threading.Lock()
         self._leases: Dict[str, ProxyEndpoint] = {}
 
-    def acquire(self, min_remaining_seconds: float) -> Dict[str, object]:
+    def acquire(
+        self,
+        min_remaining_seconds: float,
+        page_assignments: int = 1,
+    ) -> Dict[str, object]:
         self._reap_expired_leases()
         proxy = self.scheduler.acquire(
-            min_remaining_seconds=min_remaining_seconds
+            min_remaining_seconds=min_remaining_seconds,
+            page_assignments=page_assignments,
         )
         lease_id = uuid.uuid4().hex
         with self._lock:
@@ -545,7 +581,9 @@ class ProxyLeaseService:
             "leased": active_leases,
             "available_proxies": self.scheduler.available_proxy_count,
             "available_page_slots": self.scheduler.available_page_slots,
-            "max_pages_per_proxy": MAX_PAGE_ASSIGNMENTS_PER_PROXY,
+            "max_pages_per_proxy": (
+                self.scheduler.max_page_assignments_per_proxy
+            ),
             "last_batch_received": self.scheduler.last_batch_received,
             "last_batch_validated": self.scheduler.last_batch_validated,
         }
@@ -583,9 +621,13 @@ class ProxySchedulerRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if self.path == "/lease":
                 minimum = float(payload.get("min_remaining_seconds", 1.0))
+                page_assignments = int(payload.get("page_assignments", 1))
                 self._send_json(
                     200,
-                    self.server.service.acquire(minimum),
+                    self.server.service.acquire(
+                        minimum,
+                        page_assignments,
+                    ),
                 )
                 return
             if self.path == "/release":
@@ -684,10 +726,14 @@ class ProxyClient:
         self,
         *,
         min_remaining_seconds: float = 1.0,
+        page_assignments: int = 1,
     ) -> Iterator[RemoteProxyEndpoint]:
         payload = self._post(
             "/lease",
-            {"min_remaining_seconds": min_remaining_seconds},
+            {
+                "min_remaining_seconds": min_remaining_seconds,
+                "page_assignments": page_assignments,
+            },
         )
         proxy = RemoteProxyEndpoint(
             lease_id=str(payload["lease_id"]),

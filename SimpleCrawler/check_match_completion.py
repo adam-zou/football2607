@@ -1,71 +1,87 @@
 #!/usr/bin/env python3
-"""One-shot completion check for finished matches."""
+"""Collect and persist final odds snapshots for overdue matches."""
 
 import argparse
+import asyncio
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import psycopg2
 from dotenv import load_dotenv
-from simple_crawler.companies import company_label
-from simple_crawler.odds_parser import Titan007OddsParser
-from playwright.sync_api import Browser, sync_playwright
+from playwright.async_api import Browser as AsyncBrowser
+from playwright.async_api import async_playwright
 from psycopg2.extensions import connection as Connection
+from simple_crawler.companies import COMPANY_IDS, company_label
 
 try:
+    from .concurrent_pages import iter_bounded
+    from .crawl_status import env_active_crawl_statuses
     from .fetch_odds_pages import (
         DATABASE_ENV_NAME,
         DEFAULT_BASE_URL,
         ENV_FILE,
-        EXIT_MAJORITY_FAILURE,
-        EXIT_PARTIAL_FAILURE,
-        EXIT_SUCCESS,
-        MARKETS,
-        block_unneeded_resources,
-        build_url,
         env_bool,
-        env_company_ids,
         env_float,
+        env_int,
         env_optional_int,
-        fetch_page_rows,
     )
+    from .odds_collection import (
+        MARKETS,
+        MarketCollectionOutcome,
+        OddsCollectionConfig,
+        OddsPageJob,
+        collect_company_markets_async,
+        ensure_odds_schema,
+        group_page_jobs_by_company,
+        persist_market_failure,
+        persist_market_page,
+    )
+    from .odds_market_state import (
+        final_snapshot_complete,
+        load_pending_final_pages,
+        prepare_final_snapshot,
+    )
+    from .proxy_scheduler import ProxyClient
 except ImportError:
+    from concurrent_pages import iter_bounded
+    from crawl_status import env_active_crawl_statuses
     from fetch_odds_pages import (
         DATABASE_ENV_NAME,
         DEFAULT_BASE_URL,
         ENV_FILE,
-        EXIT_MAJORITY_FAILURE,
-        EXIT_PARTIAL_FAILURE,
-        EXIT_SUCCESS,
-        MARKETS,
-        block_unneeded_resources,
-        build_url,
         env_bool,
-        env_company_ids,
         env_float,
+        env_int,
         env_optional_int,
-        fetch_page_rows,
     )
-
-try:
-    from .proxy_scheduler import ProxyClient
-    from .crawl_status import env_active_crawl_statuses
-except ImportError:
+    from odds_collection import (
+        MARKETS,
+        MarketCollectionOutcome,
+        OddsCollectionConfig,
+        OddsPageJob,
+        collect_company_markets_async,
+        ensure_odds_schema,
+        group_page_jobs_by_company,
+        persist_market_failure,
+        persist_market_page,
+    )
+    from odds_market_state import (
+        final_snapshot_complete,
+        load_pending_final_pages,
+        prepare_final_snapshot,
+    )
     from proxy_scheduler import ProxyClient
-    from crawl_status import env_active_crawl_statuses
 
 
-MARKET_TABLES = {
-    "handicap": "titan007_handicap_changes",
-    "one_x_two": "titan007_1x2_changes",
-    "over_under": "titan007_over_under_changes",
-}
 DETAIL_SCRIPT = Path(__file__).with_name("fetch_match_details.py")
-ODDS_SCRIPT = Path(__file__).with_name("fetch_odds_pages.py")
 TASK_PREFIX = "[完成核验]"
+MAX_MARKET_FETCH_ATTEMPTS = 3
+DEFAULT_MATCH_TIMEOUT_SECONDS = 180.0
+FINAL_DETAIL_CRAWL_STATUSES = "未完成,暂停爬取,异常"
 
 ENSURE_MATCH_STATUS_SQL = """
 ALTER TABLE match_ids
@@ -80,9 +96,19 @@ ALTER TABLE match_ids
 """
 
 
+@dataclass(frozen=True)
+class FinalizationResult:
+    match_id: int
+    succeeded: int
+    failed: int
+    pending: int
+    completed: bool
+    timed_out: bool = False
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="核验完场比赛的赔率变动记录数并标记抓取完成。"
+        description="为开赛超过 4 小时的比赛采集并写入最终赔率快照。"
     )
     parser.add_argument(
         "--limit",
@@ -91,7 +117,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser,
             "SIMPLE_CRAWLER_COMPLETION_MATCH_LIMIT",
         ),
-        help="本次最多检查多少场完场比赛",
+        help="本次最多收尾多少场比赛",
     )
     parser.add_argument(
         "--timeout",
@@ -101,7 +127,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "SIMPLE_CRAWLER_ODDS_TIMEOUT_SECONDS",
             15.0,
         ),
-        help="赔率页面导航和等待表格时，每一步的超时秒数",
+        help="每个赔率页面请求的超时秒数",
+    )
+    parser.add_argument(
+        "--match-timeout",
+        type=float,
+        default=env_float(
+            parser,
+            "SIMPLE_CRAWLER_COMPLETION_MATCH_TIMEOUT_SECONDS",
+            DEFAULT_MATCH_TIMEOUT_SECONDS,
+        ),
+        help="单场最终快照的总超时秒数（默认：180）",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=env_int(
+            parser,
+            "SIMPLE_CRAWLER_ODDS_PAGE_CONCURRENCY",
+            12,
+        ),
+        help="同时采集的最终比赛×公司任务数（默认：12）",
     )
     parser.add_argument(
         "--base-url",
@@ -124,17 +170,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_false",
         help="隐藏浏览器窗口",
     )
-    parser.set_defaults(
-        headed=env_bool(parser, "SIMPLE_CRAWLER_HEADED", False)
-    )
+    parser.set_defaults(headed=env_bool(parser, "SIMPLE_CRAWLER_HEADED", False))
     args = parser.parse_args(argv)
-    args.company_ids = env_company_ids(parser)
+    args.company_ids = list(COMPANY_IDS)
     args.active_crawl_statuses = env_active_crawl_statuses(parser)
 
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit 必须大于 0")
     if args.timeout <= 0:
         parser.error("--timeout 必须大于 0")
+    if args.match_timeout <= 0:
+        parser.error("--match-timeout 必须大于 0")
+    if args.concurrency <= 0:
+        parser.error("--concurrency 必须大于 0")
     if "{endpoint}" not in args.base_url:
         parser.error("--base-url 必须包含 {endpoint}")
     return args
@@ -143,35 +191,48 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def ensure_schema(connection: Connection) -> None:
     with connection.cursor() as cursor:
         cursor.execute(ENSURE_MATCH_STATUS_SQL)
+        ensure_odds_schema(cursor)
     connection.commit()
 
 
-def select_pending_matches(
+def select_finalization_matches(
     connection: Connection,
     limit: Optional[int],
     active_crawl_statuses: Sequence[str],
-) -> List[Tuple[int, bool]]:
+) -> List[Tuple[int, bool, str]]:
     statement = """
         SELECT
             ids.match_id,
-            details.status_text = '完' AS is_finished
+            details.status_text = '完' AS is_finished,
+            ids.crawl_status
         FROM match_ids AS ids
         JOIN match_details AS details USING (match_id)
-        WHERE ids.crawl_status = ANY(%s)
+        WHERE ids.crawl_status <> '已完成'
           AND (
-              details.status_text = '完'
+              ids.crawl_status = ANY(%s)
+              OR ids.crawl_status IN ('暂停爬取', '异常')
+          )
+          AND (
+              (
+                  details.status_text = '完'
+                  AND details.updated_at <= NOW() - INTERVAL '5 minutes'
+              )
               OR (
-                  details.status_text <> '完'
-                  AND
                   details.scheduled_time ~
                       '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
                   AND details.scheduled_time::TIMESTAMP
                       AT TIME ZONE 'Asia/Shanghai'
-                      <= NOW() - INTERVAL '4 hours'
+                      < NOW() - INTERVAL '4 hours'
               )
           )
         ORDER BY
-            CASE WHEN details.status_text = '完' THEN 0 ELSE 1 END,
+            (details.status_text = '完') DESC,
+            CASE
+                WHEN details.scheduled_time ~
+                    '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+                THEN details.scheduled_time::TIMESTAMP
+                    AT TIME ZONE 'Asia/Shanghai'
+            END DESC NULLS LAST,
             ids.match_id
     """
     parameters: Tuple[object, ...] = (list(active_crawl_statuses),)
@@ -180,107 +241,23 @@ def select_pending_matches(
         parameters += (limit,)
     with connection.cursor() as cursor:
         cursor.execute(statement, parameters)
-        return [(int(row[0]), bool(row[1])) for row in cursor.fetchall()]
+        return [
+            (int(row[0]), bool(row[1]), str(row[2]))
+            for row in cursor.fetchall()
+        ]
 
 
-def load_stored_counts(
-    connection: Connection,
-    match_id: int,
-    company_ids: Sequence[int],
-) -> Dict[Tuple[int, str], int]:
-    counts: Dict[Tuple[int, str], int] = {}
-    with connection.cursor() as cursor:
-        for company_id in company_ids:
-            for market, table in MARKET_TABLES.items():
-                cursor.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM {table}
-                    WHERE match_id = %s AND company_id = %s
-                    """,
-                    (match_id, company_id),
-                )
-                counts[(company_id, market)] = int(cursor.fetchone()[0])
-    return counts
-
-
-def fetch_market_count(
-    browser: Browser,
-    proxy_scheduler: ProxyClient,
-    args: argparse.Namespace,
-    match_id: int,
-    company_id: int,
-    market: str,
-) -> int:
-    _, selector, _ = MARKETS[market]
-    minimum_lifetime = min(
-        args.timeout + 2,
-        proxy_scheduler.ttl_seconds - 1,
+def refresh_detail_once(match_id: int) -> int:
+    environment = os.environ.copy()
+    environment["SIMPLE_CRAWLER_ACTIVE_CRAWL_STATUSES"] = (
+        FINAL_DETAIL_CRAWL_STATUSES
     )
-    with proxy_scheduler.lease(
-        min_remaining_seconds=minimum_lifetime
-    ) as proxy:
-        context = browser.new_context(
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            proxy=proxy.playwright_options(),
-        )
-        try:
-            page = context.new_page()
-            page.route("**/*", block_unneeded_resources)
-            rows = fetch_page_rows(
-                page,
-                build_url(args.base_url, match_id, company_id, market),
-                selector,
-                args.timeout,
-            )
-            changes = Titan007OddsParser.parse_rows(
-                market,
-                rows,
-                match_id=match_id,
-                company_id=company_id,
-            )
-            return len(changes)
-        finally:
-            context.close()
-
-
-def check_match(
-    browser: Browser,
-    proxy_scheduler: ProxyClient,
-    connection: Connection,
-    args: argparse.Namespace,
-    match_id: int,
-) -> Tuple[bool, str]:
-    stored_counts = load_stored_counts(
-        connection,
-        match_id,
-        args.company_ids,
+    result = subprocess.run(
+        [sys.executable, str(DETAIL_SCRIPT), str(match_id)],
+        check=False,
+        env=environment,
     )
-    for company_id in args.company_ids:
-        for market, (_, _, label) in MARKETS.items():
-            try:
-                fetched_count = fetch_market_count(
-                    browser,
-                    proxy_scheduler,
-                    args,
-                    match_id,
-                    company_id,
-                    market,
-                )
-            except Exception as error:
-                return (
-                    False,
-                    f"{company_label(company_id)} {label}获取失败：{error}",
-                )
-            stored_count = stored_counts[(company_id, market)]
-            if fetched_count != stored_count:
-                return (
-                    False,
-                    f"{company_label(company_id)} {label}赔率变动记录数不一致："
-                    f"页面 {fetched_count}，数据库 {stored_count}",
-                )
-    return True, "全部公司和市场的赔率变动记录数一致"
+    return result.returncode
 
 
 def mark_completed(connection: Connection, match_id: int) -> None:
@@ -296,59 +273,262 @@ def mark_completed(connection: Connection, match_id: int) -> None:
     connection.commit()
 
 
-def refresh_detail_once(match_id: int) -> int:
-    result = subprocess.run(
-        [sys.executable, str(DETAIL_SCRIPT), str(match_id)],
-        check=False,
-    )
-    return result.returncode
-
-
-def is_match_finished(connection: Connection, match_id: int) -> bool:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT status_text = '完'
-            FROM match_details
-            WHERE match_id = %s
-            """,
-            (match_id,),
-        )
-        row = cursor.fetchone()
-    return bool(row and row[0])
-
-
-def refresh_odds_once(match_id: int) -> int:
-    result = subprocess.run(
-        [sys.executable, str(ODDS_SCRIPT), str(match_id)],
-        check=False,
-    )
-    return result.returncode
-
-
-def final_status_for_refresh(returncode: int) -> Optional[str]:
-    if returncode in (EXIT_SUCCESS, EXIT_PARTIAL_FAILURE):
-        return "暂停爬取"
-    if returncode == EXIT_MAJORITY_FAILURE:
-        return "异常"
-    return None
-
-
-def mark_final_status(
+def prepare_pending_jobs(
     connection: Connection,
     match_id: int,
-    crawl_status: str,
-) -> None:
+    company_ids: Sequence[int],
+) -> List[OddsPageJob]:
     with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            UPDATE match_ids
-            SET crawl_status = %s, updated_at = NOW()
-            WHERE match_id = %s
-            """,
-            (crawl_status, match_id),
+        prepare_final_snapshot(
+            cursor,
+            match_id=match_id,
+            company_ids=company_ids,
+            markets=list(MARKETS),
         )
+        pending = load_pending_final_pages(cursor, match_id, company_ids)
     connection.commit()
+    return [
+        OddsPageJob(match_id, company_id, market)
+        for company_id, market in pending
+    ]
+
+
+def load_pending_jobs(
+    connection: Connection,
+    match_id: int,
+    company_ids: Sequence[int],
+) -> List[OddsPageJob]:
+    with connection.cursor() as cursor:
+        pending = load_pending_final_pages(cursor, match_id, company_ids)
+    return [
+        OddsPageJob(match_id, company_id, market)
+        for company_id, market in pending
+    ]
+
+
+def is_final_snapshot_complete(
+    connection: Connection,
+    match_id: int,
+    company_ids: Sequence[int],
+) -> bool:
+    with connection.cursor() as cursor:
+        return final_snapshot_complete(
+            cursor,
+            match_id,
+            company_ids,
+            len(MARKETS),
+        )
+
+
+def persist_final_failure_or_log(
+    connection: Connection,
+    job: OddsPageJob,
+    error: str,
+) -> None:
+    try:
+        persist_market_failure(connection, job, error, final=True)
+    except Exception as state_error:
+        connection.rollback()
+        print(
+            f"{TASK_PREFIX} {job.match_id} | "
+            f"{company_label(job.company_id)} | "
+            f"{MARKETS[job.market][2]}最终状态写入失败：{state_error}",
+            file=sys.stderr,
+        )
+
+
+async def run_final_jobs(
+    browser: AsyncBrowser,
+    proxy_client: ProxyClient,
+    connection: Connection,
+    args: argparse.Namespace,
+    jobs: Sequence[OddsPageJob],
+) -> Tuple[int, int]:
+    config = OddsCollectionConfig(
+        base_url=args.base_url,
+        timeout_seconds=args.timeout,
+    )
+    succeeded = 0
+    pending = list(jobs)
+
+    for attempt in range(1, MAX_MARKET_FETCH_ATTEMPTS + 1):
+        if not pending:
+            break
+        company_jobs = group_page_jobs_by_company(pending)
+        next_pending: List[OddsPageJob] = []
+
+        async def fetch(company_job):
+            return await collect_company_markets_async(
+                browser,
+                proxy_client,
+                config,
+                company_job,
+            )
+
+        async for outcome in iter_bounded(
+            company_jobs,
+            args.concurrency,
+            fetch,
+        ):
+            if outcome.error is not None:
+                market_outcomes = [
+                    MarketCollectionOutcome(
+                        job=page_job,
+                        error=outcome.error,
+                    )
+                    for page_job in outcome.job.page_jobs()
+                ]
+            else:
+                market_outcomes = outcome.result or []
+
+            for market_outcome in market_outcomes:
+                job = market_outcome.job
+                label = MARKETS[job.market][2]
+                error = market_outcome.error
+                if error is None and market_outcome.changes is None:
+                    error = RuntimeError("没有返回解析结果")
+                if error is None:
+                    try:
+                        persist_market_page(
+                            connection,
+                            job,
+                            market_outcome.changes or [],
+                            final=True,
+                        )
+                    except Exception as persist_error:
+                        connection.rollback()
+                        error = RuntimeError(
+                            f"数据库写入失败：{persist_error}"
+                        )
+                if error is not None:
+                    connection.rollback()
+                    persist_final_failure_or_log(
+                        connection,
+                        job,
+                        str(error),
+                    )
+                    next_pending.append(job)
+                    print(
+                        f"{TASK_PREFIX} {job.match_id} | "
+                        f"{company_label(job.company_id)} | {label} | "
+                        f"第 {attempt}/{MAX_MARKET_FETCH_ATTEMPTS} "
+                        f"次失败：{error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    succeeded += 1
+                    print(
+                        f"{TASK_PREFIX} {job.match_id} | "
+                        f"{company_label(job.company_id)} | {label} | "
+                        f"最终快照 {len(market_outcome.changes or [])} 条"
+                    )
+        pending = next_pending
+        if pending and attempt < MAX_MARKET_FETCH_ATTEMPTS:
+            print(
+                f"{TASK_PREFIX} 仅重试失败市场 {len(pending)} 页，"
+                f"开始第 {attempt + 1}/{MAX_MARKET_FETCH_ATTEMPTS} 次尝试。",
+                file=sys.stderr,
+            )
+    return succeeded, len(pending)
+
+
+async def finalize_match(
+    browser: AsyncBrowser,
+    proxy_client: ProxyClient,
+    connection: Connection,
+    args: argparse.Namespace,
+    match_id: int,
+) -> FinalizationResult:
+    jobs = prepare_pending_jobs(connection, match_id, args.company_ids)
+    succeeded = 0
+    failed = 0
+    timed_out = False
+    if jobs:
+        try:
+            succeeded, failed = await asyncio.wait_for(
+                run_final_jobs(
+                    browser,
+                    proxy_client,
+                    connection,
+                    args,
+                    jobs,
+                ),
+                timeout=args.match_timeout,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+
+    completed = is_final_snapshot_complete(
+        connection,
+        match_id,
+        args.company_ids,
+    )
+    if completed:
+        mark_completed(connection, match_id)
+    remaining = len(load_pending_jobs(connection, match_id, args.company_ids))
+    return FinalizationResult(
+        match_id=match_id,
+        succeeded=succeeded,
+        failed=failed,
+        pending=remaining,
+        completed=completed,
+        timed_out=timed_out,
+    )
+
+
+async def finalize_matches(
+    connection: Connection,
+    args: argparse.Namespace,
+    matches: Sequence[Tuple[int, bool, str]],
+) -> List[FinalizationResult]:
+    results: List[FinalizationResult] = []
+    proxy_client = ProxyClient.from_env()
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=not args.headed)
+        try:
+            for match_id, is_finished, _crawl_status in matches:
+                if not is_finished:
+                    detail_returncode = refresh_detail_once(match_id)
+                    if detail_returncode != 0:
+                        results.append(
+                            FinalizationResult(
+                                match_id=match_id,
+                                succeeded=0,
+                                failed=0,
+                                pending=len(args.company_ids) * len(MARKETS),
+                                completed=False,
+                            )
+                        )
+                        print(
+                            f"{TASK_PREFIX} {match_id} | 未完成 | "
+                            "最终详情刷新失败，留待下一轮",
+                            file=sys.stderr,
+                        )
+                        continue
+                result = await finalize_match(
+                    browser,
+                    proxy_client,
+                    connection,
+                    args,
+                    match_id,
+                )
+                results.append(result)
+                if result.completed:
+                    print(
+                        f"{TASK_PREFIX} {match_id} | 已完成 | "
+                        "全部最终快照页面已成功写入"
+                    )
+                else:
+                    timeout_text = "；单场超时" if result.timed_out else ""
+                    print(
+                        f"{TASK_PREFIX} {match_id} | 未完成 | "
+                        f"本轮成功 {result.succeeded}，"
+                        f"失败 {result.failed}，"
+                        f"待处理 {result.pending}{timeout_text}"
+                    )
+        finally:
+            await browser.close()
+    return results
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -363,115 +543,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    connection: Optional[Connection] = None
     try:
         connection = psycopg2.connect(database_url)
         ensure_schema(connection)
-        pending_matches = select_pending_matches(
+        matches = select_finalization_matches(
             connection,
             args.limit,
             args.active_crawl_statuses,
         )
     except psycopg2.Error as error:
+        if connection is not None:
+            connection.close()
         print(f"{TASK_PREFIX} 数据库访问失败：{error}", file=sys.stderr)
         return 1
 
-    if not pending_matches:
+    if not matches:
         connection.close()
-        print(
-            f"{TASK_PREFIX} 没有需要核验或暂停的比赛。",
-            file=sys.stderr,
-        )
+        print(f"{TASK_PREFIX} 没有需要收尾的比赛。", file=sys.stderr)
         return 0
 
-    completed = 0
-    incomplete = 0
-    paused = 0
-    abnormal = 0
     try:
-        with ProxyClient.from_env() as proxy_scheduler:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=not args.headed)
-                try:
-                    for match_id, is_finished in pending_matches:
-                        if not is_finished:
-                            detail_returncode = refresh_detail_once(match_id)
-                            if detail_returncode != 0:
-                                incomplete += 1
-                                print(
-                                    f"{TASK_PREFIX} {match_id} | 未更新 | "
-                                    "最后一次详情刷新失败，保留原状态"
-                                )
-                                continue
-                            if is_match_finished(connection, match_id):
-                                incomplete += 1
-                                print(
-                                    f"{TASK_PREFIX} {match_id} | 未完成 | "
-                                    "详情已更新为完场，留待下一轮核验赔率完整性"
-                                )
-                                continue
-                            returncode = refresh_odds_once(match_id)
-                            final_status = final_status_for_refresh(returncode)
-                            if final_status is None:
-                                incomplete += 1
-                                print(
-                                    f"{TASK_PREFIX} {match_id} | 未更新 | "
-                                    "最后一次赔率抓取整体中断，保留原状态"
-                                )
-                                continue
-                            mark_final_status(
-                                connection,
-                                match_id,
-                                final_status,
-                            )
-                            if final_status == "暂停爬取":
-                                paused += 1
-                            else:
-                                abnormal += 1
-                            refresh_message = (
-                                "最后一次赔率抓取成功"
-                                if returncode == EXIT_SUCCESS
-                                else (
-                                    "存在失败页面，但未超过一半"
-                                    if returncode == EXIT_PARTIAL_FAILURE
-                                    else "超过一半页面失败"
-                                )
-                            )
-                            print(
-                                f"{TASK_PREFIX} {match_id} | {final_status} | "
-                                f"开赛时间已超过 4 小时；{refresh_message}"
-                            )
-                            continue
-                        matched, message = check_match(
-                            browser,
-                            proxy_scheduler,
-                            connection,
-                            args,
-                            match_id,
-                        )
-                        if matched:
-                            mark_completed(connection, match_id)
-                            completed += 1
-                            print(
-                                f"{TASK_PREFIX} {match_id} | 已完成 | {message}"
-                            )
-                        else:
-                            incomplete += 1
-                            print(
-                                f"{TASK_PREFIX} {match_id} | 未完成 | {message}"
-                            )
-                finally:
-                    browser.close()
+        results = asyncio.run(finalize_matches(connection, args, matches))
     except Exception as error:
-        print(f"{TASK_PREFIX} 完成核验中断：{error}", file=sys.stderr)
+        print(f"{TASK_PREFIX} 最终快照中断：{error}", file=sys.stderr)
         return 1
     finally:
         connection.close()
 
+    completed = sum(result.completed for result in results)
+    incomplete = len(results) - completed
     print(
-        f"{TASK_PREFIX} 完成核验结束：标记完成 {completed} 场，"
-        f"暂停爬取 {paused} 场，"
-        f"异常 {abnormal} 场，"
-        f"仍未完成 {incomplete} 场。",
+        f"{TASK_PREFIX} 最终快照结束：完成 {completed} 场，"
+        f"待续跑 {incomplete} 场。",
         file=sys.stderr,
     )
     return 0
