@@ -85,10 +85,12 @@ of their own validation, lifecycle, and shutdown behavior.
 
 `MatchWeb/server.py` is an independently started, read-only presentation service.
 It loads the same `SIMPLE_CRAWLER_DATABASE_URL` used by the crawler, accepts a
-Shanghai-calendar date and one or more of four presentation status groups, then
-reads `match_details`. The browser defaults to the combined `未开始` and `进行中`
-groups, allows any non-empty combination, and sends each selected group as a
-repeated `status` query parameter. The status groups preserve the dashboard domain
+Shanghai-calendar match date and one or more of four presentation status groups,
+then reads `match_details`. A selected match date covers scheduled times from 21:00
+on the previous calendar day, inclusive, through 00:00 on the following day,
+exclusive. The browser defaults to the combined `未开始` and `进行中` groups,
+allows any non-empty combination, and sends each selected group as a repeated
+`status` query parameter. The status groups preserve the dashboard domain
 rules: minute/phase values are presented as in progress, `未开始` and `完` are
 exact groups, and every remaining source status is grouped as other. No crawler
 schedule or persisted record is changed.
