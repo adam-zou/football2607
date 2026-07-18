@@ -34,9 +34,16 @@ python3 MatchWeb/manage_users.py list
 python3 MatchWeb/manage_users.py remove adam
 ```
 
+使用 `admin` 账号登录后，也可以从页面右上角进入“用户管理”，在网页中新增用户、
+重置密码或删除普通用户。用户管理页面及其接口仅允许用户名恰好为 `admin` 的已登录
+账号访问，并且不允许在网页中删除 `admin` 自身。修改立即生效，无需重启服务。
+
 ## 启动
 
-在仓库根目录执行：
+Windows 用户如需同时启动采集调度器和本网页应用，可直接双击仓库根目录的
+`start_all.bat`。两个服务会在独立命令行窗口中运行。
+
+只启动网页应用时，在仓库根目录执行：
 
 ```bash
 python3 MatchWeb/server.py
