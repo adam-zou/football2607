@@ -17,7 +17,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -41,6 +41,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 SESSION_COOKIE = "match_web_session"
 SESSION_LIFETIME = timedelta(hours=12)
 ALLOWED_STATUSES = {"未开始", "进行中", "完", "其它"}
+DEFAULT_STATUSES = ("未开始", "进行中")
 ADMIN_USERNAME = "admin"
 
 STATUS_SQL = {
@@ -80,14 +81,18 @@ def validate_date(value: str) -> str:
 def fetch_matches(
     database_url: str,
     match_date: str,
-    status: str,
+    statuses: Union[str, Sequence[str]],
     odds_filter: bool = True,
 ) -> List[Dict[str, object]]:
     """Return matching rows from the crawler database without changing it."""
 
     match_date = validate_date(match_date)
-    if status not in ALLOWED_STATUSES:
+    if isinstance(statuses, str):
+        statuses = [statuses]
+    statuses = list(dict.fromkeys(statuses))
+    if not statuses or any(status not in ALLOWED_STATUSES for status in statuses):
         raise ValueError("比赛状态无效")
+    status_filter_sql = " OR ".join(f"({STATUS_SQL[status]})" for status in statuses)
 
     odds_filter_sql = ""
     if odds_filter:
@@ -147,7 +152,7 @@ def fetch_matches(
         ) AS filter_hits ON TRUE
         WHERE details.scheduled_time ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$'
           AND details.scheduled_time::TIMESTAMP::DATE = %s::DATE
-          AND {STATUS_SQL[status]}
+          AND ({status_filter_sql})
           {odds_filter_sql}
         ORDER BY details.scheduled_time ASC, details.match_id ASC
     """
@@ -444,7 +449,7 @@ class MatchWebHandler(BaseHTTPRequestHandler):
     def handle_matches(self, query: str) -> None:
         params = parse_qs(query)
         match_date = params.get("date", [today_in_shanghai()])[0]
-        status = params.get("status", ["进行中"])[0]
+        statuses = params.get("status", list(DEFAULT_STATUSES))
         odds_filter_value = params.get("odds_filter", ["1"])[0]
         if odds_filter_value not in {"0", "1"}:
             self.send_json({"error": "赔率筛选参数无效"}, HTTPStatus.BAD_REQUEST)
@@ -452,7 +457,7 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         odds_filter = odds_filter_value == "1"
         try:
             matches = fetch_matches(
-                self.server.app.database_url, match_date, status, odds_filter
+                self.server.app.database_url, match_date, statuses, odds_filter
             )
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -463,7 +468,7 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         self.send_json(
             {
                 "date": match_date,
-                "status": status,
+                "statuses": statuses,
                 "odds_filter": odds_filter,
                 "total": len(matches),
                 "refreshed_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),

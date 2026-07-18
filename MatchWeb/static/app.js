@@ -29,8 +29,8 @@ function localDateValue() {
   return `${value.year}-${value.month}-${value.day}`;
 }
 
-function selectedStatus() {
-  return document.querySelector('input[name="status"]:checked').value;
+function selectedStatuses() {
+  return Array.from(document.querySelectorAll('input[name="status"]:checked'), ({ value }) => value);
 }
 
 function text(value) {
@@ -104,9 +104,9 @@ async function loadMatches() {
   try {
     const params = new URLSearchParams({
       date: dateInput.value,
-      status: selectedStatus(),
       odds_filter: oddsFilter.checked ? '1' : '0',
     });
+    selectedStatuses().forEach((status) => params.append('status', status));
     const response = await fetch(`/api/matches?${params}`, { cache: 'no-store' });
     if (response.status === 401) {
       location.href = '/login';
@@ -116,7 +116,7 @@ async function loadMatches() {
     if (!response.ok) throw new Error(payload.error || '读取失败');
     renderMatches(payload.matches);
     emptyState.hidden = payload.matches.length !== 0;
-    resultSummary.textContent = `${payload.date} · ${payload.status} · 共 ${payload.total} 场`;
+    resultSummary.textContent = `${payload.date} · ${payload.statuses.join('、')} · 共 ${payload.total} 场`;
     updatedAt.textContent = `更新于 ${new Date(payload.refreshed_at).toLocaleTimeString('zh-CN', { hour12: false })}`;
     refreshState.textContent = '每 60 秒自动刷新';
   } catch (error) {
@@ -135,7 +135,10 @@ async function loadMatches() {
 dateInput.value = localDateValue();
 queryButton.addEventListener('click', loadMatches);
 dateInput.addEventListener('change', loadMatches);
-document.querySelectorAll('input[name="status"]').forEach((input) => input.addEventListener('change', loadMatches));
+document.querySelectorAll('input[name="status"]').forEach((input) => input.addEventListener('change', () => {
+  if (selectedStatuses().length === 0) input.checked = true;
+  loadMatches();
+}));
 oddsFilter.addEventListener('change', loadMatches);
 revealAdminNavigation();
 loadMatches();
