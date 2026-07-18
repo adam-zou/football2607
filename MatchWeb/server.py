@@ -153,7 +153,8 @@ def fetch_matches(
             ) AS matched
         ) AS filter_hits ON TRUE
         WHERE details.scheduled_time ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$'
-          AND details.scheduled_time::TIMESTAMP::DATE = %s::DATE
+          AND details.scheduled_time::TIMESTAMP >= (%s::DATE - INTERVAL '3 hours')
+          AND details.scheduled_time::TIMESTAMP < (%s::DATE + INTERVAL '1 day')
           AND ({status_filter_sql})
           {odds_filter_sql}
         ORDER BY details.scheduled_time ASC, details.match_id ASC
@@ -162,7 +163,7 @@ def fetch_matches(
     with psycopg2.connect(database_url) as connection:
         connection.set_session(readonly=True)
         with connection.cursor() as cursor:
-            cursor.execute(query, (match_date,))
+            cursor.execute(query, (match_date, match_date))
             rows = cursor.fetchall()
 
     matches = []

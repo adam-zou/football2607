@@ -77,6 +77,15 @@ class MatchWebAppTests(unittest.TestCase):
         connection.set_session.assert_called_once_with(readonly=True)
         cursor.execute.assert_called_once()
         query = cursor.execute.call_args.args[0]
+        self.assertIn(
+            "details.scheduled_time::TIMESTAMP >= (%s::DATE - INTERVAL '3 hours')",
+            query,
+        )
+        self.assertIn(
+            "details.scheduled_time::TIMESTAMP < (%s::DATE + INTERVAL '1 day')",
+            query,
+        )
+        self.assertEqual(cursor.execute.call_args.args[1], ("2026-07-17", "2026-07-17"))
         self.assertIn("(''|′)", query)
         self.assertIn("handicap.home_odds < 0.700", query)
         self.assertIn("handicap.away_odds < 0.700", query)
