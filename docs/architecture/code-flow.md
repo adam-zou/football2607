@@ -95,11 +95,11 @@ schedule or persisted record is changed.
 
 The optional odds predicate is enabled by default. It keeps matches where either
 handicap side (`home_odds` or `away_odds`) or the over price (`over_odds`) has
-ever been below `0.700` on a non-`滚` record, and independently requires at least one company-3 row
-in any of the handicap, one-x-two, or over-under change tables. Disabling the
-checkbox omits both odds predicates.
-The same non-rolling low-price records are aggregated per match for the filter
-marker column. The API maps each stored company ID through the crawler-owned
+ever been below `0.700` on a non-`滚` record from any company except company 4,
+and independently requires at least one company-3 row in any of the handicap,
+one-x-two, or over-under change tables. Disabling the checkbox omits both odds
+predicates. The same non-rolling, non-company-4 low-price records are aggregated
+per match for the filter marker column. The API maps each stored company ID through the crawler-owned
 company-name configuration and returns the company name with its `change_time`;
 the browser exposes those values on marker hover and keyboard focus.
 
