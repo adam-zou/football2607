@@ -93,6 +93,13 @@ Playwright 在访问目标页面时使用。
 
 ### 4. 启动完整采集流程
 
+Windows 用户如需同时启动采集调度器和 MatchWeb 网页应用，可直接双击仓库根目录的
+`start_all.bat`。脚本优先使用根目录 `.venv` 中的 Python，并为两个服务分别打开
+命令行窗口。默认监控地址为 `http://127.0.0.1:8081/`，网页应用地址为
+`http://127.0.0.1:8082/`。
+
+只启动采集流程时，执行：
+
 ```bash
 python SimpleCrawler/run_scheduler.py
 ```

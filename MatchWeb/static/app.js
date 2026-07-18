@@ -10,6 +10,17 @@ const updatedAt = document.getElementById('updated-at');
 const refreshState = document.getElementById('refresh-state');
 let refreshTimer;
 
+async function revealAdminNavigation() {
+  try {
+    const response = await fetch('/api/session', { cache: 'no-store' });
+    if (!response.ok) return;
+    const session = await response.json();
+    document.getElementById('user-management-link').hidden = !session.is_admin;
+  } catch (_) {
+    // Match loading remains available if the optional session badge cannot load.
+  }
+}
+
 function localDateValue() {
   const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'
@@ -126,4 +137,5 @@ queryButton.addEventListener('click', loadMatches);
 dateInput.addEventListener('change', loadMatches);
 document.querySelectorAll('input[name="status"]').forEach((input) => input.addEventListener('change', loadMatches));
 oddsFilter.addEventListener('change', loadMatches);
+revealAdminNavigation();
 loadMatches();

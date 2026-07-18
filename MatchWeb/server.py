@@ -11,19 +11,20 @@ import json
 import os
 import secrets
 import sys
+import threading
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import psycopg2
 from dotenv import load_dotenv
 
-from auth import load_users, verify_password
+from auth import hash_password, load_users, save_users, validate_username, verify_password
 
 
 SIMPLE_CRAWLER_DIR = Path(__file__).resolve().parent.parent / "SimpleCrawler"
@@ -40,6 +41,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 SESSION_COOKIE = "match_web_session"
 SESSION_LIFETIME = timedelta(hours=12)
 ALLOWED_STATUSES = {"未开始", "进行中", "完", "其它"}
+ADMIN_USERNAME = "admin"
 
 STATUS_SQL = {
     "未开始": "details.status_text = '未开始'",
@@ -183,10 +185,18 @@ def fetch_matches(
 
 
 class MatchWebApp:
-    def __init__(self, database_url: str, users: Dict[str, str], secret: bytes):
+    def __init__(
+        self,
+        database_url: str,
+        users: Dict[str, str],
+        secret: bytes,
+        users_path: Optional[Path] = None,
+    ):
         self.database_url = database_url
         self.users = users
         self.secret = secret
+        self.users_path = users_path
+        self.users_lock = threading.Lock()
 
     def authenticate(self, username: str, password: str) -> bool:
         password_hash = self.users.get(username)
@@ -204,22 +214,64 @@ class MatchWebApp:
         signature = hmac.new(self.secret, encoded, hashlib.sha256).hexdigest().encode("ascii")
         return (encoded + b"." + signature).decode("ascii")
 
-    def valid_session(self, token: str) -> bool:
+    def session_username(self, token: str) -> Optional[str]:
         try:
             encoded, supplied_signature = token.encode("ascii").rsplit(b".", 1)
             expected_signature = hmac.new(
                 self.secret, encoded, hashlib.sha256
             ).hexdigest().encode("ascii")
             if not hmac.compare_digest(supplied_signature, expected_signature):
-                return False
+                return None
             padding = b"=" * (-len(encoded) % 4)
             payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
-            return (
-                payload.get("username") in self.users
-                and int(payload.get("expires", 0)) > int(datetime.now(SHANGHAI).timestamp())
-            )
+            username = payload.get("username")
+            if (
+                username in self.users
+                and int(payload.get("expires", 0))
+                > int(datetime.now(SHANGHAI).timestamp())
+            ):
+                return str(username)
+            return None
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-            return False
+            return None
+
+    def valid_session(self, token: str) -> bool:
+        return self.session_username(token) is not None
+
+    def list_usernames(self) -> List[str]:
+        with self.users_lock:
+            return sorted(self.users, key=str.casefold)
+
+    def add_user(self, username: str, password: str) -> None:
+        username = validate_username(username)
+        with self.users_lock:
+            if username in self.users:
+                raise ValueError("该用户名已存在")
+            self.users[username] = hash_password(password)
+            self._save_users()
+
+    def reset_user_password(self, username: str, password: str) -> None:
+        username = validate_username(username)
+        with self.users_lock:
+            if username not in self.users:
+                raise ValueError("用户不存在")
+            self.users[username] = hash_password(password)
+            self._save_users()
+
+    def delete_user(self, username: str) -> None:
+        username = validate_username(username)
+        if username == ADMIN_USERNAME:
+            raise ValueError("不能删除 admin 管理员账号")
+        with self.users_lock:
+            if username not in self.users:
+                raise ValueError("用户不存在")
+            del self.users[username]
+            self._save_users()
+
+    def _save_users(self) -> None:
+        if self.users_path is None:
+            raise RuntimeError("未配置账号文件")
+        save_users(self.users_path, self.users)
 
 
 class MatchWebServer(ThreadingHTTPServer):
@@ -255,10 +307,36 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/":
             self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        elif parsed.path == "/users":
+            if not self.is_admin():
+                self.send_error(HTTPStatus.FORBIDDEN, "仅 admin 可访问")
+                return
+            self.serve_file(STATIC_DIR / "users.html", "text/html; charset=utf-8")
         elif parsed.path == "/app.js":
             self.serve_file(STATIC_DIR / "app.js", "text/javascript; charset=utf-8")
+        elif parsed.path == "/users.js":
+            if not self.is_admin():
+                self.send_error(HTTPStatus.FORBIDDEN, "仅 admin 可访问")
+                return
+            self.serve_file(STATIC_DIR / "users.js", "text/javascript; charset=utf-8")
         elif parsed.path == "/api/matches":
             self.handle_matches(parsed.query)
+        elif parsed.path == "/api/session":
+            username = self.current_username()
+            self.send_json({"username": username, "is_admin": username == ADMIN_USERNAME})
+        elif parsed.path == "/api/users":
+            if not self.require_admin_api():
+                return
+            usernames = self.server.app.list_usernames()
+            self.send_json(
+                {
+                    "users": [
+                        {"username": name, "is_admin": name == ADMIN_USERNAME}
+                        for name in usernames
+                    ],
+                    "total": len(usernames),
+                }
+            )
         elif parsed.path == "/logout":
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/login")
@@ -272,6 +350,21 @@ class MatchWebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/users":
+            if not self.require_admin_api():
+                return
+            payload = self.read_json()
+            if payload is None:
+                return
+            try:
+                self.server.app.add_user(
+                    str(payload.get("username", "")), str(payload.get("password", ""))
+                )
+            except (ValueError, RuntimeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"message": "用户已创建"}, HTTPStatus.CREATED)
+            return
         if parsed.path != "/login":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -290,6 +383,63 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             "HttpOnly; SameSite=Lax; Max-Age=43200",
         )
         self.end_headers()
+
+    def do_PUT(self) -> None:
+        username = self.user_api_username()
+        if username is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if not self.require_admin_api():
+            return
+        payload = self.read_json()
+        if payload is None:
+            return
+        try:
+            self.server.app.reset_user_password(
+                username, str(payload.get("password", ""))
+            )
+        except (ValueError, RuntimeError) as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json({"message": "密码已重置"})
+
+    def do_DELETE(self) -> None:
+        username = self.user_api_username()
+        if username is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if not self.require_admin_api():
+            return
+        try:
+            self.server.app.delete_user(username)
+        except (ValueError, RuntimeError) as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        self.send_json({"message": "用户已删除"})
+
+    def user_api_username(self) -> Optional[str]:
+        parsed = urlparse(self.path)
+        prefix = "/api/users/"
+        if not parsed.path.startswith(prefix):
+            return None
+        username = unquote(parsed.path[len(prefix):])
+        return username if username and "/" not in username else None
+
+    def read_json(self) -> Optional[Dict[str, object]]:
+        if self.headers.get_content_type() != "application/json":
+            self.send_json({"error": "请求格式必须是 JSON"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 16_384:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json({"error": "请求内容无效"}, HTTPStatus.BAD_REQUEST)
+            return None
 
     def handle_matches(self, query: str) -> None:
         params = parse_qs(query)
@@ -322,9 +472,24 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         )
 
     def is_authenticated(self) -> bool:
+        return self.current_username() is not None
+
+    def current_username(self) -> Optional[str]:
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
         morsel = cookie.get(SESSION_COOKIE)
-        return bool(morsel and self.server.app.valid_session(morsel.value))
+        return self.server.app.session_username(morsel.value) if morsel else None
+
+    def is_admin(self) -> bool:
+        return self.current_username() == ADMIN_USERNAME
+
+    def require_admin_api(self) -> bool:
+        if not self.is_authenticated():
+            self.send_json({"error": "未登录"}, HTTPStatus.UNAUTHORIZED)
+            return False
+        if not self.is_admin():
+            self.send_json({"error": "仅 admin 可访问"}, HTTPStatus.FORBIDDEN)
+            return False
+        return True
 
     def serve_file(self, path: Path, content_type: str) -> None:
         try:
@@ -393,7 +558,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     secret = secret_text.encode("utf-8") if secret_text else secrets.token_bytes(32)
     if not secret_text:
         print("[MatchWeb] 未配置会话密钥；本次启动已使用临时随机密钥。")
-    app = MatchWebApp(database_url, users, secret)
+    app = MatchWebApp(database_url, users, secret, users_path)
     server = MatchWebServer((args.host, args.port), app)
     print(f"[MatchWeb] http://{args.host}:{server.server_address[1]}/")
     try:

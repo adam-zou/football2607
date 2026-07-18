@@ -64,6 +64,7 @@ flowchart LR
 
 | Command | Python entrypoint | Purpose | Persistent write |
 | --- | --- | --- | --- |
+| `start_all.bat` | Windows launcher for `SimpleCrawler/run_scheduler.py:main` and `MatchWeb/server.py:main` | Start the crawler supervisor and authenticated match view in separate command windows, preferring the repository `.venv` | None directly; the launched crawler jobs own their writes |
 | `python3 SimpleCrawler/run_scheduler.py` | `SimpleCrawler/run_scheduler.py:main` | Run the proxy service and the four independent, single-instance crawler loops | None directly; child jobs own their writes |
 | `python3 SimpleCrawler/fetch_match_ids.py` | `SimpleCrawler/fetch_match_ids.py:main` | Fetch the currently rendered Titan007 match IDs, print them, and store unseen IDs | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
 | `python3 SimpleCrawler/fetch_match_details.py [match_id ...]` | `SimpleCrawler/fetch_match_details.py:main` | Fetch and store detail-page fields for selected IDs or every database ID | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
@@ -74,6 +75,13 @@ flowchart LR
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
 
 ## Authenticated match view
+
+On Windows, `start_all.bat` at the repository root provides the combined launcher.
+It resolves the repository from the batch file location, prefers
+`.venv\Scripts\python.exe`, falls back to the Python launcher or `python` on
+`PATH`, and starts the crawler supervisor and MatchWeb in separate command
+windows. The Python entrypoints remain independently usable and retain ownership
+of their own validation, lifecycle, and shutdown behavior.
 
 `MatchWeb/server.py` is an independently started, read-only presentation service.
 It loads the same `SIMPLE_CRAWLER_DATABASE_URL` used by the crawler, accepts a
@@ -96,6 +104,15 @@ the browser exposes those values on marker hover and keyboard focus.
 All HTML and JSON match routes require a server-validated, HMAC-signed login
 session. Multiple local accounts are stored in a separately managed JSON file;
 passwords use salted PBKDF2-SHA256 hashes and are never stored as plaintext.
+The authenticated `/users` page and `/api/users` management endpoints additionally
+require the signed session username to be exactly `admin`. They list accounts and
+allow the administrator to create users, reset passwords, and delete non-admin
+accounts. Each mutation validates input, hashes new passwords, and atomically
+replaces the same account JSON file; deleting the `admin` account is rejected.
+The in-process account map is updated together with the file, so changes take effect
+immediately without restarting MatchWeb. Non-admin sessions receive HTTP 403 from
+these routes, and the browser only reveals the user-management navigation after a
+server-reported admin session check.
 After the first query, the browser repeats the same read-only request every 60
 seconds. Match IDs link to Nowscore's company-3 three-market odds page.
 

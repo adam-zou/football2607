@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>用户管理 · MatchWeb</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/" aria-label="MatchWeb 首页">
+          <span class="brand-mark">M</span>
+          <span><strong>MatchWeb</strong><small>赛事数据中心</small></span>
+        </a>
+        <nav class="main-nav" aria-label="主导航">
+          <a href="/"><span class="nav-icon">⌁</span>比赛数据</a>
+          <a class="active" href="/users" aria-current="page"><span class="nav-icon">♙</span>用户管理</a>
+        </nav>
+        <div class="sidebar-account">
+          <span class="avatar">A</span>
+          <span><strong>admin</strong><small>超级管理员</small></span>
+          <a href="/logout" aria-label="退出登录" title="退出登录">↗</a>
+        </div>
+      </aside>
+
+      <main class="admin-main">
+        <header class="admin-header">
+          <div>
+            <p class="eyebrow">系统设置</p>
+            <h1>用户管理</h1>
+            <p>管理可登录 MatchWeb 的账号与访问权限。</p>
+          </div>
+          <button id="add-user-button" class="primary-button" type="button"><span>＋</span> 新增用户</button>
+        </header>
+
+        <section class="summary-grid" aria-label="用户统计">
+          <article class="summary-card">
+            <span class="summary-icon green">♙</span>
+            <div><small>用户总数</small><strong id="total-users">—</strong><p>已创建的登录账号</p></div>
+          </article>
+          <article class="summary-card">
+            <span class="summary-icon blue">✓</span>
+            <div><small>管理员</small><strong>1</strong><p>拥有用户管理权限</p></div>
+          </article>
+          <article class="summary-card">
+            <span class="summary-icon amber">⌾</span>
+            <div><small>安全策略</small><strong class="summary-text">已启用</strong><p>密码加盐加密存储</p></div>
+          </article>
+        </section>
+
+        <section class="user-panel">
+          <div class="panel-toolbar">
+            <div>
+              <h2>全部用户</h2>
+              <p id="user-summary">正在读取用户…</p>
+            </div>
+            <label class="search-box">
+              <span>⌕</span>
+              <span class="sr-only">搜索用户</span>
+              <input id="user-search" type="search" placeholder="搜索用户名" autocomplete="off" />
+            </label>
+          </div>
+          <div class="user-table-wrap">
+            <table class="user-table">
+              <thead><tr><th>用户</th><th>角色</th><th>状态</th><th><span class="sr-only">操作</span></th></tr></thead>
+              <tbody id="user-rows"></tbody>
+            </table>
+            <div id="users-empty" class="empty-state" hidden>没有匹配的用户</div>
+            <div id="users-error" class="empty-state error-state" hidden></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="user-dialog" class="user-dialog">
+      <form id="user-form">
+        <div class="dialog-heading">
+          <div><p class="eyebrow">账号设置</p><h2 id="dialog-title">新增用户</h2></div>
+          <button id="dialog-close" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <input id="dialog-mode" type="hidden" value="create" />
+        <label class="form-field">用户名
+          <input id="dialog-username" name="username" type="text" maxlength="64" required autocomplete="off" placeholder="例如：operator01" />
+          <small>1–64 个字符，不可包含空格</small>
+        </label>
+        <label class="form-field">密码
+          <input id="dialog-password" name="password" type="password" minlength="8" required autocomplete="new-password" placeholder="至少 8 个字符" />
+        </label>
+        <p id="form-error" class="inline-error" hidden></p>
+        <div class="dialog-actions">
+          <button id="dialog-cancel" class="secondary-button" type="button">取消</button>
+          <button id="dialog-submit" class="primary-button" type="submit">创建用户</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="delete-dialog" class="user-dialog confirm-dialog">
+      <form id="delete-form">
+        <span class="danger-symbol">!</span>
+        <h2>删除用户？</h2>
+        <p>账号 <strong id="delete-username"></strong> 将立即无法登录。此操作无法撤销。</p>
+        <p id="delete-error" class="inline-error" hidden></p>
+        <div class="dialog-actions">
+          <button id="delete-cancel" class="secondary-button" type="button">取消</button>
+          <button class="danger-button" type="submit">确认删除</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/users.js" defer></script>
+  </body>
+</html>
