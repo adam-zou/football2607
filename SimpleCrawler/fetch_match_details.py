@@ -16,6 +16,7 @@ from playwright.async_api import Browser as AsyncBrowser
 from playwright.async_api import Page as AsyncPage
 from playwright.async_api import async_playwright
 from psycopg2.extensions import connection as Connection
+from simple_crawler.monitoring import format_round_match_count
 
 try:
     from .concurrent_pages import async_proxy_lease, iter_bounded
@@ -33,6 +34,7 @@ ENV_FILE = Path(__file__).with_name(".env")
 DATABASE_ENV_NAME = "SIMPLE_CRAWLER_DATABASE_URL"
 TASK_PREFIX = "[比赛详情]"
 MAX_DETAIL_FETCH_ATTEMPTS = 3
+DETAIL_PROGRESS_INTERVAL = 10
 BLOCKED_RESOURCE_TYPES = {"stylesheet", "image", "media", "font"}
 TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 FALSE_ENV_VALUES = {"0", "false", "no", "off"}
@@ -236,20 +238,7 @@ def select_match_ids(
                 [(match_id,) for match_id in unique_ids],
             )
             connection.commit()
-            cursor.execute(
-                """
-                SELECT match_id
-                FROM match_ids
-                WHERE match_id = ANY(%s)
-                  AND crawl_status = ANY(%s)
-                """,
-                (unique_ids, list(active_crawl_statuses)),
-            )
-            allowed_ids = {row[0] for row in cursor.fetchall()}
-            selected_ids = [
-                match_id for match_id in unique_ids if match_id in allowed_ids
-            ]
-            return selected_ids[:limit]
+            return unique_ids[:limit]
 
         statement = """
             SELECT ids.match_id
@@ -427,6 +416,13 @@ def format_detail(detail: MatchDetail) -> str:
     )
 
 
+def concise_error(error: BaseException) -> str:
+    """Keep the actionable first line and omit Playwright's repeated call log."""
+
+    first_line = str(error).splitlines()[0].strip() if str(error) else ""
+    return first_line or type(error).__name__
+
+
 async def fetch_detail_with_retries(
     browser: AsyncBrowser,
     proxy_client: ProxyClient,
@@ -467,7 +463,8 @@ async def fetch_detail_with_retries(
         except Exception as error:
             print(
                 f"{TASK_PREFIX} {match_id} | 第 "
-                f"{attempt}/{MAX_DETAIL_FETCH_ATTEMPTS} 次获取失败：{error}",
+                f"{attempt}/{MAX_DETAIL_FETCH_ATTEMPTS} 次获取失败："
+                f"{concise_error(error)}",
                 file=sys.stderr,
             )
             if attempt == MAX_DETAIL_FETCH_ATTEMPTS:
@@ -487,6 +484,7 @@ async def crawl_details(
 ) -> Tuple[int, int]:
     succeeded = 0
     failed = 0
+    total = len(match_ids)
 
     proxy_client = ProxyClient.from_env()
     async with async_playwright() as playwright:
@@ -511,30 +509,43 @@ async def crawl_details(
                     connection.rollback()
                     print(
                         f"{TASK_PREFIX} {match_id} | 页面获取失败："
-                        f"{outcome.error}",
-                        file=sys.stderr,
-                    )
-                    continue
-                detail = outcome.result
-                if detail is None:
-                    failed += 1
-                    print(
-                        f"{TASK_PREFIX} {match_id} | 获取失败：没有返回详情",
-                        file=sys.stderr,
-                    )
-                    continue
-                try:
-                    save_detail(connection, detail)
-                except psycopg2.Error as error:
-                    failed += 1
-                    connection.rollback()
-                    print(
-                        f"{TASK_PREFIX} {match_id} | 数据库写入失败：{error}",
+                        f"{concise_error(outcome.error)}",
                         file=sys.stderr,
                     )
                 else:
-                    succeeded += 1
-                    print(f"{TASK_PREFIX} {format_detail(detail)}")
+                    detail = outcome.result
+                    if detail is None:
+                        failed += 1
+                        print(
+                            f"{TASK_PREFIX} {match_id} | "
+                            "获取失败：没有返回详情",
+                            file=sys.stderr,
+                        )
+                    else:
+                        try:
+                            save_detail(connection, detail)
+                        except psycopg2.Error as error:
+                            failed += 1
+                            connection.rollback()
+                            print(
+                                f"{TASK_PREFIX} {match_id} | "
+                                f"数据库写入失败：{concise_error(error)}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            succeeded += 1
+                            print(f"{TASK_PREFIX} {format_detail(detail)}")
+
+                processed = succeeded + failed
+                if (
+                    processed % DETAIL_PROGRESS_INTERVAL == 0
+                    or processed == total
+                ):
+                    active = min(args.concurrency, total - processed)
+                    print(
+                        f"{TASK_PREFIX} 进度：已处理 {processed}/{total}，"
+                        f"成功 {succeeded}，失败 {failed}，处理中 {active}"
+                    )
         finally:
             await browser.close()
     return succeeded, failed
@@ -568,6 +579,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{TASK_PREFIX} 数据库访问失败：{error}", file=sys.stderr)
         return 1
 
+    print(format_round_match_count(TASK_PREFIX, len(match_ids)))
     if not match_ids:
         connection.close()
         print(f"{TASK_PREFIX} 数据库中没有比赛 ID。", file=sys.stderr)

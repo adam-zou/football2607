@@ -18,12 +18,12 @@ from typing import Callable, Optional, Sequence, TextIO
 
 from dotenv import load_dotenv
 from simple_crawler.dashboard_statistics import fetch_daily_statistics
-from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - SimpleCrawler is deployed on Linux/macOS
-    fcntl = None
+from simple_crawler.file_lock import ExclusiveFileLock, FileAlreadyLocked
+from simple_crawler.monitoring import (
+    DashboardServer,
+    RuntimeMonitor,
+    parse_round_match_count,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -58,32 +58,34 @@ class SchedulerAlreadyRunning(RuntimeError):
 class SchedulerLock:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock: Optional[ExclusiveFileLock] = None
         self._file: Optional[TextIO] = None
 
     def __enter__(self) -> "SchedulerLock":
-        if fcntl is None:
-            raise RuntimeError("当前平台不支持调度器单实例文件锁")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = self.path.open("a+", encoding="utf-8")
+        lock = ExclusiveFileLock(self.path, timeout=0)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            lock_file.close()
+            lock_file = lock.acquire()
+        except FileAlreadyLocked as error:
             raise SchedulerAlreadyRunning(
                 "SimpleCrawler 调度器已经在运行"
             ) from error
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write(str(os.getpid()))
-        lock_file.flush()
+        try:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(os.getpid()))
+            lock_file.flush()
+        except Exception:
+            lock.release()
+            raise
+        self._lock = lock
         self._file = lock_file
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        if self._file is None:
+        if self._lock is None:
             return
-        fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-        self._file.close()
+        self._lock.release()
+        self._lock = None
         self._file = None
 
 
@@ -119,7 +121,7 @@ def worker_specs() -> tuple[WorkerSpec, ...]:
         WorkerSpec(
             "比赛 ID",
             SCRIPT_DIR / "fetch_match_ids.py",
-            positive_env_float("SIMPLE_CRAWLER_ID_INTERVAL_SECONDS", 60.0),
+            positive_env_float("SIMPLE_CRAWLER_ID_INTERVAL_SECONDS", 900.0),
         ),
         WorkerSpec(
             "比赛详情",
@@ -199,6 +201,12 @@ def run_worker_process(
     def handle_log(line: str) -> None:
         print(line, flush=True)
         if monitor is not None:
+            round_match_count = parse_round_match_count(line)
+            if round_match_count is not None:
+                monitor.update(
+                    spec.script.stem,
+                    round_match_count=round_match_count,
+                )
             monitor.append_log(spec.script.stem, line)
 
     return run_child_process(
@@ -227,6 +235,7 @@ def run_worker_loop(
                 message="脚本正在运行",
                 started_at=time.time(),
                 next_run_at=None,
+                round_match_count=None,
             )
         started_at = time.monotonic()
         returncode = None
@@ -298,6 +307,7 @@ def format_proxy_health(payload: dict[str, object]) -> str:
         f"代理健康：当前代理 {payload.get('pool_size', 0)} 个，"
         f"已租用 {payload.get('leased', 0)} 个，"
         f"可用代理 {payload.get('available_proxies', 0)} 个，"
+        f"隔离代理 {payload.get('retired_proxies', 0)} 个，"
         f"可用页面槽位 {payload.get('available_page_slots', 0)}；"
         f"最近获取 {payload.get('last_batch_received', 0)} 个，"
         f"验证通过 {payload.get('last_batch_validated', 0)} 个"
@@ -315,6 +325,7 @@ def run_proxy_health_monitor(
     while not stop_event.wait(interval_seconds):
         try:
             payload = fetcher()
+            monitor.update_proxy_health(payload)
             monitor.append_log("proxy_scheduler", format_proxy_health(payload))
             monitor.update(
                 "proxy_scheduler",
@@ -322,6 +333,7 @@ def run_proxy_health_monitor(
                 message="代理服务健康",
             )
         except Exception as error:
+            monitor.set_proxy_health_error(str(error))
             monitor.append_log("proxy_scheduler", f"代理健康检查失败：{error}")
             monitor.update(
                 "proxy_scheduler",
