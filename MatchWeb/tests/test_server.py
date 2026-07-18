@@ -41,6 +41,12 @@ class MatchWebAppTests(unittest.TestCase):
                 server.fetch_matches("postgresql://test", "2026-07-17", "全部")
             connect.assert_not_called()
 
+    def test_rejects_empty_status_selection_before_database_connection(self):
+        with patch.object(server.psycopg2, "connect") as connect:
+            with self.assertRaisesRegex(ValueError, "状态无效"):
+                server.fetch_matches("postgresql://test", "2026-07-17", [])
+            connect.assert_not_called()
+
     def test_fetch_matches_uses_read_only_connection(self):
         cursor = MagicMock()
         cursor.fetchall.return_value = [
@@ -93,6 +99,26 @@ class MatchWebAppTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_fetch_matches_combines_multiple_status_groups(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.fetch_matches(
+                "postgresql://test", "2026-07-17", ["未开始", "进行中"]
+            )
+
+        query = cursor.execute.call_args.args[0]
+        self.assertIn("details.status_text = '未开始'", query)
+        self.assertIn("details.status_text IN ('上', '中', '下'", query)
+        self.assertIn(" OR ", query)
 
     def test_fetch_matches_can_disable_odds_filter(self):
         cursor = MagicMock()
