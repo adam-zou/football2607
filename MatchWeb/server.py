@@ -140,12 +140,14 @@ def fetch_matches(
                 SELECT handicap.company_id, handicap.change_time
                 FROM titan007_handicap_changes AS handicap
                 WHERE handicap.match_id = details.match_id
+                  AND handicap.company_id <> 4
                   AND handicap.source_status <> '滚'
                   AND (handicap.home_odds < 0.700 OR handicap.away_odds < 0.700)
                 UNION
                 SELECT totals.company_id, totals.change_time
                 FROM titan007_over_under_changes AS totals
                 WHERE totals.match_id = details.match_id
+                  AND totals.company_id <> 4
                   AND totals.source_status <> '滚'
                   AND totals.over_odds < 0.700
             ) AS matched
