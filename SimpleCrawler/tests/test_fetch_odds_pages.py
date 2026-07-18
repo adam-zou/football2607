@@ -14,8 +14,10 @@ from odds_collection import (
     UPSERT_HANDICAP,
     UPSERT_ONE_X_TWO,
     UPSERT_OVER_UNDER,
+    MarketCollectionOutcome,
     OddsPageJob,
     extract_page_rows_from_html,
+    persist_market_batch,
     persist_market_page,
 )
 
@@ -189,6 +191,25 @@ class OddsPersistenceTests(unittest.TestCase):
             rows=[(1, 2, 3)],
             final=False,
         )
+        self.assertEqual(connection.commits, 1)
+
+    @mock.patch("odds_collection.record_market_result")
+    def test_company_markets_share_one_transaction(
+        self,
+        record_market_result,
+    ) -> None:
+        connection = FakeConnection([])
+        outcomes = [
+            MarketCollectionOutcome(
+                OddsPageJob(123, 3, market),
+                changes=[],
+            )
+            for market in ("handicap", "one_x_two", "over_under")
+        ]
+
+        persist_market_batch(connection, outcomes, final=True)
+
+        self.assertEqual(record_market_result.call_count, 3)
         self.assertEqual(connection.commits, 1)
 
 

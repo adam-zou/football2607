@@ -1,5 +1,6 @@
 const REFRESH_INTERVAL_MS = 60_000;
 const dateInput = document.getElementById('match-date');
+const oddsFilter = document.getElementById('odds-filter');
 const queryButton = document.getElementById('query-button');
 const rows = document.getElementById('match-rows');
 const emptyState = document.getElementById('empty-state');
@@ -32,12 +33,32 @@ function statusClass(status) {
   return 'live';
 }
 
+function createFilterMarker(markers) {
+  if (!Array.isArray(markers) || markers.length === 0) return '—';
+  const marker = document.createElement('span');
+  marker.className = 'filter-marker';
+  marker.tabIndex = 0;
+  marker.textContent = '详情';
+  marker.setAttribute('aria-label', `筛选命中 ${markers.length} 条，聚焦后查看详情`);
+
+  const tooltip = document.createElement('span');
+  tooltip.className = 'filter-tooltip';
+  tooltip.setAttribute('role', 'tooltip');
+  for (const item of markers) {
+    const line = document.createElement('span');
+    line.textContent = `${item.company_name} · ${item.change_time}`;
+    tooltip.append(line);
+  }
+  marker.append(tooltip);
+  return marker;
+}
+
 function renderMatches(matches) {
   rows.replaceChildren();
   for (const match of matches) {
     const row = document.createElement('tr');
     const link = document.createElement('a');
-    link.href = `https://vip.titan007.com/changeDetail/3in1Odds.aspx?id=${encodeURIComponent(match.match_id)}&companyid=47&l=0`;
+    link.href = `https://live.nowscore.com/odds/3in1Odds.aspx?companyid=3&id=${encodeURIComponent(match.match_id)}`;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     link.textContent = match.match_id;
@@ -50,8 +71,7 @@ function renderMatches(matches) {
       text(match.home_team),
       match.home_score == null || match.away_score == null ? '—' : `${match.home_score} : ${match.away_score}`,
       text(match.away_team),
-      text(match.crawl_status),
-      text(match.updated_at).replace('T', ' '),
+      createFilterMarker(match.filter_markers),
     ];
     cells.forEach((content, index) => {
       const cell = document.createElement('td');
@@ -71,7 +91,11 @@ async function loadMatches() {
   refreshState.textContent = '正在刷新…';
   errorState.hidden = true;
   try {
-    const params = new URLSearchParams({ date: dateInput.value, status: selectedStatus() });
+    const params = new URLSearchParams({
+      date: dateInput.value,
+      status: selectedStatus(),
+      odds_filter: oddsFilter.checked ? '1' : '0',
+    });
     const response = await fetch(`/api/matches?${params}`, { cache: 'no-store' });
     if (response.status === 401) {
       location.href = '/login';
@@ -101,4 +125,5 @@ dateInput.value = localDateValue();
 queryButton.addEventListener('click', loadMatches);
 dateInput.addEventListener('change', loadMatches);
 document.querySelectorAll('input[name="status"]').forEach((input) => input.addEventListener('change', loadMatches));
+oddsFilter.addEventListener('change', loadMatches);
 loadMatches();

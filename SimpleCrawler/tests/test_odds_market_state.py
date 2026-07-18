@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from odds_market_state import (
     CREATE_ODDS_MARKET_STATE_TABLE_SQL,
+    final_snapshot_success_count,
     final_snapshot_complete,
     load_pending_final_pages,
     prepare_final_snapshot,
@@ -132,7 +133,11 @@ class OddsMarketStateTests(unittest.TestCase):
 
         prepare_statement, prepared = cursor.executions[0]
         self.assertIn("final_required", prepare_statement)
-        self.assertEqual(len(prepared), 4)
+        self.assertIn("unnest", prepare_statement)
+        self.assertEqual(
+            prepared,
+            (123, [3, 4], ["handicap", "over_under"]),
+        )
         self.assertEqual(
             pages,
             [(3, "handicap"), (4, "over_under")],
@@ -155,6 +160,21 @@ class OddsMarketStateTests(unittest.TestCase):
                 3,
             )
         )
+
+    def test_counts_only_completed_final_pages(self) -> None:
+        cursor = FakeCursor([(7,)])
+
+        count = final_snapshot_success_count(
+            cursor,
+            123,
+            [3, 4, 8, 24, 31, 47],
+        )
+
+        self.assertEqual(count, 7)
+        statement, parameters = cursor.executions[-1]
+        self.assertIn("final_success_at IS NOT NULL", statement)
+        self.assertIn("NOT final_required", statement)
+        self.assertEqual(parameters, (123, [3, 4, 8, 24, 31, 47]))
 
     def test_requires_exactly_one_of_rows_or_error(self) -> None:
         cursor = FakeCursor()

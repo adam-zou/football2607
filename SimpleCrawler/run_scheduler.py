@@ -117,7 +117,7 @@ def worker_specs() -> tuple[WorkerSpec, ...]:
         WorkerSpec(
             "比赛 ID",
             SCRIPT_DIR / "fetch_match_ids.py",
-            positive_env_float("SIMPLE_CRAWLER_ID_INTERVAL_SECONDS", 60.0),
+            positive_env_float("SIMPLE_CRAWLER_ID_INTERVAL_SECONDS", 900.0),
         ),
         WorkerSpec(
             "比赛详情",
@@ -296,6 +296,7 @@ def format_proxy_health(payload: dict[str, object]) -> str:
         f"代理健康：当前代理 {payload.get('pool_size', 0)} 个，"
         f"已租用 {payload.get('leased', 0)} 个，"
         f"可用代理 {payload.get('available_proxies', 0)} 个，"
+        f"隔离代理 {payload.get('retired_proxies', 0)} 个，"
         f"可用页面槽位 {payload.get('available_page_slots', 0)}；"
         f"最近获取 {payload.get('last_batch_received', 0)} 个，"
         f"验证通过 {payload.get('last_batch_validated', 0)} 个"
@@ -313,6 +314,7 @@ def run_proxy_health_monitor(
     while not stop_event.wait(interval_seconds):
         try:
             payload = fetcher()
+            monitor.update_proxy_health(payload)
             monitor.append_log("proxy_scheduler", format_proxy_health(payload))
             monitor.update(
                 "proxy_scheduler",
@@ -320,6 +322,7 @@ def run_proxy_health_monitor(
                 message="代理服务健康",
             )
         except Exception as error:
+            monitor.set_proxy_health_error(str(error))
             monitor.append_log("proxy_scheduler", f"代理健康检查失败：{error}")
             monitor.update(
                 "proxy_scheduler",

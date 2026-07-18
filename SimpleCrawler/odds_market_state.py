@@ -131,7 +131,15 @@ INSERT INTO titan007_odds_market_state (
     match_id, company_id, market,
     fetch_status, last_error, final_required
 )
-VALUES (%s, %s, %s, '待抓取', NULL, TRUE)
+SELECT
+    %s,
+    company_id,
+    market,
+    '待抓取',
+    NULL,
+    TRUE
+FROM unnest(%s::INTEGER[]) AS company_id
+CROSS JOIN unnest(%s::TEXT[]) AS market
 ON CONFLICT (match_id, company_id, market) DO UPDATE SET
     final_required = TRUE,
     updated_at = NOW()
@@ -183,12 +191,10 @@ def prepare_final_snapshot(
     company_ids: Sequence[int],
     markets: Sequence[str],
 ) -> None:
-    pages = [
-        (match_id, company_id, market)
-        for company_id in company_ids
-        for market in markets
-    ]
-    cursor.executemany(PREPARE_FINAL_SNAPSHOT_SQL, pages)
+    cursor.execute(
+        PREPARE_FINAL_SNAPSHOT_SQL,
+        (match_id, list(company_ids), list(markets)),
+    )
 
 
 def load_pending_final_pages(
@@ -237,6 +243,26 @@ def final_snapshot_complete(
     row = cursor.fetchone()
     expected = len(company_ids) * market_count
     return bool(row and int(row[0]) == expected and row[1])
+
+
+def final_snapshot_success_count(
+    cursor: Any,
+    match_id: int,
+    company_ids: Sequence[int],
+) -> int:
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM titan007_odds_market_state
+        WHERE match_id = %s
+          AND company_id = ANY(%s)
+          AND NOT final_required
+          AND final_success_at IS NOT NULL
+        """,
+        (match_id, list(company_ids)),
+    )
+    row = cursor.fetchone()
+    return int(row[0]) if row else 0
 
 
 def _content_hash(rows: Sequence[Sequence[Any]]) -> str:

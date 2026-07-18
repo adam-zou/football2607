@@ -66,15 +66,29 @@ class FiveUseProxyTests(unittest.TestCase):
 
         self.assertEqual(self.scheduler.pool_size, 0)
 
-    def test_five_assignments_permanently_retire_proxy(self) -> None:
+    def test_five_assignments_quarantine_proxy_until_supplier_reoffers(self) -> None:
         for _ in range(5):
             proxy = self.scheduler.acquire()
             self.scheduler.release(proxy, failed=False)
 
         self.assertEqual(self.scheduler.pool_size, 0)
+        self.assertEqual(self.scheduler.retired_proxy_count, 1)
         self.scheduler._refresh_pool()
 
         self.assertEqual(self.scheduler.pool_size, 0)
+
+        server = "http://192.0.2.10:8000"
+        self.scheduler._retired_until[server] = 0.0
+
+        # Retirement expiry only makes the address eligible for a future
+        # supplier response; it does not resurrect the old endpoint.
+        self.assertEqual(self.scheduler.pool_size, 0)
+        self.assertEqual(self.scheduler.retired_proxy_count, 0)
+
+        self.scheduler._refresh_pool()
+
+        self.assertEqual(self.scheduler.pool_size, 1)
+        self.assertEqual(self.scheduler.available_page_slots, 5)
 
     def test_page_failure_retires_proxy_before_five_assignments(self) -> None:
         proxy = self.scheduler.acquire()
@@ -146,6 +160,34 @@ class FiveUseProxyTests(unittest.TestCase):
             scheduler = ProxyScheduler.from_env()
 
         self.assertEqual(scheduler.max_page_assignments_per_proxy, 7)
+
+    def test_retirement_period_is_loaded_from_environment(self) -> None:
+        environment = {
+            "PROXY_API_URL": "https://proxy.example.test",
+            "PROXY_USERNAME": "user",
+            "PROXY_PASSWORD": "password",
+            "PROXY_RETIRE_SECONDS": "1800",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            scheduler = ProxyScheduler.from_env()
+
+        self.assertEqual(scheduler.retirement_seconds, 1800)
+
+    def test_scheduler_uses_shorter_refresh_and_acquire_defaults(self) -> None:
+        environment = {
+            "PROXY_API_URL": "https://proxy.example.test",
+            "PROXY_USERNAME": "user",
+            "PROXY_PASSWORD": "password",
+        }
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch("proxy_scheduler.load_dotenv"),
+        ):
+            scheduler = ProxyScheduler.from_env()
+
+        self.assertEqual(scheduler.refresh_seconds, 1.6)
+        self.assertEqual(scheduler.acquire_timeout_seconds, 5.0)
+        self.assertEqual(scheduler.api_min_interval_seconds, 1.6)
 
 
 class ProxyClientLeaseTests(unittest.TestCase):

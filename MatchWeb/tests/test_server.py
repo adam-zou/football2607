@@ -1,8 +1,7 @@
-import os
 import sys
+import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,19 +10,22 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
+from auth import hash_password, load_users, save_users, verify_password
 
 
 class MatchWebAppTests(unittest.TestCase):
     def setUp(self):
-        self.app = server.MatchWebApp("postgresql://test", "adam", "secret", b"key")
+        self.app = server.MatchWebApp(
+            "postgresql://test", {"adam": hash_password("secret-123")}, b"key"
+        )
 
     def test_authenticate_requires_both_values(self):
-        self.assertTrue(self.app.authenticate("adam", "secret"))
+        self.assertTrue(self.app.authenticate("adam", "secret-123"))
         self.assertFalse(self.app.authenticate("adam", "wrong"))
-        self.assertFalse(self.app.authenticate("wrong", "secret"))
+        self.assertFalse(self.app.authenticate("wrong", "secret-123"))
 
     def test_session_round_trip_and_tamper_detection(self):
-        token = self.app.create_session()
+        token = self.app.create_session("adam")
         self.assertTrue(self.app.valid_session(token))
         self.assertFalse(self.app.valid_session(token + "x"))
 
@@ -39,10 +41,19 @@ class MatchWebAppTests(unittest.TestCase):
             connect.assert_not_called()
 
     def test_fetch_matches_uses_read_only_connection(self):
-        updated_at = datetime.now(server.SHANGHAI) - timedelta(minutes=1)
         cursor = MagicMock()
         cursor.fetchall.return_value = [
-            (3020831, "中超", "2026-07-17 19:35", "进行中", "主队", 1, 0, "客队", "未完成", updated_at)
+            (
+                3020831,
+                "中超",
+                "2026-07-17 19:35",
+                "进行中",
+                "主队",
+                1,
+                0,
+                "客队",
+                [{"company_id": 3, "change_time": "7-17 18:20"}],
+            )
         ]
         cursor_context = MagicMock()
         cursor_context.__enter__.return_value = cursor
@@ -60,8 +71,48 @@ class MatchWebAppTests(unittest.TestCase):
         cursor.execute.assert_called_once()
         query = cursor.execute.call_args.args[0]
         self.assertIn("(''|′)", query)
+        self.assertIn("handicap.home_odds < 0.700", query)
+        self.assertIn("handicap.away_odds < 0.700", query)
+        self.assertIn("handicap.source_status <> '滚'", query)
+        self.assertIn("totals.over_odds < 0.700", query)
+        self.assertIn("totals.source_status <> '滚'", query)
+        self.assertIn("filter_hits.markers IS NOT NULL", query)
+        self.assertIn("company_three_handicap.company_id = 3", query)
+        self.assertIn("company_three_one_x_two.company_id = 3", query)
+        self.assertIn("company_three_totals.company_id = 3", query)
         self.assertEqual(matches[0]["match_id"], 3020831)
         self.assertEqual(matches[0]["home_score"], 1)
+        self.assertEqual(
+            matches[0]["filter_markers"],
+            [
+                {
+                    "company_id": 3,
+                    "company_name": "Crow*",
+                    "change_time": "7-17 18:20",
+                }
+            ],
+        )
+
+    def test_fetch_matches_can_disable_odds_filter(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.fetch_matches(
+                "postgresql://test", "2026-07-17", "进行中", odds_filter=False
+            )
+
+        query = cursor.execute.call_args.args[0]
+        self.assertIn("titan007_handicap_changes", query)
+        self.assertIn("titan007_over_under_changes", query)
+        self.assertNotIn("filter_hits.markers IS NOT NULL", query)
+        self.assertNotIn("company_id = 3", query)
 
     def test_http_login_protects_home_page(self):
         http_server = server.MatchWebServer(("127.0.0.1", 0), self.app)
@@ -75,7 +126,7 @@ class MatchWebAppTests(unittest.TestCase):
             self.assertEqual(response.status, 303)
             self.assertEqual(response.getheader("Location"), "/login")
 
-            body = "username=adam&password=secret"
+            body = "username=adam&password=secret-123"
             connection.request(
                 "POST",
                 "/login",
@@ -103,9 +154,24 @@ class MatchWebAppTests(unittest.TestCase):
 
     def test_client_uses_required_odds_link(self):
         script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
-        self.assertIn("changeDetail/3in1Odds.aspx?id=", script)
-        self.assertIn("companyid=47&l=0", script)
+        self.assertIn("https://live.nowscore.com/odds/3in1Odds.aspx?companyid=3&id=", script)
         self.assertIn("60_000", script)
+        self.assertIn("odds_filter", script)
+        self.assertIn("filter_markers", script)
+
+    def test_password_hash_is_salted_and_verifiable(self):
+        first = hash_password("a-secure-password")
+        second = hash_password("a-secure-password")
+        self.assertNotEqual(first, second)
+        self.assertTrue(verify_password("a-secure-password", first))
+        self.assertFalse(verify_password("wrong-password", first))
+
+    def test_user_file_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "users.json"
+            users = {"adam": hash_password("a-secure-password")}
+            save_users(path, users)
+            self.assertEqual(load_users(path), users)
 
 
 if __name__ == "__main__":

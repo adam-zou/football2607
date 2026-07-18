@@ -1,11 +1,13 @@
 import argparse
+import io
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 
 from fetch_match_details import (
     MatchDetail,
     block_unneeded_resources,
+    crawl_details,
     fetch_detail_with_retries,
     parse_args,
     select_match_ids,
@@ -97,6 +99,9 @@ class FakeConnection:
     def commit(self) -> None:
         self.commits += 1
 
+    def rollback(self) -> None:
+        return None
+
 
 class DetailMatchSelectionTests(unittest.TestCase):
     def test_normal_selection_applies_detail_refresh_window(self) -> None:
@@ -124,8 +129,8 @@ class DetailMatchSelectionTests(unittest.TestCase):
         self.assertIn("LIMIT %s", statement)
         self.assertEqual(parameters, (["未完成"], 1))
 
-    def test_explicit_ids_force_refresh_with_only_status_filter(self) -> None:
-        connection = FakeConnection([(102,)])
+    def test_explicit_ids_force_refresh_without_status_filter(self) -> None:
+        connection = FakeConnection([])
 
         selected = select_match_ids(
             connection,
@@ -134,10 +139,24 @@ class DetailMatchSelectionTests(unittest.TestCase):
             ["未完成"],
         )
 
-        self.assertEqual(selected, [102])
-        statement, _ = connection.cursor_instance.executions[-1]
-        self.assertNotIn("JOIN match_details", statement)
-        self.assertNotIn("INTERVAL", statement)
+        self.assertEqual(selected, [101, 102])
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(len(connection.cursor_instance.executions), 1)
+        statement, parameters = connection.cursor_instance.executions[0]
+        self.assertIn("INSERT INTO match_ids", statement)
+        self.assertEqual(parameters, [(101,), (102,)])
+
+    def test_explicit_ids_still_apply_limit(self) -> None:
+        connection = FakeConnection([])
+
+        selected = select_match_ids(
+            connection,
+            [101, 102, 103],
+            2,
+            ["未完成"],
+        )
+
+        self.assertEqual(selected, [101, 102])
 
 
 class FakeProxy:
@@ -267,6 +286,82 @@ class DetailRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proxy_client.succeeded, 0)
         self.assertEqual(fetch_detail.await_count, 3)
         self.assertTrue(all(context.closed for context in browser.contexts))
+
+    @mock.patch(
+        "fetch_match_details.fetch_detail_async",
+        new_callable=mock.AsyncMock,
+    )
+    async def test_playwright_call_log_is_hidden(self, fetch_detail) -> None:
+        fetch_detail.side_effect = [
+            RuntimeError(
+                "Page.wait_for_selector: Timeout 8000ms exceeded.\n"
+                "Call log:\n  - waiting for locator"
+            ),
+            self.detail,
+        ]
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            await fetch_detail_with_retries(
+                FakeAsyncBrowser(),
+                FakeProxyClient(),
+                self.args,
+                123,
+            )
+
+        output = stderr.getvalue()
+        self.assertIn("Timeout 8000ms exceeded.", output)
+        self.assertNotIn("Call log", output)
+
+
+class DetailProgressTests(unittest.IsolatedAsyncioTestCase):
+    @mock.patch("fetch_match_details.save_detail")
+    @mock.patch(
+        "fetch_match_details.fetch_detail_with_retries",
+        new_callable=mock.AsyncMock,
+    )
+    async def test_reports_progress_every_ten_matches_and_at_completion(
+        self,
+        fetch_detail,
+        _save_detail,
+    ) -> None:
+        fetch_detail.return_value = MatchDetail(
+            match_id=123,
+            league="测试联赛",
+            home_team="主队",
+            away_team="客队",
+            scheduled_time="2026-07-17 00:00",
+            home_score=None,
+            away_score=None,
+            status_text="未开始",
+        )
+        browser = mock.AsyncMock()
+        playwright = mock.Mock()
+        playwright.chromium.launch = mock.AsyncMock(return_value=browser)
+        playwright_context = mock.AsyncMock()
+        playwright_context.__aenter__.return_value = playwright
+        args = argparse.Namespace(headed=False, concurrency=2)
+        stdout = io.StringIO()
+
+        with mock.patch(
+            "fetch_match_details.ProxyClient.from_env",
+            return_value=mock.sentinel.proxy_client,
+        ), mock.patch(
+            "fetch_match_details.async_playwright",
+            return_value=playwright_context,
+        ), redirect_stdout(stdout):
+            result = await crawl_details(
+                FakeConnection([]),
+                list(range(20)),
+                args,
+            )
+
+        self.assertEqual(result, (20, 0))
+        output = stdout.getvalue()
+        self.assertIn("已处理 10/20", output)
+        self.assertIn("处理中 2", output)
+        self.assertIn("已处理 20/20", output)
+        self.assertIn("处理中 0", output)
 
 
 if __name__ == "__main__":

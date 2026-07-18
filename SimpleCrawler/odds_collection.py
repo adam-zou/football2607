@@ -636,23 +636,54 @@ def persist_market_page(
 ) -> None:
     """Atomically persist parsed changes and their successful page state."""
 
-    values = [change_values(change) for change in changes]
+    persist_market_batch(
+        connection,
+        [MarketCollectionOutcome(job=job, changes=list(changes))],
+        final=final,
+    )
+
+
+def persist_market_batch(
+    connection: Connection,
+    outcomes: Sequence[MarketCollectionOutcome],
+    *,
+    final: bool = False,
+) -> None:
+    """Persist one completed company batch in a single transaction."""
+
     with connection.cursor() as cursor:
-        if values:
-            execute_values(
-                cursor,
-                UPSERTS[job.market],
-                values,
-                page_size=500,
-            )
-        record_market_result(
-            cursor,
-            match_id=job.match_id,
-            company_id=job.company_id,
-            market=job.market,
-            rows=values,
-            final=final,
-        )
+        for outcome in outcomes:
+            if (outcome.changes is None) == (outcome.error is None):
+                raise ValueError(
+                    "market outcome must contain exactly one of changes or error"
+                )
+            job = outcome.job
+            if outcome.changes is not None:
+                values = [change_values(change) for change in outcome.changes]
+                if values:
+                    execute_values(
+                        cursor,
+                        UPSERTS[job.market],
+                        values,
+                        page_size=500,
+                    )
+                record_market_result(
+                    cursor,
+                    match_id=job.match_id,
+                    company_id=job.company_id,
+                    market=job.market,
+                    rows=values,
+                    final=final,
+                )
+            else:
+                record_market_result(
+                    cursor,
+                    match_id=job.match_id,
+                    company_id=job.company_id,
+                    market=job.market,
+                    error=str(outcome.error),
+                    final=final,
+                )
     connection.commit()
 
 
@@ -665,13 +696,8 @@ def persist_market_failure(
 ) -> None:
     """Persist one failed page attempt without replacing prior success data."""
 
-    with connection.cursor() as cursor:
-        record_market_result(
-            cursor,
-            match_id=job.match_id,
-            company_id=job.company_id,
-            market=job.market,
-            error=error,
-            final=final,
-        )
-    connection.commit()
+    persist_market_batch(
+        connection,
+        [MarketCollectionOutcome(job=job, error=RuntimeError(error))],
+        final=final,
+    )

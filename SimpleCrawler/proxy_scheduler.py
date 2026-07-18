@@ -37,6 +37,7 @@ GLOBAL_RATE_LIMIT_FILE = Path(tempfile.gettempdir()) / (
     "football2607-simple-crawler-proxy-api.lock"
 )
 DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY = 5
+DEFAULT_PROXY_RETIRE_SECONDS = 3600.0
 
 
 class ProxySchedulerError(RuntimeError):
@@ -72,11 +73,11 @@ class ProxyScheduler:
         api_url: str,
         username: str,
         password: str,
-        refresh_seconds: float = 2.0,
+        refresh_seconds: float = 1.6,
         ttl_seconds: float = 30.0,
         api_timeout_seconds: float = 5.0,
-        acquire_timeout_seconds: float = 15.0,
-        api_min_interval_seconds: float = 2.0,
+        acquire_timeout_seconds: float = 5.0,
+        api_min_interval_seconds: float = 1.6,
         fetcher: Optional[ProxyFetcher] = None,
         test_url: str = "https://live.titan007.com/oldIndexall.aspx",
         test_timeout_seconds: float = 5.0,
@@ -84,6 +85,7 @@ class ProxyScheduler:
         max_page_assignments_per_proxy: int = (
             DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY
         ),
+        retirement_seconds: float = DEFAULT_PROXY_RETIRE_SECONDS,
         validator: Optional[ProxyValidator] = None,
     ) -> None:
         if not api_url.strip():
@@ -110,6 +112,8 @@ class ProxyScheduler:
             raise ValueError(
                 "PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP 必须大于 0"
             )
+        if retirement_seconds <= 0:
+            raise ValueError("PROXY_RETIRE_SECONDS 必须大于 0")
 
         self.api_url = api_url
         self.username = username.strip()
@@ -124,6 +128,7 @@ class ProxyScheduler:
         self.test_timeout_seconds = test_timeout_seconds
         self.validation_workers = validation_workers
         self.max_page_assignments_per_proxy = max_page_assignments_per_proxy
+        self.retirement_seconds = retirement_seconds
         self._validator = validator or self._validate_proxy
         self._condition = threading.Condition()
         self._refresh_lock = threading.Lock()
@@ -132,7 +137,7 @@ class ProxyScheduler:
         self._proxies: Dict[str, ProxyEndpoint] = {}
         self._leased: Dict[str, int] = {}
         self._assignment_counts: Dict[str, int] = {}
-        self._retired: set[str] = set()
+        self._retired_until: Dict[str, float] = {}
         self._last_error: Optional[Exception] = None
         self.last_batch_received = 0
         self.last_batch_validated = 0
@@ -152,7 +157,7 @@ class ProxyScheduler:
             api_url=required["PROXY_API_URL"],
             username=required["PROXY_USERNAME"],
             password=required["PROXY_PASSWORD"],
-            refresh_seconds=cls._float_env("PROXY_REFRESH_SECONDS", 2.0),
+            refresh_seconds=cls._float_env("PROXY_REFRESH_SECONDS", 1.6),
             ttl_seconds=cls._float_env("PROXY_TTL_SECONDS", 30.0),
             api_timeout_seconds=cls._float_env(
                 "PROXY_API_TIMEOUT_SECONDS",
@@ -160,11 +165,11 @@ class ProxyScheduler:
             ),
             acquire_timeout_seconds=cls._float_env(
                 "PROXY_ACQUIRE_TIMEOUT_SECONDS",
-                15.0,
+                5.0,
             ),
             api_min_interval_seconds=cls._float_env(
                 "PROXY_API_MIN_INTERVAL_SECONDS",
-                2.0,
+                1.6,
             ),
             test_url=os.environ.get(
                 "PROXY_TEST_URL",
@@ -181,6 +186,10 @@ class ProxyScheduler:
             max_page_assignments_per_proxy=cls._int_env(
                 "PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP",
                 DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY,
+            ),
+            retirement_seconds=cls._float_env(
+                "PROXY_RETIRE_SECONDS",
+                DEFAULT_PROXY_RETIRE_SECONDS,
             ),
         )
 
@@ -256,7 +265,7 @@ class ProxyScheduler:
                 now = time.monotonic()
                 self._remove_expired(now)
                 for server, proxy in self._proxies.items():
-                    if server in self._retired:
+                    if self._is_retired(server, now):
                         continue
                     assignment_count = self._assignment_counts.get(server, 0)
                     if (
@@ -273,7 +282,7 @@ class ProxyScheduler:
                         assignment_count
                         >= self.max_page_assignments_per_proxy
                     ):
-                        self._retired.add(server)
+                        self._retire(server, now)
                     return proxy
 
                 remaining = deadline - now
@@ -292,9 +301,9 @@ class ProxyScheduler:
             else:
                 self._leased[proxy.server] = active_count - 1
             if failed:
-                self._retired.add(proxy.server)
+                self._retire(proxy.server, time.monotonic())
             if (
-                proxy.server in self._retired
+                self._is_retired(proxy.server, time.monotonic())
                 and proxy.server not in self._leased
             ) or proxy.expires_at <= time.monotonic():
                 self._proxies.pop(proxy.server, None)
@@ -318,7 +327,7 @@ class ProxyScheduler:
             return sum(
                 1
                 for server in self._proxies
-                if server not in self._retired
+                if not self._is_retired(server, time.monotonic())
                 and self._assignment_counts.get(server, 0)
                 < self.max_page_assignments_per_proxy
             )
@@ -331,8 +340,15 @@ class ProxyScheduler:
                 self.max_page_assignments_per_proxy
                 - self._assignment_counts.get(server, 0)
                 for server in self._proxies
-                if server not in self._retired
+                if not self._is_retired(server, time.monotonic())
             )
+
+    @property
+    def retired_proxy_count(self) -> int:
+        with self._condition:
+            now = time.monotonic()
+            self._remove_expired(now)
+            return sum(until > now for until in self._retired_until.values())
 
     def _refresh_loop(self) -> None:
         while not self._stop_event.wait(self.refresh_seconds):
@@ -363,7 +379,7 @@ class ProxyScheduler:
             expires_at = fetched_at + self.ttl_seconds
             with self._condition:
                 self._remove_expired(time.monotonic())
-                retired_servers = set(self._retired)
+                retired_servers = set(self._retired_until)
             candidates = [
                 ProxyEndpoint(
                     server=server,
@@ -409,7 +425,7 @@ class ProxyScheduler:
             with self._condition:
                 self._remove_expired(time.monotonic())
                 for candidate in validated:
-                    if candidate.server in self._retired:
+                    if self._is_retired(candidate.server, time.monotonic()):
                         continue
                     existing = self._proxies.get(candidate.server)
                     if existing is not None:
@@ -451,6 +467,32 @@ class ProxyScheduler:
         ]
         for server in expired:
             self._proxies.pop(server, None)
+            if server not in self._retired_until:
+                self._assignment_counts.pop(server, None)
+
+        completed_retirement_periods = [
+            server
+            for server, retired_until in self._retired_until.items()
+            if retired_until <= now
+        ]
+        for server in completed_retirement_periods:
+            # Quarantine expiry never revives the old endpoint. A subsequent
+            # supplier response must create and validate a fresh endpoint.
+            self._proxies.pop(server, None)
+            if server in self._leased:
+                continue
+            self._retired_until.pop(server, None)
+            self._assignment_counts.pop(server, None)
+
+    def _retire(self, server: str, now: float) -> None:
+        retired_until = now + self.retirement_seconds
+        self._retired_until[server] = max(
+            retired_until,
+            self._retired_until.get(server, 0.0),
+        )
+
+    def _is_retired(self, server: str, now: float) -> bool:
+        return self._retired_until.get(server, 0.0) > now
 
     @staticmethod
     def parse_proxy_servers(text: str) -> list[str]:
@@ -575,6 +617,7 @@ class ProxyLeaseService:
             "leased": active_leases,
             "available_proxies": self.scheduler.available_proxy_count,
             "available_page_slots": self.scheduler.available_page_slots,
+            "retired_proxies": self.scheduler.retired_proxy_count,
             "max_pages_per_proxy": (
                 self.scheduler.max_page_assignments_per_proxy
             ),

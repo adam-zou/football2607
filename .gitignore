@@ -1,5 +1,7 @@
 /.venv/
 /SimpleCrawler/.env
 /MatchWeb/.env
+/MatchWeb/users.json
+/titan007_match_status_snapshot.tsv
 *.egg-info/
 .DS_Store

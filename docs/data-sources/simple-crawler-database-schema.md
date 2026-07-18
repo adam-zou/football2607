@@ -262,6 +262,7 @@ CREATE INDEX IF NOT EXISTS titan007_odds_market_state_final_pending_idx
 3. `scheduled_time`、`change_time` 和 `status_text` 都保留源站文本。使用这些字段
    做日期或状态统计时，应沿用代码中的格式校验和状态分类规则。
 4. 建表使用 `CREATE TABLE IF NOT EXISTS`，不会自动修正已经存在表的所有字段差异。
-   当前代码仅对 `match_ids.crawl_status` 的部分旧结构和状态约束执行显式升级。
+   当前代码仅对 `match_ids.crawl_status` 的部分旧结构和状态约束执行显式升级；
+   已符合当前定义的状态约束不会在每轮核验时重复删除和重建。
 5. `NUMERIC(8,3)` 最多保留 3 位小数；`NUMERIC(6,2)` 最多保留 2 位小数。读取时
    应保留定点数语义，避免不必要地转换为二进制浮点数。

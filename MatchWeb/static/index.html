@@ -33,6 +33,10 @@
             <label for="status-other">其它</label>
           </div>
         </fieldset>
+        <label class="checkbox-filter" for="odds-filter">
+          <input id="odds-filter" type="checkbox" checked />
+          <span>启用筛选</span>
+        </label>
         <button id="query-button" class="query-button" type="button">查询</button>
       </section>
 
@@ -55,8 +59,7 @@
                 <th>主队</th>
                 <th>比分</th>
                 <th>客队</th>
-                <th>爬取状态</th>
-                <th>数据更新时间</th>
+                <th>筛选标记</th>
               </tr>
             </thead>
             <tbody id="match-rows"></tbody>

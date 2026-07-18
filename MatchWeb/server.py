@@ -23,6 +23,15 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from dotenv import load_dotenv
 
+from auth import load_users, verify_password
+
+
+SIMPLE_CRAWLER_DIR = Path(__file__).resolve().parent.parent / "SimpleCrawler"
+if str(SIMPLE_CRAWLER_DIR) not in sys.path:
+    sys.path.insert(0, str(SIMPLE_CRAWLER_DIR))
+
+from simple_crawler.companies import COMPANY_NAMES
+
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_DIR = APP_DIR.parent
@@ -66,12 +75,39 @@ def validate_date(value: str) -> str:
         raise ValueError("日期格式必须是 YYYY-MM-DD") from exc
 
 
-def fetch_matches(database_url: str, match_date: str, status: str) -> List[Dict[str, object]]:
+def fetch_matches(
+    database_url: str,
+    match_date: str,
+    status: str,
+    odds_filter: bool = True,
+) -> List[Dict[str, object]]:
     """Return matching rows from the crawler database without changing it."""
 
     match_date = validate_date(match_date)
     if status not in ALLOWED_STATUSES:
         raise ValueError("比赛状态无效")
+
+    odds_filter_sql = ""
+    if odds_filter:
+        odds_filter_sql = """
+          AND filter_hits.markers IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM titan007_handicap_changes AS company_three_handicap
+              WHERE company_three_handicap.match_id = details.match_id
+                AND company_three_handicap.company_id = 3
+              UNION ALL
+              SELECT 1
+              FROM titan007_1x2_changes AS company_three_one_x_two
+              WHERE company_three_one_x_two.match_id = details.match_id
+                AND company_three_one_x_two.company_id = 3
+              UNION ALL
+              SELECT 1
+              FROM titan007_over_under_changes AS company_three_totals
+              WHERE company_three_totals.match_id = details.match_id
+                AND company_three_totals.company_id = 3
+          )
+        """
 
     query = f"""
         SELECT
@@ -83,13 +119,34 @@ def fetch_matches(database_url: str, match_date: str, status: str) -> List[Dict[
             details.home_score,
             details.away_score,
             details.away_team,
-            ids.crawl_status,
-            details.updated_at
+            COALESCE(filter_hits.markers, '[]'::JSONB)
         FROM match_details AS details
-        JOIN match_ids AS ids USING (match_id)
+        LEFT JOIN LATERAL (
+            SELECT JSONB_AGG(
+                JSONB_BUILD_OBJECT(
+                    'company_id', matched.company_id,
+                    'change_time', matched.change_time
+                )
+                ORDER BY matched.company_id, matched.change_time
+            ) AS markers
+            FROM (
+                SELECT handicap.company_id, handicap.change_time
+                FROM titan007_handicap_changes AS handicap
+                WHERE handicap.match_id = details.match_id
+                  AND handicap.source_status <> '滚'
+                  AND (handicap.home_odds < 0.700 OR handicap.away_odds < 0.700)
+                UNION
+                SELECT totals.company_id, totals.change_time
+                FROM titan007_over_under_changes AS totals
+                WHERE totals.match_id = details.match_id
+                  AND totals.source_status <> '滚'
+                  AND totals.over_odds < 0.700
+            ) AS matched
+        ) AS filter_hits ON TRUE
         WHERE details.scheduled_time ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$'
           AND details.scheduled_time::TIMESTAMP::DATE = %s::DATE
           AND {STATUS_SQL[status]}
+          {odds_filter_sql}
         ORDER BY details.scheduled_time ASC, details.match_id ASC
     """
 
@@ -99,8 +156,19 @@ def fetch_matches(database_url: str, match_date: str, status: str) -> List[Dict[
             cursor.execute(query, (match_date,))
             rows = cursor.fetchall()
 
-    return [
-        {
+    matches = []
+    for row in rows:
+        markers = [
+            {
+                "company_id": int(marker["company_id"]),
+                "company_name": COMPANY_NAMES.get(
+                    int(marker["company_id"]), f"公司 {marker['company_id']}"
+                ),
+                "change_time": str(marker["change_time"]),
+            }
+            for marker in row[8]
+        ]
+        matches.append({
             "match_id": int(row[0]),
             "league": row[1],
             "scheduled_time": row[2],
@@ -109,29 +177,25 @@ def fetch_matches(database_url: str, match_date: str, status: str) -> List[Dict[
             "home_score": row[5],
             "away_score": row[6],
             "away_team": row[7],
-            "crawl_status": row[8],
-            "updated_at": row[9].astimezone(SHANGHAI).isoformat(timespec="seconds"),
-        }
-        for row in rows
-    ]
+            "filter_markers": markers,
+        })
+    return matches
 
 
 class MatchWebApp:
-    def __init__(self, database_url: str, username: str, password: str, secret: bytes):
+    def __init__(self, database_url: str, users: Dict[str, str], secret: bytes):
         self.database_url = database_url
-        self.username = username
-        self.password = password
+        self.users = users
         self.secret = secret
 
     def authenticate(self, username: str, password: str) -> bool:
-        return hmac.compare_digest(username, self.username) and hmac.compare_digest(
-            password, self.password
-        )
+        password_hash = self.users.get(username)
+        return bool(password_hash and verify_password(password, password_hash))
 
-    def create_session(self) -> str:
+    def create_session(self, username: str) -> str:
         payload = json.dumps(
             {
-                "username": self.username,
+                "username": username,
                 "expires": int((datetime.now(SHANGHAI) + SESSION_LIFETIME).timestamp()),
             },
             separators=(",", ":"),
@@ -151,7 +215,7 @@ class MatchWebApp:
             padding = b"=" * (-len(encoded) % 4)
             payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
             return (
-                payload.get("username") == self.username
+                payload.get("username") in self.users
                 and int(payload.get("expires", 0)) > int(datetime.now(SHANGHAI).timestamp())
             )
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -222,7 +286,7 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.send_header(
             "Set-Cookie",
-            f"{SESSION_COOKIE}={self.server.app.create_session()}; Path=/; "
+            f"{SESSION_COOKIE}={self.server.app.create_session(username)}; Path=/; "
             "HttpOnly; SameSite=Lax; Max-Age=43200",
         )
         self.end_headers()
@@ -231,8 +295,15 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         params = parse_qs(query)
         match_date = params.get("date", [today_in_shanghai()])[0]
         status = params.get("status", ["进行中"])[0]
+        odds_filter_value = params.get("odds_filter", ["1"])[0]
+        if odds_filter_value not in {"0", "1"}:
+            self.send_json({"error": "赔率筛选参数无效"}, HTTPStatus.BAD_REQUEST)
+            return
+        odds_filter = odds_filter_value == "1"
         try:
-            matches = fetch_matches(self.server.app.database_url, match_date, status)
+            matches = fetch_matches(
+                self.server.app.database_url, match_date, status, odds_filter
+            )
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -243,6 +314,7 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             {
                 "date": match_date,
                 "status": status,
+                "odds_filter": odds_filter,
                 "total": len(matches),
                 "refreshed_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
                 "matches": matches,
@@ -299,20 +371,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     load_environment()
     args = parse_args(argv)
     database_url = os.environ.get("SIMPLE_CRAWLER_DATABASE_URL", "").strip()
-    username = os.environ.get("MATCH_WEB_USERNAME", "").strip()
-    password = os.environ.get("MATCH_WEB_PASSWORD", "")
-    if not database_url or not username or not password:
+    users_path_text = os.environ.get("MATCH_WEB_USERS_FILE", "").strip()
+    users_path = Path(users_path_text).expanduser() if users_path_text else APP_DIR / "users.json"
+    if not users_path.is_absolute():
+        users_path = REPO_DIR / users_path
+    try:
+        users = load_users(users_path)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not database_url:
         print(
-            "请配置 SIMPLE_CRAWLER_DATABASE_URL、MATCH_WEB_USERNAME 和 "
-            "MATCH_WEB_PASSWORD。",
+            "请配置 SIMPLE_CRAWLER_DATABASE_URL。",
             file=sys.stderr,
         )
+        return 2
+    if not users:
+        print("请先运行 python3 MatchWeb/manage_users.py add <账号> 创建账号。", file=sys.stderr)
         return 2
     secret_text = os.environ.get("MATCH_WEB_SESSION_SECRET", "")
     secret = secret_text.encode("utf-8") if secret_text else secrets.token_bytes(32)
     if not secret_text:
         print("[MatchWeb] 未配置会话密钥；本次启动已使用临时随机密钥。")
-    app = MatchWebApp(database_url, username, password, secret)
+    app = MatchWebApp(database_url, users, secret)
     server = MatchWebServer((args.host, args.port), app)
     print(f"[MatchWeb] http://{args.host}:{server.server_address[1]}/")
     try:

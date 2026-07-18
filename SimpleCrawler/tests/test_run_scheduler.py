@@ -35,7 +35,7 @@ class SchedulerConfigurationTests(unittest.TestCase):
                 for spec in worker_specs()
             }
 
-        self.assertEqual(intervals["fetch_match_ids.py"], 60.0)
+        self.assertEqual(intervals["fetch_match_ids.py"], 900.0)
         self.assertEqual(intervals["fetch_match_details.py"], 5.0)
         self.assertEqual(intervals["fetch_odds_pages.py"], 5.0)
         self.assertEqual(intervals["check_match_completion.py"], 60.0)
@@ -132,6 +132,7 @@ class ProxyHealthMonitorTests(unittest.TestCase):
                 "pool_size": 8,
                 "leased": 2,
                 "available_proxies": 6,
+                "retired_proxies": 4,
                 "available_page_slots": 28,
                 "last_batch_received": 10,
                 "last_batch_validated": 8,
@@ -140,9 +141,14 @@ class ProxyHealthMonitorTests(unittest.TestCase):
         run_proxy_health_monitor(stop_event, monitor, 0.001, fetcher)
 
         proxy = monitor.snapshot()["components"][0]
+        proxy_health = monitor.snapshot()["proxy_health"]
         self.assertEqual(proxy["status"], "running")
         self.assertIn("当前代理 8 个", proxy["logs"][-1])
+        self.assertIn("隔离代理 4 个", proxy["logs"][-1])
         self.assertIn("可用页面槽位 28", proxy["logs"][-1])
+        self.assertEqual(proxy_health["available_proxies"], 6)
+        self.assertEqual(proxy_health["validation_rate"], 0.8)
+        self.assertIsNone(proxy_health["error"])
 
     def test_formats_missing_health_fields_as_zero(self) -> None:
         self.assertIn("当前代理 0 个", format_proxy_health({}))
@@ -234,10 +240,15 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIn("历史比赛", html)
         self.assertIn("时间异常", html)
         self.assertIn("待获取详情", html)
+        self.assertIn("未完成对应比赛状态", html)
+        self.assertIn("采集积压", html)
+        self.assertIn("代理池状态", html)
+        self.assertIn("问题比赛", html)
         self.assertIn("完场但爬取未完成", html)
         self.assertIn("c.logs.join('\\n')", html)
         self.assertIn("抓取到 12 场比赛", payload)
         self.assertIn('"daily_statistics"', payload)
+        self.assertIn('"proxy_health"', payload)
 
 
 if __name__ == "__main__":
