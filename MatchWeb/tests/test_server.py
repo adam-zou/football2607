@@ -3,6 +3,7 @@ import tempfile
 import threading
 import unittest
 from http.client import HTTPConnection
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -151,6 +152,122 @@ class MatchWebAppTests(unittest.TestCase):
             http_server.shutdown()
             http_server.server_close()
             thread.join(timeout=2)
+
+    def test_user_management_requires_admin_and_persists_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            users_path = Path(directory) / "users.json"
+            users = {
+                "admin": hash_password("admin-secret"),
+                "viewer": hash_password("viewer-secret"),
+            }
+            save_users(users_path, users)
+            app = server.MatchWebApp(
+                "postgresql://test", users, b"key", users_path
+            )
+            http_server = server.MatchWebServer(("127.0.0.1", 0), app)
+            thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+            thread.start()
+            connection = HTTPConnection(*http_server.server_address, timeout=2)
+            try:
+                viewer_cookie = self._login_cookie(
+                    connection, "viewer", "viewer-secret"
+                )
+                connection.request(
+                    "GET", "/api/users", headers={"Cookie": viewer_cookie}
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 403)
+
+                connection.request(
+                    "GET", "/users", headers={"Cookie": viewer_cookie}
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 403)
+
+                admin_cookie = self._login_cookie(
+                    connection, "admin", "admin-secret"
+                )
+                connection.request(
+                    "GET", "/users", headers={"Cookie": admin_cookie}
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+
+                body = json.dumps({"username": "operator", "password": "new-secret"})
+                connection.request(
+                    "POST",
+                    "/api/users",
+                    body=body,
+                    headers={
+                        "Cookie": admin_cookie,
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 201)
+                self.assertTrue(verify_password("new-secret", load_users(users_path)["operator"]))
+
+                reset_body = json.dumps({"password": "reset-secret"})
+                connection.request(
+                    "PUT",
+                    "/api/users/operator",
+                    body=reset_body,
+                    headers={
+                        "Cookie": admin_cookie,
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(reset_body)),
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(
+                    verify_password("reset-secret", load_users(users_path)["operator"])
+                )
+
+                connection.request(
+                    "DELETE", "/api/users/admin", headers={"Cookie": admin_cookie}
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 400)
+                self.assertIn("不能删除", payload["error"])
+
+                connection.request(
+                    "DELETE", "/api/users/operator", headers={"Cookie": admin_cookie}
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                self.assertNotIn("operator", load_users(users_path))
+            finally:
+                connection.close()
+                http_server.shutdown()
+                http_server.server_close()
+                thread.join(timeout=2)
+
+    @staticmethod
+    def _login_cookie(connection, username, password):
+        body = f"username={username}&password={password}"
+        connection.request(
+            "POST",
+            "/login",
+            body=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+            },
+        )
+        response = connection.getresponse()
+        response.read()
+        if response.status != 303:
+            raise AssertionError(f"login failed with status {response.status}")
+        return response.getheader("Set-Cookie").split(";", 1)[0]
 
     def test_client_uses_required_odds_link(self):
         script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")

@@ -309,14 +309,14 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         elif parsed.path == "/users":
             if not self.is_admin():
-                self.send_error(HTTPStatus.FORBIDDEN, "仅 admin 可访问")
+                self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self.serve_file(STATIC_DIR / "users.html", "text/html; charset=utf-8")
         elif parsed.path == "/app.js":
             self.serve_file(STATIC_DIR / "app.js", "text/javascript; charset=utf-8")
         elif parsed.path == "/users.js":
             if not self.is_admin():
-                self.send_error(HTTPStatus.FORBIDDEN, "仅 admin 可访问")
+                self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self.serve_file(STATIC_DIR / "users.js", "text/javascript; charset=utf-8")
         elif parsed.path == "/api/matches":
