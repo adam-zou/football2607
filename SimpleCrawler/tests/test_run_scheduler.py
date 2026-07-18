@@ -15,10 +15,16 @@ from run_scheduler import (
     positive_env_float,
     run_proxy_health_monitor,
     run_daily_statistics_monitor,
+    run_worker_process,
     run_worker_loop,
     worker_specs,
 )
-from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
+from simple_crawler.monitoring import (
+    DashboardServer,
+    RuntimeMonitor,
+    format_round_match_count,
+    parse_round_match_count,
+)
 
 
 class SchedulerConfigurationTests(unittest.TestCase):
@@ -72,6 +78,29 @@ class SchedulerConfigurationTests(unittest.TestCase):
 
 
 class WorkerLoopTests(unittest.TestCase):
+    def test_round_match_count_marker_round_trips(self) -> None:
+        line = format_round_match_count("[比赛详情]", 12)
+
+        self.assertEqual(line, "[比赛详情] 本轮比赛数量：12 场。")
+        self.assertEqual(parse_round_match_count(line), 12)
+        self.assertIsNone(parse_round_match_count("[比赛详情] 普通日志"))
+
+    @patch("run_scheduler.run_child_process")
+    def test_worker_process_records_round_match_count(self, run_child) -> None:
+        def child(command, stop_event, log_callback):
+            del command, stop_event
+            log_callback("[比赛详情] 本轮比赛数量：7 场。")
+            return 0
+
+        run_child.side_effect = child
+        monitor = RuntimeMonitor()
+        spec = WorkerSpec("比赛详情", Path("fetch_match_details.py"), 1)
+
+        self.assertEqual(run_worker_process(spec, threading.Event(), monitor), 0)
+
+        component = monitor.snapshot()["components"][2]
+        self.assertEqual(component["round_match_count"], 7)
+
     def test_worker_runs_sequentially_until_stopped(self) -> None:
         stop_event = threading.Event()
         calls = []
@@ -119,6 +148,22 @@ class WorkerLoopTests(unittest.TestCase):
         run_worker_loop(spec, stop_event, runner)
 
         self.assertEqual(calls, ["job.py", "job.py"])
+
+    def test_worker_clears_previous_round_match_count(self) -> None:
+        stop_event = threading.Event()
+        monitor = RuntimeMonitor()
+        monitor.update("fetch_match_details", round_match_count=9)
+        spec = WorkerSpec("比赛详情", Path("fetch_match_details.py"), 0.001)
+
+        def runner(received_spec, received_stop_event) -> int:
+            del received_spec
+            received_stop_event.set()
+            return 0
+
+        run_worker_loop(spec, stop_event, runner, monitor)
+
+        component = monitor.snapshot()["components"][2]
+        self.assertIsNone(component["round_match_count"])
 
 
 class ProxyHealthMonitorTests(unittest.TestCase):
@@ -244,11 +289,13 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIn("采集积压", html)
         self.assertIn("代理池状态", html)
         self.assertIn("问题比赛", html)
+        self.assertIn("本轮比赛", html)
         self.assertIn("完场但爬取未完成", html)
         self.assertIn("c.logs.join('\\n')", html)
         self.assertIn("抓取到 12 场比赛", payload)
         self.assertIn('"daily_statistics"', payload)
         self.assertIn('"proxy_health"', payload)
+        self.assertIn('"round_match_count"', payload)
 
 
 if __name__ == "__main__":

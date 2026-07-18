@@ -11,6 +11,7 @@ from typing import List, Optional, Sequence, Tuple
 import psycopg2
 from dotenv import load_dotenv
 from simple_crawler.companies import COMPANY_IDS, company_label
+from simple_crawler.monitoring import format_round_match_count
 from playwright.async_api import async_playwright
 from psycopg2.extensions import connection as Connection
 
@@ -500,6 +501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{TASK_PREFIX} 数据库访问失败：{error}", file=sys.stderr)
         return EXIT_INDETERMINATE
 
+    print(format_round_match_count(TASK_PREFIX, len(match_ids)))
     if not match_ids:
         connection.close()
         print(f"{TASK_PREFIX} 数据库中没有比赛 ID。", file=sys.stderr)

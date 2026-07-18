@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from copy import deepcopy
@@ -23,6 +24,17 @@ COMPONENTS: Tuple[Tuple[str, str], ...] = (
     ("check_match_completion", "完成核验"),
 )
 
+ROUND_MATCH_COUNT_PATTERN = re.compile(r"本轮比赛数量：(\d+) 场。?$")
+
+
+def format_round_match_count(task_prefix: str, count: int) -> str:
+    return f"{task_prefix} 本轮比赛数量：{count} 场。"
+
+
+def parse_round_match_count(line: str) -> Optional[int]:
+    match = ROUND_MATCH_COUNT_PATTERN.search(line)
+    return int(match.group(1)) if match else None
+
 
 @dataclass
 class ComponentState:
@@ -34,6 +46,7 @@ class ComponentState:
     next_run_at: Optional[float] = None
     duration_seconds: Optional[float] = None
     exit_code: Optional[int] = None
+    round_match_count: Optional[int] = None
     message: str = "等待启动"
     logs: Deque[str] = field(default_factory=deque)
 
@@ -194,6 +207,7 @@ class RuntimeMonitor:
                         "next_run_at": component.next_run_at,
                         "duration_seconds": component.duration_seconds,
                         "exit_code": component.exit_code,
+                        "round_match_count": component.round_match_count,
                         "message": component.message,
                         "logs": list(component.logs),
                     }
@@ -289,6 +303,7 @@ DASHBOARD_HTML = """<!doctype html>
     .empty-row { padding:16px!important; color:var(--muted); text-align:center!important; }
     .card-head { display:flex; justify-content:space-between; align-items:flex-start;
       gap:12px; padding:14px 16px; border-bottom:1px solid var(--line); }
+    .round-count { margin-top:4px; color:var(--run); font-size:12px; }
     h2 { margin:0 0 4px; font:650 16px/1.2 system-ui,sans-serif; }
     .badge { flex:none; padding:4px 9px; border-radius:99px; border:1px solid currentColor;
       font-size:12px; }
@@ -483,11 +498,13 @@ DASHBOARD_HTML = """<!doctype html>
     }
     function card(c){let el=document.querySelector(`[data-key="${c.key}"]`);
       if(!el){el=document.createElement('article');el.dataset.key=c.key;
-        el.innerHTML='<div class="card-head"><div><h2></h2><div class="meta message"></div></div><span class="badge"></span></div><pre></pre><footer><span class="timing"></span><span class="exit"></span></footer>';
+        el.innerHTML='<div class="card-head"><div><h2></h2><div class="meta message"></div><div class="round-count" hidden></div></div><span class="badge"></span></div><pre></pre><footer><span class="timing"></span><span class="exit"></span></footer>';
         grid.appendChild(el)}
       el.querySelector('h2').textContent=c.name; const badge=el.querySelector('.badge');
       badge.className=`badge ${c.status}`;badge.textContent=statusText[c.status]||c.status;
       el.querySelector('.message').textContent=c.message||'';
+      const roundCount=el.querySelector('.round-count'), hasRoundCount=c.round_match_count!==null&&c.round_match_count!==undefined;
+      roundCount.hidden=!hasRoundCount;roundCount.textContent=hasRoundCount?`本轮比赛 ${number(c.round_match_count)} 场`:'';
       const log=el.querySelector('pre'), atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<36;
       log.textContent=c.logs.length?c.logs.join('\\n'):'尚无日志';
       if(follow&&atBottom)log.scrollTop=log.scrollHeight;

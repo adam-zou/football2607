@@ -16,6 +16,7 @@ from playwright.async_api import Browser as AsyncBrowser
 from playwright.async_api import Page as AsyncPage
 from playwright.async_api import async_playwright
 from psycopg2.extensions import connection as Connection
+from simple_crawler.monitoring import format_round_match_count
 
 try:
     from .concurrent_pages import async_proxy_lease, iter_bounded
@@ -578,6 +579,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{TASK_PREFIX} 数据库访问失败：{error}", file=sys.stderr)
         return 1
 
+    print(format_round_match_count(TASK_PREFIX, len(match_ids)))
     if not match_ids:
         connection.close()
         print(f"{TASK_PREFIX} 数据库中没有比赛 ID。", file=sys.stderr)

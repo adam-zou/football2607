@@ -16,6 +16,7 @@ from playwright.async_api import Browser as AsyncBrowser
 from playwright.async_api import async_playwright
 from psycopg2.extensions import connection as Connection
 from simple_crawler.companies import COMPANY_IDS, company_label
+from simple_crawler.monitoring import format_round_match_count
 
 try:
     from .concurrent_pages import iter_bounded
@@ -706,6 +707,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{TASK_PREFIX} 数据库访问失败：{error}", file=sys.stderr)
         return 1
 
+    print(format_round_match_count(TASK_PREFIX, len(matches)))
     if not matches:
         connection.close()
         print(f"{TASK_PREFIX} 没有需要收尾的比赛。", file=sys.stderr)

@@ -19,7 +19,11 @@ from typing import Callable, Optional, Sequence, TextIO
 from dotenv import load_dotenv
 from simple_crawler.dashboard_statistics import fetch_daily_statistics
 from simple_crawler.file_lock import ExclusiveFileLock, FileAlreadyLocked
-from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
+from simple_crawler.monitoring import (
+    DashboardServer,
+    RuntimeMonitor,
+    parse_round_match_count,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -197,6 +201,12 @@ def run_worker_process(
     def handle_log(line: str) -> None:
         print(line, flush=True)
         if monitor is not None:
+            round_match_count = parse_round_match_count(line)
+            if round_match_count is not None:
+                monitor.update(
+                    spec.script.stem,
+                    round_match_count=round_match_count,
+                )
             monitor.append_log(spec.script.stem, line)
 
     return run_child_process(
@@ -225,6 +235,7 @@ def run_worker_loop(
                 message="脚本正在运行",
                 started_at=time.time(),
                 next_run_at=None,
+                round_match_count=None,
             )
         started_at = time.monotonic()
         returncode = None

@@ -120,6 +120,14 @@ from its own `pyproject.toml`. The supervisor lock uses the shared `portalocker`
 backed file-lock adapter, so the same single-instance behavior applies on Windows,
 Linux, and macOS.
 
+After database selection, the detail, ordinary odds, and completion entrypoints
+emit one shared `本轮比赛数量：N 场` monitor marker, including `N = 0`. The
+supervisor parses that marker from the already captured output into the component's
+process-local `round_match_count`; it resets the value at the start of every round.
+The dashboard shows the count only for components that emit the marker. This output
+contract carries presentation metadata only and does not affect selection or job
+scheduling.
+
 The supervisor also owns a read-only human dashboard on `127.0.0.1:8081` by
 default. `/` renders separate panels for the proxy service and all four jobs;
 `/api/status` returns their current state, latest timing and exit information, and
