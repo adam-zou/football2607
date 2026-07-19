@@ -18,7 +18,9 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -43,6 +45,8 @@ SESSION_LIFETIME = timedelta(hours=12)
 ALLOWED_STATUSES = {"未开始", "进行中", "完", "其它"}
 DEFAULT_STATUSES = ("未开始", "进行中")
 ADMIN_USERNAME = "admin"
+DEFAULT_MONITOR_URL = "http://127.0.0.1:8081"
+MONITOR_TIMEOUT_SECONDS = 2
 
 STATUS_SQL = {
     "未开始": "details.status_text = '未开始'",
@@ -199,11 +203,13 @@ class MatchWebApp:
         users: Dict[str, str],
         secret: bytes,
         users_path: Optional[Path] = None,
+        monitor_url: str = DEFAULT_MONITOR_URL,
     ):
         self.database_url = database_url
         self.users = users
         self.secret = secret
         self.users_path = users_path
+        self.monitor_url = monitor_url.rstrip("/")
         self.users_lock = threading.Lock()
 
     def authenticate(self, username: str, password: str) -> bool:
@@ -308,13 +314,25 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         if not self.is_authenticated():
-            if parsed.path.startswith("/api/"):
+            if parsed.path.startswith("/api/") or parsed.path == "/monitor/api/status":
                 self.send_json({"error": "未登录"}, HTTPStatus.UNAUTHORIZED)
             else:
                 self.redirect("/login")
             return
         if parsed.path == "/":
             self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        elif parsed.path == "/monitor":
+            if not self.require_admin_page():
+                return
+            self.redirect("/monitor/")
+        elif parsed.path == "/monitor/":
+            if not self.require_admin_page():
+                return
+            self.proxy_monitor("/", is_api=False)
+        elif parsed.path == "/monitor/api/status":
+            if not self.require_admin_api():
+                return
+            self.proxy_monitor("/api/status", is_api=True)
         elif parsed.path == "/users":
             if not self.is_admin():
                 self.send_error(HTTPStatus.FORBIDDEN)
@@ -499,12 +517,46 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def require_admin_page(self) -> bool:
+        if not self.is_admin():
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return False
+        return True
+
+    def proxy_monitor(self, upstream_path: str, *, is_api: bool) -> None:
+        request = Request(
+            f"{self.server.app.monitor_url}{upstream_path}",
+            headers={"Accept": "application/json" if is_api else "text/html"},
+        )
+        try:
+            with urlopen(request, timeout=MONITOR_TIMEOUT_SECONDS) as response:
+                body = response.read()
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "application/json; charset=utf-8"
+                    if is_api
+                    else "text/html; charset=utf-8",
+                )
+        except (HTTPError, URLError, TimeoutError, OSError):
+            if is_api:
+                self.send_json(
+                    {"error": "采集监控暂不可用"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            else:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "采集监控暂不可用")
+            return
+        self.send_body(body, content_type)
+
     def serve_file(self, path: Path, content_type: str) -> None:
         try:
             body = path.read_bytes()
         except FileNotFoundError:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        self.send_body(body, content_type)
+
+    def send_body(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -544,6 +596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     load_environment()
     args = parse_args(argv)
     database_url = os.environ.get("SIMPLE_CRAWLER_DATABASE_URL", "").strip()
+    monitor_url = os.environ.get("MATCH_WEB_MONITOR_URL", DEFAULT_MONITOR_URL).strip()
     users_path_text = os.environ.get("MATCH_WEB_USERS_FILE", "").strip()
     users_path = Path(users_path_text).expanduser() if users_path_text else APP_DIR / "users.json"
     if not users_path.is_absolute():
@@ -566,7 +619,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     secret = secret_text.encode("utf-8") if secret_text else secrets.token_bytes(32)
     if not secret_text:
         print("[MatchWeb] 未配置会话密钥；本次启动已使用临时随机密钥。")
-    app = MatchWebApp(database_url, users, secret, users_path)
+    app = MatchWebApp(
+        database_url,
+        users,
+        secret,
+        users_path,
+        monitor_url or DEFAULT_MONITOR_URL,
+    )
     server = MatchWebServer((args.host, args.port), app)
     print(f"[MatchWeb] http://{args.host}:{server.server_address[1]}/")
     try:

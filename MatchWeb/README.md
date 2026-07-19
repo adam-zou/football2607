@@ -14,6 +14,7 @@
 - `SIMPLE_CRAWLER_DATABASE_URL`：与爬虫相同的 PostgreSQL 连接地址；
 - `MATCH_WEB_SESSION_SECRET`：用于签名登录会话的长随机字符串。
 - `MATCH_WEB_USERS_FILE`：可选的账号文件位置，默认是 `MatchWeb/users.json`。
+- `MATCH_WEB_MONITOR_URL`：采集监控的内部地址，默认是 `http://127.0.0.1:8081`。
 
 也可以继续把数据库地址放在 `SimpleCrawler/.env`；`MatchWeb/.env` 中的同名配置
 优先。
@@ -40,6 +41,10 @@ python3 MatchWeb/manage_users.py remove adam
 重置密码或删除普通用户。用户管理页面及其接口仅允许用户名恰好为 `admin` 的已登录
 账号访问，并且不允许在网页中删除 `admin` 自身。修改立即生效，无需重启服务。
 
+同一管理员导航还提供“采集监控”入口。`/monitor/` 和
+`/monitor/api/status` 由 MatchWeb 在验证管理员会话后转发到内部监控地址，浏览器
+不需要直接访问 `8081`。普通账号不能访问监控页面或状态接口。
+
 ## 启动
 
 Windows 用户如需同时启动采集调度器和本网页应用，可直接双击仓库根目录的
@@ -51,7 +56,9 @@ Windows 用户如需同时启动采集调度器和本网页应用，可直接双
 python3 MatchWeb/server.py
 ```
 
-默认地址为 `http://127.0.0.1:8082/`。服务只对数据库执行只读查询。
+默认地址为 `http://127.0.0.1:8082/`；管理员可从
+`http://127.0.0.1:8082/monitor/` 查看采集监控。比赛查询只读取数据库，监控路由
+只读取调度器的进程内状态。
 
 ## 列表列
 

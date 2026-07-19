@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 from auth import hash_password, load_users, save_users, verify_password
+from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
 
 
 class MatchWebAppTests(unittest.TestCase):
@@ -288,6 +289,79 @@ class MatchWebAppTests(unittest.TestCase):
                 http_server.server_close()
                 thread.join(timeout=2)
 
+    def test_monitor_route_is_admin_only_and_proxies_local_dashboard(self):
+        monitor = RuntimeMonitor()
+        monitor.append_log("fetch_match_ids", "监控代理测试")
+        dashboard = DashboardServer(monitor, "127.0.0.1", 0)
+        dashboard.start()
+        host, port = dashboard.address
+        users = {
+            "admin": hash_password("admin-secret"),
+            "viewer": hash_password("viewer-secret"),
+        }
+        app = server.MatchWebApp(
+            "postgresql://test",
+            users,
+            b"key",
+            monitor_url=f"http://{host}:{port}",
+        )
+        http_server = server.MatchWebServer(("127.0.0.1", 0), app)
+        thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+        thread.start()
+        connection = HTTPConnection(*http_server.server_address, timeout=2)
+        try:
+            connection.request("GET", "/monitor/api/status")
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 401)
+
+            viewer_cookie = self._login_cookie(
+                connection, "viewer", "viewer-secret"
+            )
+            connection.request(
+                "GET", "/monitor/", headers={"Cookie": viewer_cookie}
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+
+            admin_cookie = self._login_cookie(connection, "admin", "admin-secret")
+            connection.request("GET", "/monitor", headers={"Cookie": admin_cookie})
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 303)
+            self.assertEqual(response.getheader("Location"), "/monitor/")
+
+            connection.request("GET", "/monitor/", headers={"Cookie": admin_cookie})
+            response = connection.getresponse()
+            page = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("SimpleCrawler 总监控", page)
+            self.assertIn("fetch('api/status'", page)
+
+            connection.request(
+                "GET", "/monitor/api/status", headers={"Cookie": admin_cookie}
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertIn("监控代理测试", payload["components"][1]["logs"][0])
+
+            dashboard.close()
+            connection.request(
+                "GET", "/monitor/api/status", headers={"Cookie": admin_cookie}
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 503)
+            self.assertEqual(payload["error"], "采集监控暂不可用")
+        finally:
+            connection.close()
+            http_server.shutdown()
+            http_server.server_close()
+            thread.join(timeout=2)
+            dashboard.close()
+
     @staticmethod
     def _login_cookie(connection, username, password):
         body = f"username={username}&password={password}"
@@ -312,6 +386,7 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("60_000", script)
         self.assertIn("odds_filter", script)
         self.assertIn("filter_markers", script)
+        self.assertIn("monitor-link", script)
 
     def test_password_hash_is_salted_and_verifiable(self):
         first = hash_password("a-secure-password")

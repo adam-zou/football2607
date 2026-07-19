@@ -52,6 +52,7 @@ flowchart LR
     SimpleMatchDetails --> SimpleDashboard
     SimpleOddsRows --> SimpleDashboard
     SimpleOddsState --> SimpleDashboard
+    SimpleDashboard -->|"localhost read-only HTTP"| MatchWeb
     SimpleMatchDetails --> MatchWeb
     SimpleOddsRows --> MatchWeb
     SimpleProxy --> SimpleList
@@ -117,6 +118,14 @@ The in-process account map is updated together with the file, so changes take ef
 immediately without restarting MatchWeb. Non-admin sessions receive HTTP 403 from
 these routes, and the browser only reveals the user-management navigation after a
 server-reported admin session check.
+The same admin-only navigation exposes `/monitor/`. MatchWeb proxies exactly that
+HTML resource and `/monitor/api/status` to the configured localhost
+`MATCH_WEB_MONITOR_URL` (default `http://127.0.0.1:8081`); it is not a general
+reverse proxy. The dashboard uses a relative `api/status` URL, so its existing
+standalone root route and the authenticated MatchWeb sub-route share the same HTML.
+The seam is read-only: MatchWeb does not import runtime state, control scheduler
+lifecycle, or take ownership of monitor availability. Upstream connection failures
+become HTTP 503 responses while the match view remains available.
 After the first query, the browser repeats the same read-only request every 60
 seconds. Match IDs link to Nowscore's company-3 three-market odds page.
 
@@ -152,7 +161,9 @@ scheduling.
 The supervisor also owns a read-only human dashboard on `127.0.0.1:8081` by
 default. `/` renders separate panels for the proxy service and all four jobs;
 `/api/status` returns their current state, latest timing and exit information, and
-the most recent 400 log lines per component. A separate read-only sampler queries
+the most recent 400 log lines per component. These same two resources are available
+to an authenticated administrator through MatchWeb's `/monitor/` route without
+changing dashboard state ownership. A separate read-only sampler queries
 PostgreSQL every ten seconds for matches whose parsed scheduled date is today in
 Asia/Shanghai. It publishes the match-ID count, finished count (`status_text =
 '完'`), in-progress count (live phase or minute `status_text`), today's completed,
@@ -247,12 +258,17 @@ response contributes up to ten `host:port` addresses to the one shared in-memory
 pool only after validation. The ten candidates are checked concurrently through
 their authenticated HTTPS proxy against `PROXY_TEST_URL`; only a 2xx or 3xx
 response enters the pool. `/health` reports the latest received and validated
-counts, distinct available and quarantined proxies, and remaining page-assignment slots. An
+counts, distinct available and quarantined proxies, remaining page-assignment slots,
+and the configured per-address concurrent lease ceiling. An
 address expires 30 seconds after its supplier request started and may be assigned
 to at most `PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP` pages across all crawler processes
-(default 5), including concurrent browser contexts. A lease may atomically reserve
-more than one slot when one context will make several page requests; odds company
-jobs reserve one slot per requested market. The final allowed assignment
+(default 6), including concurrent browser contexts. Independently,
+`PROXY_MAX_CONCURRENT_LEASES_PER_IP` limits simultaneous leases per address
+(default 3). Eligible addresses are ranked by active lease count first, cumulative
+page assignments second, and address last for deterministic ties, so work spreads
+across the pool before an address receives additional concurrent work. A lease may
+atomically reserve more than one page slot when one context will make several page
+requests; odds company jobs reserve one slot per requested market. The final allowed assignment
 quarantines that address for `PROXY_RETIRE_SECONDS` (default one hour); an earlier
 page exception starts the same quarantine immediately. Existing concurrent pages
 may finish, but releases never restore consumed assignment slots. Supplier responses

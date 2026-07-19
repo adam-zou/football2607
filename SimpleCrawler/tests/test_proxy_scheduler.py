@@ -39,6 +39,8 @@ class FiveUseProxyTests(unittest.TestCase):
             ttl_seconds=30,
             acquire_timeout_seconds=0.01,
             api_min_interval_seconds=0,
+            max_page_assignments_per_proxy=5,
+            max_concurrent_leases_per_proxy=5,
             fetcher=lambda _url, _timeout: "192.0.2.10:8000",
             validator=lambda _proxy, _url, _timeout: True,
         )
@@ -136,6 +138,18 @@ class FiveUseProxyTests(unittest.TestCase):
                 max_page_assignments_per_proxy=0,
             )
 
+    def test_concurrent_lease_limit_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "PROXY_MAX_CONCURRENT_LEASES_PER_IP 必须大于 0",
+        ):
+            ProxyScheduler(
+                api_url="https://proxy.example.test",
+                username="user",
+                password="password",
+                max_concurrent_leases_per_proxy=0,
+            )
+
     def test_company_lease_reserves_each_market_page_assignment(self) -> None:
         proxy = self.scheduler.acquire(page_assignments=3)
 
@@ -160,6 +174,18 @@ class FiveUseProxyTests(unittest.TestCase):
             scheduler = ProxyScheduler.from_env()
 
         self.assertEqual(scheduler.max_page_assignments_per_proxy, 7)
+
+    def test_concurrent_lease_limit_is_loaded_from_environment(self) -> None:
+        environment = {
+            "PROXY_API_URL": "https://proxy.example.test",
+            "PROXY_USERNAME": "user",
+            "PROXY_PASSWORD": "password",
+            "PROXY_MAX_CONCURRENT_LEASES_PER_IP": "3",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            scheduler = ProxyScheduler.from_env()
+
+        self.assertEqual(scheduler.max_concurrent_leases_per_proxy, 3)
 
     def test_retirement_period_is_loaded_from_environment(self) -> None:
         environment = {
@@ -188,6 +214,75 @@ class FiveUseProxyTests(unittest.TestCase):
         self.assertEqual(scheduler.refresh_seconds, 1.6)
         self.assertEqual(scheduler.acquire_timeout_seconds, 5.0)
         self.assertEqual(scheduler.api_min_interval_seconds, 1.6)
+        self.assertEqual(scheduler.max_page_assignments_per_proxy, 6)
+        self.assertEqual(scheduler.max_concurrent_leases_per_proxy, 3)
+
+
+class BalancedProxySelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.scheduler = ProxyScheduler(
+            api_url="https://proxy.example.test",
+            username="user",
+            password="password",
+            refresh_seconds=2,
+            ttl_seconds=30,
+            acquire_timeout_seconds=0.01,
+            api_min_interval_seconds=0,
+            max_page_assignments_per_proxy=6,
+            max_concurrent_leases_per_proxy=3,
+            fetcher=lambda _url, _timeout: (
+                "192.0.2.10:8000\n"
+                "192.0.2.11:8000\n"
+                "192.0.2.12:8000"
+            ),
+            validator=lambda _proxy, _url, _timeout: True,
+        )
+        self.scheduler._thread = threading.Thread()
+        self.scheduler._refresh_pool()
+
+    def tearDown(self) -> None:
+        self.scheduler._thread = None
+
+    def test_prefers_proxies_with_fewer_active_leases(self) -> None:
+        proxies = [
+            self.scheduler.acquire(page_assignments=3)
+            for _ in range(3)
+        ]
+
+        self.assertEqual(len({proxy.server for proxy in proxies}), 3)
+
+    def test_breaks_active_lease_ties_with_fewer_page_assignments(self) -> None:
+        first = self.scheduler.acquire()
+        self.scheduler.release(first, failed=False)
+
+        second = self.scheduler.acquire()
+
+        self.assertNotEqual(second.server, first.server)
+
+    def test_concurrent_limit_is_independent_from_page_limit(self) -> None:
+        scheduler = ProxyScheduler(
+            api_url="https://proxy.example.test",
+            username="user",
+            password="password",
+            refresh_seconds=2,
+            ttl_seconds=30,
+            acquire_timeout_seconds=0.01,
+            api_min_interval_seconds=0,
+            max_page_assignments_per_proxy=6,
+            max_concurrent_leases_per_proxy=1,
+            fetcher=lambda _url, _timeout: "192.0.2.20:8000",
+            validator=lambda _proxy, _url, _timeout: True,
+        )
+        scheduler._thread = threading.Thread()
+        scheduler._refresh_pool()
+        first = scheduler.acquire()
+
+        with self.assertRaises(ProxySchedulerError):
+            scheduler.acquire()
+
+        scheduler.release(first, failed=False)
+        second = scheduler.acquire()
+        self.assertEqual(second.server, first.server)
 
 
 class ProxyClientLeaseTests(unittest.TestCase):

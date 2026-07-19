@@ -36,7 +36,8 @@ PROXY_PATTERN = re.compile(
 GLOBAL_RATE_LIMIT_FILE = Path(tempfile.gettempdir()) / (
     "football2607-simple-crawler-proxy-api.lock"
 )
-DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY = 5
+DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY = 6
+DEFAULT_MAX_CONCURRENT_LEASES_PER_PROXY = 3
 DEFAULT_PROXY_RETIRE_SECONDS = 3600.0
 
 
@@ -85,6 +86,9 @@ class ProxyScheduler:
         max_page_assignments_per_proxy: int = (
             DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY
         ),
+        max_concurrent_leases_per_proxy: int = (
+            DEFAULT_MAX_CONCURRENT_LEASES_PER_PROXY
+        ),
         retirement_seconds: float = DEFAULT_PROXY_RETIRE_SECONDS,
         validator: Optional[ProxyValidator] = None,
     ) -> None:
@@ -112,6 +116,10 @@ class ProxyScheduler:
             raise ValueError(
                 "PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP 必须大于 0"
             )
+        if max_concurrent_leases_per_proxy <= 0:
+            raise ValueError(
+                "PROXY_MAX_CONCURRENT_LEASES_PER_IP 必须大于 0"
+            )
         if retirement_seconds <= 0:
             raise ValueError("PROXY_RETIRE_SECONDS 必须大于 0")
 
@@ -128,6 +136,9 @@ class ProxyScheduler:
         self.test_timeout_seconds = test_timeout_seconds
         self.validation_workers = validation_workers
         self.max_page_assignments_per_proxy = max_page_assignments_per_proxy
+        self.max_concurrent_leases_per_proxy = (
+            max_concurrent_leases_per_proxy
+        )
         self.retirement_seconds = retirement_seconds
         self._validator = validator or self._validate_proxy
         self._condition = threading.Condition()
@@ -186,6 +197,10 @@ class ProxyScheduler:
             max_page_assignments_per_proxy=cls._int_env(
                 "PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP",
                 DEFAULT_MAX_PAGE_ASSIGNMENTS_PER_PROXY,
+            ),
+            max_concurrent_leases_per_proxy=cls._int_env(
+                "PROXY_MAX_CONCURRENT_LEASES_PER_IP",
+                DEFAULT_MAX_CONCURRENT_LEASES_PER_PROXY,
             ),
             retirement_seconds=cls._float_env(
                 "PROXY_RETIRE_SECONDS",
@@ -264,8 +279,15 @@ class ProxyScheduler:
             while True:
                 now = time.monotonic()
                 self._remove_expired(now)
+                candidates = []
                 for server, proxy in self._proxies.items():
                     if self._is_retired(server, now):
+                        continue
+                    active_leases = self._leased.get(server, 0)
+                    if (
+                        active_leases
+                        >= self.max_concurrent_leases_per_proxy
+                    ):
                         continue
                     assignment_count = self._assignment_counts.get(server, 0)
                     if (
@@ -275,7 +297,23 @@ class ProxyScheduler:
                         continue
                     if proxy.expires_at - now < min_remaining_seconds:
                         continue
-                    self._leased[server] = self._leased.get(server, 0) + 1
+                    candidates.append(
+                        (
+                            active_leases,
+                            assignment_count,
+                            server,
+                            proxy,
+                        )
+                    )
+
+                if candidates:
+                    (
+                        active_leases,
+                        assignment_count,
+                        server,
+                        proxy,
+                    ) = min(candidates, key=lambda candidate: candidate[:3])
+                    self._leased[server] = active_leases + 1
                     assignment_count += page_assignments
                     self._assignment_counts[server] = assignment_count
                     if (
@@ -328,6 +366,8 @@ class ProxyScheduler:
                 1
                 for server in self._proxies
                 if not self._is_retired(server, time.monotonic())
+                and self._leased.get(server, 0)
+                < self.max_concurrent_leases_per_proxy
                 and self._assignment_counts.get(server, 0)
                 < self.max_page_assignments_per_proxy
             )
@@ -620,6 +660,9 @@ class ProxyLeaseService:
             "retired_proxies": self.scheduler.retired_proxy_count,
             "max_pages_per_proxy": (
                 self.scheduler.max_page_assignments_per_proxy
+            ),
+            "max_concurrent_leases_per_proxy": (
+                self.scheduler.max_concurrent_leases_per_proxy
             ),
             "last_batch_received": self.scheduler.last_batch_received,
             "last_batch_validated": self.scheduler.last_batch_validated,
