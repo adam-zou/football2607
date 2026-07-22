@@ -1,0 +1,4 @@
+interface:
+  display_name: "Publish Football2607"
+  short_description: "Commit, push, and open a safe project pull request"
+  default_prompt: "Use $publish-football2607 to validate and publish the current Football2607 changes as a pull request."
