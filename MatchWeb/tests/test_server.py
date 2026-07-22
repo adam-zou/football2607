@@ -170,6 +170,7 @@ class MatchWebAppTests(unittest.TestCase):
                 2,
                 1,
                 "客队",
+                "关注",
             )
         ]
         cursor_context = MagicMock()
@@ -188,6 +189,9 @@ class MatchWebAppTests(unittest.TestCase):
         query = cursor.execute.call_args.args[0]
         self.assertIn("titan007_1x2_changes", query)
         self.assertIn("changes.company_id = 47", query)
+        self.assertIn("details.status_text IN ('上', '中', '下'", query)
+        self.assertIn(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", query)
+        self.assertIn(r"^\d{1,2}-\d{1,2} \d{1,2}:\d{2}$", query)
         self.assertIn("source_status = '滚'", query)
         self.assertIn("AND is_suspended", query)
         self.assertIn("seq - ROW_NUMBER()", query)
@@ -196,6 +200,67 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertEqual(cursor.execute.call_args.args[1], ("2026-07-17", "2026-07-17"))
         self.assertEqual(matches[0]["match_id"], 3020831)
         self.assertNotIn("suspension_periods", matches[0])
+        self.assertEqual(matches[0]["pb_status"], "关注")
+
+    def test_fetch_company_47_suspensions_combines_status_groups(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.fetch_company_47_suspensions(
+                "postgresql://test", "2026-07-17", ["未开始", "完"]
+            )
+
+        query = cursor.execute.call_args.args[0]
+        self.assertIn("details.status_text = '未开始'", query)
+        self.assertIn("details.status_text = '完'", query)
+        self.assertIn("SELECT DISTINCT", query)
+
+    def test_ensure_pb_status_table_creates_matchweb_owned_table(self):
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.ensure_pb_status_table("postgresql://test")
+
+        query = cursor.execute.call_args.args[0]
+        self.assertIn("CREATE TABLE IF NOT EXISTS match_web_pb_status", query)
+        self.assertIn("status IN ('关注', '作废')", query)
+
+    def test_set_pb_match_status_upserts_shared_status(self):
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.set_pb_match_status(
+                "postgresql://test", 3020831, "作废", "matchuser"
+            )
+
+        query, params = cursor.execute.call_args.args
+        self.assertIn("ON CONFLICT (match_id) DO UPDATE", query)
+        self.assertEqual(params, (3020831, "作废", "matchuser", 3020831))
+
+        with self.assertRaisesRegex(ValueError, "状态无效"):
+            server.set_pb_match_status(
+                "postgresql://test", 3020831, "未知", "matchuser"
+            )
 
     def test_http_login_protects_home_page(self):
         http_server = server.MatchWebServer(("127.0.0.1", 0), self.app)
@@ -352,6 +417,7 @@ class MatchWebAppTests(unittest.TestCase):
         thread = threading.Thread(target=http_server.serve_forever, daemon=True)
         thread.start()
         connection = HTTPConnection(*http_server.server_address, timeout=2)
+        app.set_pb_match_status = MagicMock()
         try:
             body = "username=matchuser&password=user-secret"
             connection.request(
@@ -388,6 +454,25 @@ class MatchWebAppTests(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
             self.assertEqual(response.status, 403)
             self.assertEqual(payload["error"], "该账号仅可访问 PB 页面")
+
+            status_body = json.dumps({"status": "关注"}, ensure_ascii=False).encode("utf-8")
+            connection.request(
+                "PUT",
+                "/api/company-47-suspensions/3020831/status",
+                body=status_body,
+                headers={
+                    "Cookie": cookie,
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(status_body)),
+                },
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["status"], "关注")
+            app.set_pb_match_status.assert_called_once_with(
+                3020831, "关注", "matchuser"
+            )
         finally:
             connection.close()
             http_server.shutdown()

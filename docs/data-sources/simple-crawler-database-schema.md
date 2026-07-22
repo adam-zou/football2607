@@ -2,8 +2,8 @@
 
 ## 1. 文档范围
 
-本文依据 `SimpleCrawler` 当前代码中的 PostgreSQL 建表语句、数据模型、解析器和
-写入逻辑整理，描述爬虫实际使用的数据库表结构与字段语义。
+本文依据 `SimpleCrawler` 和 `MatchWeb` 当前代码中的 PostgreSQL 建表语句、数据模型、
+解析器和写入逻辑整理，描述两个服务实际使用的数据库表结构与字段语义。
 
 主要代码来源：
 
@@ -15,6 +15,7 @@
 - `SimpleCrawler/simple_crawler/models.py`
 - `SimpleCrawler/simple_crawler/odds_parser.py`
 - `SimpleCrawler/simple_crawler/companies.py`
+- `MatchWeb/server.py`
 
 数据库由环境变量 `SIMPLE_CRAWLER_DATABASE_URL` 指定，代码按 PostgreSQL 语法
 创建和访问表。本文描述的是代码声明的目标结构；如果数据库由较早版本创建，仍应
@@ -30,6 +31,9 @@
 | `titan007_1x2_changes` | 保存胜平负赔率变动记录 | `(match_id, company_id, seq)` |
 | `titan007_over_under_changes` | 保存进球数赔率变动记录 | `(match_id, company_id, seq)` |
 | `titan007_odds_market_state` | 保存每个比赛、公司和市场页面的最近采集状态 | `(match_id, company_id, market)` |
+| `wecom_match_market_push_state` | 保存企业微信通知首次基线是否已建立 | `state_key` |
+| `wecom_match_market_pushes` | 保存每个比赛市场的通知去重、快照和发送状态 | `(match_id, market_type)` |
+| `match_web_pb_status` | 保存 PB 页面每场比赛的共享关注/作废状态 | `match_id` |
 
 仓库还提供三个不存储数据的可选 PostgreSQL 视图：
 
@@ -46,6 +50,8 @@
   级联删除页面采集状态。
 - 三张赔率变动表的 `match_id` 与 `match_ids.match_id` 是逻辑关联，代码没有为其
   建立数据库外键。
+- `wecom_match_market_pushes.match_id` 与 `match_details.match_id` 是逻辑关联，
+  不声明外键，以保留已发送通知的审计记录。
 - `company_id` 使用代码内固定映射，没有单独的公司维表。
 
 ## 3. 公共取值和规则
@@ -248,6 +254,63 @@
 状态和错误，保留上一次成功的时间、记录数与摘要。最终快照失败会设置
 `final_required = TRUE` 并清空 `final_success_at`；最终快照成功会设置
 `final_required = FALSE` 并写入 `final_success_at`。
+
+### 10.1 `match_web_pb_status`
+
+该表由 `MatchWeb/server.py` 在服务启动时以 `CREATE TABLE IF NOT EXISTS` 创建并拥有，
+不属于爬虫采集状态。PB 页面上的“关注”和“作废”操作以比赛为单位共享保存；同一
+比赛只能有一个当前状态。
+
+| 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
+| --- | --- | :---: | --- | --- | --- |
+| `match_id` | `BIGINT` | 否 | 无 | 主键 | Titan007 比赛 ID；写入前由应用确认 `match_details` 中存在该比赛 |
+| `status` | `TEXT` | 否 | 无 | 检查约束 | 只允许 `关注` 或 `作废` |
+| `updated_by` | `TEXT` | 否 | 无 |  | 最近设置该状态的登录用户名 |
+| `updated_at` | `TIMESTAMPTZ` | 否 | `NOW()` |  | 状态最近更新时间 |
+
+再次设置同一比赛时使用 `ON CONFLICT (match_id) DO UPDATE` 覆盖状态、操作者和更新时间。
+该表不声明外键，以免展示侧状态改变爬虫表的删除和生命周期语义。
+
+### 10.2 企业微信通知状态表
+
+`SimpleCrawler/push_wecom_matches.py` 以 `CREATE TABLE IF NOT EXISTS` 创建并拥有
+以下两张表。
+
+`wecom_match_market_push_state` 是单例初始化标记：
+
+| 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
+| --- | --- | :---: | --- | --- | --- |
+| `state_key` | `TEXT` | 否 | 无 | 主键；固定为 `match_market_baseline` | 基线类型 |
+| `initialized_at` | `TIMESTAMPTZ` | 否 | `NOW()` |  | 首次基线建立时间 |
+
+独立初始化表保证即使首轮没有符合条件的比赛，后续新比赛也不会被
+错当成基线而漏发。
+
+`wecom_match_market_pushes` 每个“比赛 + 市场类别”一行：
+
+| 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
+| --- | --- | :---: | --- | --- | --- |
+| `match_id` | `BIGINT` | 否 | 无 | 联合主键 | Titan007 比赛 ID |
+| `market_type` | `TEXT` | 否 | 无 | 联合主键；检查约束 | `over_under`、`handicap_home` 或 `handicap_away` |
+| `push_status` | `TEXT` | 否 | 无 | 检查约束 | `baseline`、`pending`、`sent`、`failed` 或 `expired` |
+| `company_count` | `BIGINT` | 否 | 无 | `company_count >= 3` | 发现时的命中公司数快照 |
+| `line_value` | `NUMERIC(6,2)` | 是 | `NULL` |  | 发现时的最大盘口快照 |
+| `league` | `TEXT` | 是 | `NULL` |  | 发现时的联赛快照 |
+| `scheduled_time` | `TEXT` | 否 | 无 |  | 发现时的开赛时间快照 |
+| `home_team` | `TEXT` | 否 | 无 |  | 发现时的主队快照 |
+| `away_team` | `TEXT` | 否 | 无 |  | 发现时的客队快照 |
+| `detected_at` | `TIMESTAMPTZ` | 否 | `NOW()` |  | 首次发现时间 |
+| `last_attempt_at` | `TIMESTAMPTZ` | 是 | `NULL` |  | 最近一次 Webhook 尝试时间 |
+| `sent_at` | `TIMESTAMPTZ` | 是 | `NULL` |  | Webhook 明确确认成功的时间 |
+| `attempt_count` | `INTEGER` | 否 | `0` | `attempt_count >= 0` | Webhook 尝试次数 |
+| `last_error` | `TEXT` | 是 | `NULL` |  | 最近一次失败摘要，不含 Webhook URL |
+
+首次运行将当前符合条件且“未开始”的记录写为 `baseline`。之后候选
+记录还必须满足 `match_ids.created_at > initialized_at`，以排除基线前已发现、
+但之后才补齐赔率数据的旧比赛。新记录使用
+`INSERT ... ON CONFLICT DO NOTHING` 写为 `pending`，联合主键防止
+正常轮询重复推送。失败记录下轮重试；重试前比赛已开始则改为
+`expired`。
 
 ## 11. 索引
 

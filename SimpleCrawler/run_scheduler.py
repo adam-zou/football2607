@@ -147,6 +147,14 @@ def worker_specs() -> tuple[WorkerSpec, ...]:
                 60.0,
             ),
         ),
+        WorkerSpec(
+            "企业微信通知",
+            SCRIPT_DIR / "push_wecom_matches.py",
+            positive_env_float(
+                "SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS",
+                600.0,
+            ),
+        ),
     )
 
 

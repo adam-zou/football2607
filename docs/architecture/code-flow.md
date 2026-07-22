@@ -16,18 +16,22 @@ flowchart LR
     SimpleDetail["SimpleCrawler/fetch_match_details.py"]
     SimpleOdds["SimpleCrawler/fetch_odds_pages.py"]
     SimpleCompletion["SimpleCrawler/check_match_completion.py"]
+    SimpleWeCom["SimpleCrawler/push_wecom_matches.py"]
     SimpleOddsCollection["SimpleCrawler/odds_collection.py"]
     SimpleProxy["SimpleCrawler/proxy_scheduler.py"]
     SimpleRuntime["SimpleCrawler/run_scheduler.py"]
     SimpleDashboard["SimpleCrawler dashboard<br/>127.0.0.1:8081"]
     MatchWeb["MatchWeb authenticated match view<br/>127.0.0.1:8082"]
     ProxyApi["51Daili proxy API<br/>10 IPs every 2 seconds"]
+    WeComWebhook["企业微信群机器人 Webhook"]
     SimpleMatchIds[("SimpleCrawler database<br/>match_ids")]
     SimpleMatchDetails[("SimpleCrawler database<br/>match_details")]
     SimpleOddsRows[("SimpleCrawler database<br/>three Titan007 odds-change tables")]
     SimpleOddsState[("SimpleCrawler database<br/>titan007_odds_market_state")]
+    PBStatus[("MatchWeb database state<br/>match_web_pb_status")]
     OddsFilterSql["SimpleCrawler/sql/create_odds_filter_views.sql"]
     OddsFilterViews[("Optional PostgreSQL views<br/>hits, match and market summaries")]
+    WeComState[("SimpleCrawler database<br/>WeCom baseline and push ledger")]
 
     TitanList --> SimpleList
     SimpleList --> SimpleMatchIds
@@ -51,6 +55,7 @@ flowchart LR
     SimpleRuntime --> SimpleDetail
     SimpleRuntime --> SimpleOdds
     SimpleRuntime --> SimpleCompletion
+    SimpleRuntime --> SimpleWeCom
     SimpleRuntime --> SimpleDashboard
     SimpleMatchIds --> SimpleDashboard
     SimpleMatchDetails --> SimpleDashboard
@@ -59,6 +64,12 @@ flowchart LR
     SimpleDashboard -->|"localhost read-only HTTP"| MatchWeb
     SimpleMatchDetails --> MatchWeb
     SimpleOddsRows --> MatchWeb
+    MatchWeb -->|"关注 / 作废"| PBStatus
+    PBStatus --> MatchWeb
+    OddsFilterViews --> SimpleWeCom
+    SimpleMatchDetails --> SimpleWeCom
+    SimpleWeCom --> WeComState
+    SimpleWeCom --> WeComWebhook
     SimpleProxy --> SimpleList
     SimpleProxy --> SimpleDetail
     SimpleProxy --> SimpleOdds
@@ -70,13 +81,14 @@ flowchart LR
 | Command | Python entrypoint | Purpose | Persistent write |
 | --- | --- | --- | --- |
 | `start_all.bat` | Windows launcher for `SimpleCrawler/run_scheduler.py:main` and `MatchWeb/server.py:main` | Start the crawler supervisor and authenticated match view in separate command windows, preferring the repository `.venv` | None directly; the launched crawler jobs own their writes |
-| `python3 SimpleCrawler/run_scheduler.py` | `SimpleCrawler/run_scheduler.py:main` | Run the proxy service and the four independent, single-instance crawler loops | None directly; child jobs own their writes |
+| `python3 SimpleCrawler/run_scheduler.py` | `SimpleCrawler/run_scheduler.py:main` | Run the proxy service and the five independent, single-instance crawler loops | None directly; child jobs own their writes |
 | `python3 SimpleCrawler/fetch_match_ids.py` | `SimpleCrawler/fetch_match_ids.py:main` | Fetch the currently rendered Titan007 match IDs, print them, and store unseen IDs | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
 | `python3 SimpleCrawler/fetch_match_details.py [match_id ...]` | `SimpleCrawler/fetch_match_details.py:main` | Fetch and store detail-page fields for selected IDs or every database ID | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
 | `python3 SimpleCrawler/fetch_odds_pages.py [match_id ...]` | `SimpleCrawler/fetch_odds_pages.py:main` | Fetch, parse, and store three odds markets for each configured company and selected match | Three odds-change tables and `titan007_odds_market_state` in the dedicated PostgreSQL database |
 | `python3 SimpleCrawler/check_match_completion.py` | `SimpleCrawler/check_match_completion.py:main` | Persist resumable 18-page final snapshots for matches whose finished detail has been stable for five minutes or whose kickoff is more than four hours old | Three odds-change tables, `titan007_odds_market_state`, and `match_ids.crawl_status` |
+| `python3 SimpleCrawler/push_wecom_matches.py` | `SimpleCrawler/push_wecom_matches.py:main` | Baseline existing qualifying markets, then notify newly qualifying not-started matches through a configured WeCom group webhook | `wecom_match_market_push_state` and `wecom_match_market_pushes`; external WeCom message side effect |
 | `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
-| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve the authenticated, read-only match list with date/status filters and 60-second browser refresh | None |
+| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status`; crawler-owned tables remain read-only |
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
 | `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, and market-summary views | Three `match_odds_filter_*` views |
 
@@ -89,7 +101,9 @@ It resolves the repository from the batch file location, prefers
 windows. The Python entrypoints remain independently usable and retain ownership
 of their own validation, lifecycle, and shutdown behavior.
 
-`MatchWeb/server.py` is an independently started, read-only presentation service.
+`MatchWeb/server.py` is an independently started presentation service. Crawler-owned
+match and odds tables remain read-only to MatchWeb; the service owns only the
+`match_web_pb_status` table used by PB actions.
 It loads the same `SIMPLE_CRAWLER_DATABASE_URL` used by the crawler, accepts a
 Shanghai-calendar match date and one or more of four presentation status groups,
 then reads `match_details`. A selected match date covers scheduled times from 21:00
@@ -119,17 +133,23 @@ immediately following row; an open run without a following row qualifies only wh
 the timestamps of its own consecutive suspension rows already prove a duration of
 at least three minutes. This prevents a lone latest suspension marker from being
 treated as a known-duration interval. The API uses those runs only as a predicate
-and returns the qualifying matches; the page shows the same basic match columns as
-the primary list without suspension details. The page is read-only and refreshes
-every 60 seconds.
+and returns each qualifying match once even when several runs qualify. The page
+uses the primary list's date and multi-status filters, including its default
+`未开始` plus `进行中` selection, and shows the same basic match columns without
+suspension details. Its final column exposes mutually exclusive `关注` and `作废`
+actions. MatchWeb creates `match_web_pb_status` at startup and upserts one shared
+status per match together with the acting username and update time. The list joins
+that state on refresh: followed rows render red and invalid rows render gray. The
+match query remains read-only and refreshes every 60 seconds; only the explicit PB
+status action writes.
 
 All HTML and JSON match routes require a server-validated, HMAC-signed login
 session. Multiple local accounts are stored in a separately managed JSON file;
 passwords use salted PBKDF2-SHA256 hashes and are never stored as plaintext.
 Authenticated usernames containing `user`, compared case-insensitively, are PB-only
 accounts. Their successful login redirects to `/company-47-suspensions`; the server
-allows only that page, its script and data endpoint, shared public styling, and
-logout. Other HTML routes and APIs return HTTP 403, so this restriction does not
+allows only that page, its script, list/status endpoints, shared public styling,
+and logout. Other HTML routes and APIs return HTTP 403, so this restriction does not
 depend on hidden navigation or browser behavior.
 The authenticated `/users` page and `/api/users` management endpoints additionally
 require the signed session username to be exactly `admin`. They list accounts and
@@ -164,15 +184,50 @@ category with its maximum line plus a score-derived Asian-market result. The vie
 read the persisted odds-change tables and `match_details` at query time and own no
 independent data.
 MatchWeb currently implements its display predicate directly and does not depend
-on these optional views, so installing or omitting them does not change crawler or
-web runtime behavior.
+on these optional views. The WeCom notification worker does depend on
+`match_odds_filter_market_summary` when its webhook is configured; leaving the
+webhook empty skips the worker before database access.
+
+## WeCom match-market notifications
+
+`SimpleCrawler/push_wecom_matches.py` is a one-shot notification worker scheduled
+by `run_scheduler.py` every 600 seconds after the previous round ends. The interval
+is configurable through `SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS`. An empty
+`SIMPLE_CRAWLER_WECOM_WEBHOOK_URL` makes each round a successful no-op, so existing
+deployments do not require a webhook. A configured worker requires the optional
+odds-filter views and reads `match_odds_filter_market_summary` joined to
+`match_details`, selecting only exact `status_text = '未开始'` rows.
+
+The worker owns two PostgreSQL tables. `wecom_match_market_push_state` records a
+durable singleton initialization marker, including when the first query finds no
+candidates. On the first configured run, every currently qualifying not-started
+`(match_id, market_type)` is inserted into `wecom_match_market_pushes` with
+`baseline` status and no message is sent. Later runs insert unseen keys as
+`pending` with match and market snapshots only when `match_ids.created_at` is
+later than the stored initialization time. This prevents pre-baseline matches
+whose odds arrive late from being mistaken for new matches. The composite primary key prevents
+normal polling or concurrent discovery from enqueuing the same market twice. A
+PostgreSQL advisory session lock also prevents two notification processes from
+delivering concurrently.
+
+Pending and failed markets for the same match are combined into one Markdown
+message containing league, teams, kickoff time, company count, maximum line, and a
+company-3 Nowscore link. A confirmed webhook `errcode = 0` changes every included
+market to `sent`; a rejected or failed request changes it to `failed` for the next
+round. Before discovery, failed or pending rows whose current detail is no longer
+`未开始` become `expired` and are not sent. The webhook URL is read only from
+the environment and is never included in logs or persisted error text. As with any
+database-plus-HTTP workflow without provider idempotency, a process crash after
+remote acceptance but before the `sent` commit retains a narrow duplicate-delivery
+window; the persistent key removes routine duplicates but cannot make that
+external boundary transactional.
 
 ## Standalone match-ID discovery
 
 `SimpleCrawler/run_scheduler.py` is the long-running supervisor for the standalone
 crawler. A non-blocking process lock allows only one supervisor instance. It reuses
 an already healthy proxy lease service or starts `proxy_scheduler.py`, then starts
-four independent worker threads and one proxy-health sampling thread. The sampler
+five independent worker threads and one proxy-health sampling thread. The sampler
 queries the proxy service `/health` endpoint every ten seconds, stores the pool,
 lease, availability, quarantine, page-slot, received, validated, and validation-rate
 values in the process-local dashboard snapshot, and also appends a readable summary
@@ -197,7 +252,7 @@ contract carries presentation metadata only and does not affect selection or job
 scheduling.
 
 The supervisor also owns a read-only human dashboard on `127.0.0.1:8081` by
-default. `/` renders separate panels for the proxy service and all four jobs;
+default. `/` renders separate panels for the proxy service and all five jobs;
 `/api/status` returns their current state, latest timing and exit information, and
 the most recent 400 log lines per component. These same two resources are available
 to an authenticated administrator through MatchWeb's `/monitor/` route without
@@ -236,11 +291,13 @@ health state but only supervisor lifecycle messages because its stdout is not ow
 by this process.
 
 The default post-round intervals are 15 minutes for match-ID discovery, 5 seconds
-for details, 5 seconds for odds, and 60 seconds for completion checks. They can be
+for details, 5 seconds for odds, 60 seconds for completion checks, and 10 minutes
+for WeCom notifications. They can be
 overridden with `SIMPLE_CRAWLER_ID_INTERVAL_SECONDS`,
 `SIMPLE_CRAWLER_DETAIL_INTERVAL_SECONDS`,
 `SIMPLE_CRAWLER_ODDS_INTERVAL_SECONDS`, and
-`SIMPLE_CRAWLER_COMPLETION_INTERVAL_SECONDS`. Odds and completion workers do not
+`SIMPLE_CRAWLER_COMPLETION_INTERVAL_SECONDS`, plus
+`SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS`. Odds and completion workers do not
 share a lock and may run concurrently, but their per-match windows are disjoint:
 ordinary odds owns minus four hours through plus 30 minutes until a finished detail
 has been stable for five minutes, while finalization owns those stable finished
@@ -483,6 +540,7 @@ It no longer re-fetches pages solely to compare row counts or spawns
 | `SimpleCrawler/fetch_match_details.py` | Detail-page selection, collection, and `match_details` persistence |
 | `SimpleCrawler/fetch_odds_pages.py` | Odds-page selection, bounded async orchestration, logging, and exit-code aggregation |
 | `SimpleCrawler/check_match_completion.py` | Batched overdue detail refresh, globally bounded concurrent 18-page finalization, and crawl-status update |
+| `SimpleCrawler/push_wecom_matches.py` | WeCom baseline initialization, match-market deduplication, message rendering, webhook delivery, and retry state |
 | `SimpleCrawler/proxy_scheduler.py` | Shared proxy pool, validation, leasing, quarantine, and health endpoint |
 | `SimpleCrawler/run_scheduler.py` | Process supervision, task intervals, lifecycle, and dashboard composition |
 | `SimpleCrawler/pyproject.toml` | SimpleCrawler package metadata and complete runtime dependency declaration |
