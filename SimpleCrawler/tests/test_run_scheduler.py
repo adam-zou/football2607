@@ -281,6 +281,7 @@ class DashboardServerTests(unittest.TestCase):
             server.close()
 
         self.assertIn("SimpleCrawler 总监控", html)
+        self.assertIn("fetch('api/status'", html)
         self.assertIn("比赛数据统计", html)
         self.assertIn("历史比赛", html)
         self.assertIn("时间异常", html)

@@ -15,6 +15,7 @@ async function revealAdminNavigation() {
     const response = await fetch('/api/session', { cache: 'no-store' });
     if (!response.ok) return;
     const session = await response.json();
+    document.getElementById('monitor-link').hidden = !session.is_admin;
     document.getElementById('user-management-link').hidden = !session.is_admin;
   } catch (_) {
     // Match loading remains available if the optional session badge cannot load.

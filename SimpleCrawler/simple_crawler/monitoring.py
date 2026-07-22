@@ -511,7 +511,7 @@ DASHBOARD_HTML = """<!doctype html>
       el.querySelector('.timing').textContent=['waiting','error'].includes(c.status)?`下轮 ${fmt(c.next_run_at)}`:`开始 ${fmt(c.started_at)}`;
       el.querySelector('.exit').textContent=c.exit_code===null?'':`退出码 ${c.exit_code} · ${Number(c.duration_seconds||0).toFixed(1)}s`;
     }
-    async function refresh(){try{const response=await fetch('/api/status',{cache:'no-store'});
+    async function refresh(){try{const response=await fetch('api/status',{cache:'no-store'});
       if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();
       data.components.forEach(card);statistics(data.daily_statistics);proxyHealth(data.proxy_health);alerts(data);clock.textContent=`更新 ${fmt(data.generated_at)}`;
     }catch(error){clock.textContent=`连接失败：${error.message}`}}

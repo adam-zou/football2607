@@ -359,7 +359,8 @@ python SimpleCrawler/fetch_odds_pages.py --help
 | `PROXY_REFRESH_SECONDS` | `1.6` | 代理池刷新间隔 |
 | `PROXY_API_MIN_INTERVAL_SECONDS` | `1.6` | 跨代理服务进程共享的供应商最小请求间隔 |
 | `PROXY_TTL_SECONDS` | `30` | 代理 IP 有效期 |
-| `PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP` | `5` | 每个代理 IP 最多分配的页面调用数量；公司任务按市场数预占 |
+| `PROXY_MAX_PAGE_ASSIGNMENTS_PER_IP` | `6` | 每个代理 IP 累计最多分配的页面调用数量；公司任务按市场数预占 |
+| `PROXY_MAX_CONCURRENT_LEASES_PER_IP` | `3` | 每个代理 IP 同时允许的租约数；与累计页面额度独立限制 |
 | `PROXY_RETIRE_SECONDS` | `3600` | 页面失败或用满额度后的地址隔离时间；到期后仍需供应商重新提供并验证 |
 | `PROXY_ACQUIRE_TIMEOUT_SECONDS` | `5` | 等待可用代理的最长时间 |
 | `PROXY_TEST_URL` | `https://live.titan007.com/oldIndexall.aspx` | 新代理入池前的验证地址 |
