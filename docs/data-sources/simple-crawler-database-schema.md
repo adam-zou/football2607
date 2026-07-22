@@ -31,6 +31,14 @@
 | `titan007_over_under_changes` | 保存进球数赔率变动记录 | `(match_id, company_id, seq)` |
 | `titan007_odds_market_state` | 保存每个比赛、公司和市场页面的最近采集状态 | `(match_id, company_id, market)` |
 
+仓库还提供三个不存储数据的可选 PostgreSQL 视图：
+
+| 视图名 | 用途 |
+| --- | --- |
+| `match_odds_filter_hits` | 展开每条满足低赔率筛选条件的历史记录 |
+| `match_odds_filter_summary` | 汇总任一赔率类别至少命中三家公司的比赛 |
+| `match_odds_filter_market_summary` | 按命中类别汇总最大盘口及其比分结算结果 |
+
 表关系如下：
 
 - `match_details.match_id` 外键关联 `match_ids.match_id`，删除比赛 ID 时级联删除详情。
@@ -253,7 +261,33 @@ CREATE INDEX IF NOT EXISTS titan007_odds_market_state_final_pending_idx
 
 该索引用于快速定位仍需完成最终快照的页面状态记录。
 
-## 12. 数据完整性注意事项
+## 12. 可选赔率筛选视图
+
+`SimpleCrawler/sql/create_odds_filter_views.sql` 创建三个实时视图。该脚本需要由
+操作人员通过 `psql` 手工执行，不属于爬虫建表或
+调度器启动流程；MatchWeb 当前查询也不依赖这三个视图。脚本可以重复执行，视图
+每次查询都读取三张赔率变动表的当前数据，不保存独立快照。
+
+`match_odds_filter_hits` 先要求比赛在三种市场的任意一张表中存在公司 3 数据，
+再展开以下非“滚”且公司 ID 不为 4 的命中记录：
+
+- 亚让主队赔率低于 `0.700`；
+- 亚让客队赔率低于 `0.700`；
+- 进球数大球赔率低于 `0.700`。
+
+同一条亚让记录两侧同时命中时会产生两行。视图输出比赛、公司、市场、变化时间、
+盘口原文与数值、命中赔率及 `home`、`away` 或 `over` 方向。
+
+`match_odds_filter_summary` 按比赛分别计算大球、亚让主队和亚让客队的去重命中
+公司数，只要任一类别达到三家公司即保留该比赛。脚本会先删除再创建此派生视图，
+以允许旧版本的列顺序和结构被替换。
+
+`match_odds_filter_market_summary` 每场比赛、每个达到三家公司的类别输出一行。
+类别为 `over_under`、`handicap_home` 或 `handicap_away`，`line_value` 取该类别命中
+记录中的最大盘口值。视图左连接 `match_details` 读取比分，并按亚洲盘差值返回
+`全赢`、`赢半`、`走水`、`输半` 或 `全输`；比分或盘口缺失时结果为 `NULL`。
+
+## 13. 数据完整性注意事项
 
 1. 三张赔率变动表没有到 `match_ids` 的外键。删除 `match_ids` 记录时，数据库会
    级联删除比赛详情和赔率页面状态，但不会自动删除对应赔率变动记录。

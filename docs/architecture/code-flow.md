@@ -26,6 +26,8 @@ flowchart LR
     SimpleMatchDetails[("SimpleCrawler database<br/>match_details")]
     SimpleOddsRows[("SimpleCrawler database<br/>three Titan007 odds-change tables")]
     SimpleOddsState[("SimpleCrawler database<br/>titan007_odds_market_state")]
+    OddsFilterSql["SimpleCrawler/sql/create_odds_filter_views.sql"]
+    OddsFilterViews[("Optional PostgreSQL views<br/>hits, match and market summaries")]
 
     TitanList --> SimpleList
     SimpleList --> SimpleMatchIds
@@ -38,6 +40,8 @@ flowchart LR
     SimpleCompletion --> SimpleOddsCollection
     SimpleOddsCollection --> SimpleOddsRows
     SimpleOddsCollection --> SimpleOddsState
+    SimpleOddsRows --> OddsFilterViews
+    OddsFilterSql --> OddsFilterViews
     SimpleMatchDetails --> SimpleCompletion
     SimpleOddsRows --> SimpleCompletion
     SimpleCompletion --> SimpleMatchIds
@@ -74,6 +78,7 @@ flowchart LR
 | `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
 | `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve the authenticated, read-only match list with date/status filters and 60-second browser refresh | None |
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
+| `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, and market-summary views | Three `match_odds_filter_*` views |
 
 ## Authenticated match view
 
@@ -106,9 +111,26 @@ per match for the filter marker column. The API maps each stored company ID thro
 company-name configuration and returns the company name with its `change_time`;
 the browser exposes those values on marker hover and keyboard focus.
 
+The authenticated `/company-47-suspensions` view uses the same Shanghai match-day
+window and reads company 47's one-x-two rows. It groups rows satisfying
+`source_status = '滚' AND is_suspended = TRUE` into stable consecutive-`seq` runs.
+A run's duration starts at its first suspension `change_time` and ends at the
+immediately following row; an open run without a following row qualifies only when
+the timestamps of its own consecutive suspension rows already prove a duration of
+at least three minutes. This prevents a lone latest suspension marker from being
+treated as a known-duration interval. The API uses those runs only as a predicate
+and returns the qualifying matches; the page shows the same basic match columns as
+the primary list without suspension details. The page is read-only and refreshes
+every 60 seconds.
+
 All HTML and JSON match routes require a server-validated, HMAC-signed login
 session. Multiple local accounts are stored in a separately managed JSON file;
 passwords use salted PBKDF2-SHA256 hashes and are never stored as plaintext.
+Authenticated usernames containing `user`, compared case-insensitively, are PB-only
+accounts. Their successful login redirects to `/company-47-suspensions`; the server
+allows only that page, its script and data endpoint, shared public styling, and
+logout. Other HTML routes and APIs return HTTP 403, so this restriction does not
+depend on hidden navigation or browser behavior.
 The authenticated `/users` page and `/api/users` management endpoints additionally
 require the signed session username to be exactly `admin`. They list accounts and
 allow the administrator to create users, reset passwords, and delete non-admin
@@ -128,6 +150,22 @@ lifecycle, or take ownership of monitor availability. Upstream connection failur
 become HTTP 503 responses while the match view remains available.
 After the first query, the browser repeats the same read-only request every 60
 seconds. Match IDs link to Nowscore's company-3 three-market odds page.
+
+## Optional odds-filter views
+
+`SimpleCrawler/sql/create_odds_filter_views.sql` is an operator-run, repeatable
+PostgreSQL script; no Python entrypoint or scheduler applies it automatically. It
+creates `match_odds_filter_hits`, a live expansion of qualifying non-rolling,
+non-company-4 handicap-side and over-price rows for matches that have company-3
+data; `match_odds_filter_summary`, which retains matches where at least one of the
+over, handicap-home, or handicap-away categories is hit by three distinct
+companies; and `match_odds_filter_market_summary`, which emits each qualifying
+category with its maximum line plus a score-derived Asian-market result. The views
+read the persisted odds-change tables and `match_details` at query time and own no
+independent data.
+MatchWeb currently implements its display predicate directly and does not depend
+on these optional views, so installing or omitting them does not change crawler or
+web runtime behavior.
 
 ## Standalone match-ID discovery
 
@@ -448,6 +486,7 @@ It no longer re-fetches pages solely to compare row counts or spawns
 | `SimpleCrawler/proxy_scheduler.py` | Shared proxy pool, validation, leasing, quarantine, and health endpoint |
 | `SimpleCrawler/run_scheduler.py` | Process supervision, task intervals, lifecycle, and dashboard composition |
 | `SimpleCrawler/pyproject.toml` | SimpleCrawler package metadata and complete runtime dependency declaration |
+| `SimpleCrawler/sql/create_odds_filter_views.sql` | Manually installed live views for low-odds hits, three-company category summaries, and score settlement |
 
 ## Documentation update checklist
 
