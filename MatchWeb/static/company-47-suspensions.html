@@ -3,15 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>比赛数据</title>
+    <title>PB · MatchWeb</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="dashboard">
       <header class="page-header">
         <div class="header-meta">
-          <a id="monitor-link" href="/monitor/" hidden>采集监控</a>
-          <a id="user-management-link" href="/users" hidden>用户管理</a>
+          <a href="/">比赛数据</a>
           <span id="refresh-state">每 60 秒自动刷新</span>
           <a href="/logout">退出</a>
         </div>
@@ -22,31 +21,13 @@
           <label for="match-date">日期</label>
           <input id="match-date" type="date" />
         </div>
-        <fieldset class="status-filter">
-          <legend>比赛状态</legend>
-          <div class="segmented">
-            <input id="status-not-started" name="status" type="checkbox" value="未开始" checked />
-            <label for="status-not-started">未开始</label>
-            <input id="status-live" name="status" type="checkbox" value="进行中" checked />
-            <label for="status-live">进行中</label>
-            <input id="status-finished" name="status" type="checkbox" value="完" />
-            <label for="status-finished">完</label>
-            <input id="status-other" name="status" type="checkbox" value="其它" />
-            <label for="status-other">其它</label>
-          </div>
-        </fieldset>
-        <label class="checkbox-filter" for="odds-filter">
-          <input id="odds-filter" type="checkbox" checked />
-          <span>启用筛选</span>
-        </label>
-        <a class="filter-page-link" href="/company-47-suspensions">PB</a>
         <button id="query-button" class="query-button" type="button">查询</button>
       </section>
 
       <section class="results" aria-live="polite">
         <div class="results-heading">
           <div>
-            <h2>比赛列表</h2>
+            <h2>符合条件的比赛</h2>
             <p id="result-summary">正在读取比赛数据…</p>
           </div>
           <p id="updated-at"></p>
@@ -62,16 +43,15 @@
                 <th>主队</th>
                 <th>比分</th>
                 <th>客队</th>
-                <th>筛选标记</th>
               </tr>
             </thead>
             <tbody id="match-rows"></tbody>
           </table>
-          <div id="empty-state" class="empty-state" hidden>当前条件下没有比赛</div>
+          <div id="empty-state" class="empty-state" hidden>当天没有符合条件的比赛</div>
           <div id="error-state" class="empty-state error-state" hidden></div>
         </div>
       </section>
     </main>
-    <script src="/app.js" defer></script>
+    <script src="/company-47-suspensions.js" defer></script>
   </body>
 </html>

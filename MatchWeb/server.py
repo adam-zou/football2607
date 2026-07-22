@@ -47,6 +47,13 @@ DEFAULT_STATUSES = ("未开始", "进行中")
 ADMIN_USERNAME = "admin"
 DEFAULT_MONITOR_URL = "http://127.0.0.1:8081"
 MONITOR_TIMEOUT_SECONDS = 2
+PB_ONLY_PAGE = "/company-47-suspensions"
+PB_ONLY_PATHS = {
+    PB_ONLY_PAGE,
+    "/company-47-suspensions.js",
+    "/api/company-47-suspensions",
+    "/logout",
+}
 
 STATUS_SQL = {
     "未开始": "details.status_text = '未开始'",
@@ -80,6 +87,10 @@ def validate_date(value: str) -> str:
         return date.fromisoformat(value).isoformat()
     except ValueError as exc:
         raise ValueError("日期格式必须是 YYYY-MM-DD") from exc
+
+
+def is_pb_only_username(username: Optional[str]) -> bool:
+    return bool(username and "user" in username.casefold())
 
 
 def fetch_matches(
@@ -121,7 +132,7 @@ def fetch_matches(
         """
 
     query = f"""
-        SELECT
+        SELECT DISTINCT
             details.match_id,
             details.league,
             details.scheduled_time,
@@ -194,6 +205,129 @@ def fetch_matches(
             "filter_markers": markers,
         })
     return matches
+
+
+def fetch_company_47_suspensions(
+    database_url: str,
+    match_date: str,
+) -> List[Dict[str, object]]:
+    """Return matches with a proven 3-minute company-47 live 1x2 suspension."""
+
+    match_date = validate_date(match_date)
+    query = """
+        WITH company_rows_with_raw_time AS (
+            SELECT
+                details.match_id,
+                details.league,
+                details.scheduled_time,
+                details.status_text,
+                details.home_team,
+                details.home_score,
+                details.away_score,
+                details.away_team,
+                changes.seq,
+                changes.change_time,
+                changes.source_status,
+                changes.is_suspended,
+                details.scheduled_time::TIMESTAMP AS scheduled_at,
+                TO_TIMESTAMP(
+                    EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
+                    || '-' || changes.change_time,
+                    'YYYY-MM-DD HH24:MI'
+                ) AS raw_change_at
+            FROM match_details AS details
+            JOIN titan007_1x2_changes AS changes
+              ON changes.match_id = details.match_id
+             AND changes.company_id = 47
+            WHERE details.scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+              AND details.scheduled_time::TIMESTAMP >= (%s::DATE - INTERVAL '3 hours')
+              AND details.scheduled_time::TIMESTAMP < (%s::DATE + INTERVAL '1 day')
+              AND changes.change_time ~ '^\\d{1,2}-\\d{1,2} \\d{1,2}:\\d{2}$'
+        ),
+        company_rows AS (
+            SELECT
+                company_rows_with_raw_time.*,
+                CASE
+                    WHEN raw_change_at < scheduled_at - INTERVAL '180 days'
+                        THEN raw_change_at + INTERVAL '1 year'
+                    WHEN raw_change_at > scheduled_at + INTERVAL '180 days'
+                        THEN raw_change_at - INTERVAL '1 year'
+                    ELSE raw_change_at
+                END AS change_at
+            FROM company_rows_with_raw_time
+        ),
+        suspended_rows AS (
+            SELECT
+                company_rows.*,
+                seq - ROW_NUMBER() OVER (
+                    PARTITION BY match_id ORDER BY seq
+                ) AS suspension_group
+            FROM company_rows
+            WHERE source_status = '滚'
+              AND is_suspended
+        ),
+        suspension_runs AS (
+            SELECT
+                match_id,
+                suspension_group,
+                MIN(seq) AS start_seq,
+                MAX(seq) AS end_seq,
+                (ARRAY_AGG(change_time ORDER BY seq))[1] AS start_time,
+                (ARRAY_AGG(change_time ORDER BY seq DESC))[1] AS last_time,
+                (ARRAY_AGG(change_at ORDER BY seq))[1] AS start_at,
+                (ARRAY_AGG(change_at ORDER BY seq DESC))[1] AS last_at
+            FROM suspended_rows
+            GROUP BY match_id, suspension_group
+        ),
+        qualifying_runs AS (
+            SELECT
+                suspension_runs.*,
+                COALESCE(next_row.change_time, suspension_runs.last_time) AS end_time,
+                COALESCE(next_row.change_at, suspension_runs.last_at) AS end_at,
+                EXTRACT(
+                    EPOCH FROM COALESCE(next_row.change_at, suspension_runs.last_at)
+                    - suspension_runs.start_at
+                ) / 60 AS duration_minutes
+            FROM suspension_runs
+            LEFT JOIN company_rows AS next_row
+              ON next_row.match_id = suspension_runs.match_id
+             AND next_row.seq = suspension_runs.end_seq + 1
+            WHERE COALESCE(next_row.change_at, suspension_runs.last_at)
+                    - suspension_runs.start_at >= INTERVAL '3 minutes'
+        )
+        SELECT
+            details.match_id,
+            details.league,
+            details.scheduled_time,
+            details.status_text,
+            details.home_team,
+            details.home_score,
+            details.away_score,
+            details.away_team
+        FROM qualifying_runs
+        JOIN match_details AS details USING (match_id)
+        ORDER BY details.scheduled_time ASC, details.match_id ASC
+    """
+
+    with psycopg2.connect(database_url) as connection:
+        connection.set_session(readonly=True)
+        with connection.cursor() as cursor:
+            cursor.execute(query, (match_date, match_date))
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "match_id": int(row[0]),
+            "league": row[1],
+            "scheduled_time": row[2],
+            "status_text": row[3],
+            "home_team": row[4],
+            "home_score": row[5],
+            "away_score": row[6],
+            "away_team": row[7],
+        }
+        for row in rows
+    ]
 
 
 class MatchWebApp:
@@ -302,8 +436,9 @@ class MatchWebHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/login":
-            if self.is_authenticated():
-                self.redirect("/")
+            username = self.current_username()
+            if username:
+                self.redirect(PB_ONLY_PAGE if is_pb_only_username(username) else "/")
             else:
                 self.serve_file(STATIC_DIR / "login.html", "text/html; charset=utf-8")
             return
@@ -319,8 +454,19 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             else:
                 self.redirect("/login")
             return
+        if is_pb_only_username(self.current_username()) and parsed.path not in PB_ONLY_PATHS:
+            if parsed.path.startswith("/api/") or parsed.path == "/monitor/api/status":
+                self.send_json({"error": "该账号仅可访问 PB 页面"}, HTTPStatus.FORBIDDEN)
+            else:
+                self.send_error(HTTPStatus.FORBIDDEN)
+            return
         if parsed.path == "/":
             self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        elif parsed.path == "/company-47-suspensions":
+            self.serve_file(
+                STATIC_DIR / "company-47-suspensions.html",
+                "text/html; charset=utf-8",
+            )
         elif parsed.path == "/monitor":
             if not self.require_admin_page():
                 return
@@ -340,6 +486,11 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / "users.html", "text/html; charset=utf-8")
         elif parsed.path == "/app.js":
             self.serve_file(STATIC_DIR / "app.js", "text/javascript; charset=utf-8")
+        elif parsed.path == "/company-47-suspensions.js":
+            self.serve_file(
+                STATIC_DIR / "company-47-suspensions.js",
+                "text/javascript; charset=utf-8",
+            )
         elif parsed.path == "/users.js":
             if not self.is_admin():
                 self.send_error(HTTPStatus.FORBIDDEN)
@@ -347,6 +498,8 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / "users.js", "text/javascript; charset=utf-8")
         elif parsed.path == "/api/matches":
             self.handle_matches(parsed.query)
+        elif parsed.path == "/api/company-47-suspensions":
+            self.handle_company_47_suspensions(parsed.query)
         elif parsed.path == "/api/session":
             username = self.current_username()
             self.send_json({"username": username, "is_admin": username == ADMIN_USERNAME})
@@ -402,7 +555,9 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             self.redirect("/login?error=1")
             return
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", "/")
+        self.send_header(
+            "Location", PB_ONLY_PAGE if is_pb_only_username(username) else "/"
+        )
         self.send_header(
             "Set-Cookie",
             f"{SESSION_COOKIE}={self.server.app.create_session(username)}; Path=/; "
@@ -491,6 +646,31 @@ class MatchWebHandler(BaseHTTPRequestHandler):
                 "date": match_date,
                 "statuses": statuses,
                 "odds_filter": odds_filter,
+                "total": len(matches),
+                "refreshed_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+                "matches": matches,
+            }
+        )
+
+    def handle_company_47_suspensions(self, query: str) -> None:
+        params = parse_qs(query)
+        match_date = params.get("date", [today_in_shanghai()])[0]
+        try:
+            matches = fetch_company_47_suspensions(
+                self.server.app.database_url, match_date
+            )
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except psycopg2.Error:
+            self.send_json({"error": "暂时无法读取比赛数据"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        self.send_json(
+            {
+                "date": match_date,
+                "minimum_duration_minutes": 3,
+                "company_id": 47,
+                "market": "胜平负",
                 "total": len(matches),
                 "refreshed_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
                 "matches": matches,

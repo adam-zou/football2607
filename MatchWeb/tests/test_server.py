@@ -36,6 +36,11 @@ class MatchWebAppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
             server.validate_date("17/07/2026")
 
+    def test_pb_only_username_is_case_insensitive(self):
+        self.assertTrue(server.is_pb_only_username("matchuser"))
+        self.assertTrue(server.is_pb_only_username("MatchUser01"))
+        self.assertFalse(server.is_pb_only_username("viewer"))
+
     def test_rejects_unknown_status_before_database_connection(self):
         with patch.object(server.psycopg2, "connect") as connect:
             with self.assertRaisesRegex(ValueError, "状态无效"):
@@ -153,6 +158,45 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertNotIn("filter_hits.markers IS NOT NULL", query)
         self.assertNotIn("company_id = 3", query)
 
+    def test_fetch_company_47_suspensions_uses_consecutive_live_runs(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            (
+                3020831,
+                "中超",
+                "2026-07-17 19:35",
+                "完",
+                "主队",
+                2,
+                1,
+                "客队",
+            )
+        ]
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            matches = server.fetch_company_47_suspensions(
+                "postgresql://test", "2026-07-17"
+            )
+
+        connection.set_session.assert_called_once_with(readonly=True)
+        query = cursor.execute.call_args.args[0]
+        self.assertIn("titan007_1x2_changes", query)
+        self.assertIn("changes.company_id = 47", query)
+        self.assertIn("source_status = '滚'", query)
+        self.assertIn("AND is_suspended", query)
+        self.assertIn("seq - ROW_NUMBER()", query)
+        self.assertIn("next_row.seq = suspension_runs.end_seq + 1", query)
+        self.assertIn("INTERVAL '3 minutes'", query)
+        self.assertEqual(cursor.execute.call_args.args[1], ("2026-07-17", "2026-07-17"))
+        self.assertEqual(matches[0]["match_id"], 3020831)
+        self.assertNotIn("suspension_periods", matches[0])
+
     def test_http_login_protects_home_page(self):
         http_server = server.MatchWebServer(("127.0.0.1", 0), self.app)
         thread = threading.Thread(target=http_server.serve_forever, daemon=True)
@@ -185,6 +229,15 @@ class MatchWebAppTests(unittest.TestCase):
             page = response.read().decode("utf-8")
             self.assertEqual(response.status, 200)
             self.assertIn("每 60 秒自动刷新", page)
+
+            connection.request(
+                "GET", "/company-47-suspensions", headers={"Cookie": cookie}
+            )
+            response = connection.getresponse()
+            page = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("符合条件的比赛", page)
+            self.assertNotIn("公司 47 滚球封盘", page)
         finally:
             connection.close()
             http_server.shutdown()
@@ -289,6 +342,58 @@ class MatchWebAppTests(unittest.TestCase):
                 http_server.server_close()
                 thread.join(timeout=2)
 
+    def test_username_containing_user_can_only_access_pb_page(self):
+        app = server.MatchWebApp(
+            "postgresql://test",
+            {"matchuser": hash_password("user-secret")},
+            b"key",
+        )
+        http_server = server.MatchWebServer(("127.0.0.1", 0), app)
+        thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+        thread.start()
+        connection = HTTPConnection(*http_server.server_address, timeout=2)
+        try:
+            body = "username=matchuser&password=user-secret"
+            connection.request(
+                "POST",
+                "/login",
+                body=body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 303)
+            self.assertEqual(response.getheader("Location"), server.PB_ONLY_PAGE)
+            cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+
+            connection.request(
+                "GET", server.PB_ONLY_PAGE, headers={"Cookie": cookie}
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+
+            connection.request("GET", "/", headers={"Cookie": cookie})
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+
+            connection.request(
+                "GET", "/api/matches?date=2026-07-17", headers={"Cookie": cookie}
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 403)
+            self.assertEqual(payload["error"], "该账号仅可访问 PB 页面")
+        finally:
+            connection.close()
+            http_server.shutdown()
+            http_server.server_close()
+            thread.join(timeout=2)
+
     def test_monitor_route_is_admin_only_and_proxies_local_dashboard(self):
         monitor = RuntimeMonitor()
         monitor.append_log("fetch_match_ids", "监控代理测试")
@@ -387,6 +492,14 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("odds_filter", script)
         self.assertIn("filter_markers", script)
         self.assertIn("monitor-link", script)
+
+        suspension_script = (
+            server.STATIC_DIR / "company-47-suspensions.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("/api/company-47-suspensions", suspension_script)
+        self.assertIn("companyid=47", suspension_script)
+        self.assertNotIn("suspension_periods", suspension_script)
+        self.assertIn("60_000", suspension_script)
 
     def test_password_hash_is_salted_and_verifiable(self):
         first = hash_password("a-secure-password")

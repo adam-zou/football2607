@@ -45,6 +45,7 @@ a { color: var(--green); text-underline-offset: 3px; }
 .checkbox-filter input { width: 18px; height: 18px; margin: 0; accent-color: var(--green); }
 .query-button { min-height: 42px; margin-left: auto; }
 .query-button:disabled { opacity: .6; cursor: wait; }
+.filter-page-link { align-self: center; white-space: nowrap; font-size: 14px; font-weight: 650; }
 
 .results { overflow: hidden; }
 .results-heading { display: flex; justify-content: space-between; align-items: end; padding: 21px 22px; border-bottom: 1px solid var(--line); }
