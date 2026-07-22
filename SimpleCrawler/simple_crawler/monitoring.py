@@ -22,6 +22,7 @@ COMPONENTS: Tuple[Tuple[str, str], ...] = (
     ("fetch_match_details", "比赛详情"),
     ("fetch_odds_pages", "赔率变化"),
     ("check_match_completion", "完成核验"),
+    ("push_wecom_matches", "企业微信通知"),
 )
 
 ROUND_MATCH_COUNT_PATTERN = re.compile(r"本轮比赛数量：(\d+) 场。?$")

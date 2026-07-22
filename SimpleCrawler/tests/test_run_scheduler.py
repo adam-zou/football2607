@@ -34,6 +34,7 @@ class SchedulerConfigurationTests(unittest.TestCase):
             "SIMPLE_CRAWLER_DETAIL_INTERVAL_SECONDS",
             "SIMPLE_CRAWLER_ODDS_INTERVAL_SECONDS",
             "SIMPLE_CRAWLER_COMPLETION_INTERVAL_SECONDS",
+            "SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS",
         )
         with patch.dict(os.environ, {name: "" for name in names}):
             intervals = {
@@ -45,6 +46,7 @@ class SchedulerConfigurationTests(unittest.TestCase):
         self.assertEqual(intervals["fetch_match_details.py"], 5.0)
         self.assertEqual(intervals["fetch_odds_pages.py"], 5.0)
         self.assertEqual(intervals["check_match_completion.py"], 60.0)
+        self.assertEqual(intervals["push_wecom_matches.py"], 600.0)
 
     def test_interval_must_be_positive(self) -> None:
         with patch.dict(os.environ, {"TEST_INTERVAL": "0"}):

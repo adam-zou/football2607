@@ -54,6 +54,15 @@ PB_ONLY_PATHS = {
     "/api/company-47-suspensions",
     "/logout",
 }
+PB_MATCH_STATUSES = {"关注", "作废"}
+PB_STATUS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS match_web_pb_status (
+    match_id BIGINT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('关注', '作废')),
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
 
 STATUS_SQL = {
     "未开始": "details.status_text = '未开始'",
@@ -91,6 +100,44 @@ def validate_date(value: str) -> str:
 
 def is_pb_only_username(username: Optional[str]) -> bool:
     return bool(username and "user" in username.casefold())
+
+
+def ensure_pb_status_table(database_url: str) -> None:
+    """Create the MatchWeb-owned PB status table when it does not exist."""
+
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(PB_STATUS_TABLE_SQL)
+
+
+def set_pb_match_status(
+    database_url: str,
+    match_id: int,
+    status: str,
+    updated_by: str,
+) -> None:
+    """Persist the shared PB status for one known match."""
+
+    if match_id <= 0:
+        raise ValueError("比赛 ID 无效")
+    if status not in PB_MATCH_STATUSES:
+        raise ValueError("PB 状态无效")
+    query = """
+        INSERT INTO match_web_pb_status (match_id, status, updated_by)
+        SELECT %s, %s, %s
+        WHERE EXISTS (
+            SELECT 1 FROM match_details WHERE match_id = %s
+        )
+        ON CONFLICT (match_id) DO UPDATE SET
+            status = EXCLUDED.status,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW()
+    """
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query, (match_id, status, updated_by, match_id))
+            if cursor.rowcount == 0:
+                raise ValueError("比赛不存在")
 
 
 def fetch_matches(
@@ -132,7 +179,7 @@ def fetch_matches(
         """
 
     query = f"""
-        SELECT DISTINCT
+        SELECT
             details.match_id,
             details.league,
             details.scheduled_time,
@@ -210,11 +257,19 @@ def fetch_matches(
 def fetch_company_47_suspensions(
     database_url: str,
     match_date: str,
+    statuses: Union[str, Sequence[str]] = DEFAULT_STATUSES,
 ) -> List[Dict[str, object]]:
     """Return matches with a proven 3-minute company-47 live 1x2 suspension."""
 
     match_date = validate_date(match_date)
-    query = """
+    if isinstance(statuses, str):
+        statuses = [statuses]
+    statuses = list(dict.fromkeys(statuses))
+    if not statuses or any(status not in ALLOWED_STATUSES for status in statuses):
+        raise ValueError("比赛状态无效")
+    status_filter_sql = " OR ".join(f"({STATUS_SQL[status]})" for status in statuses)
+
+    query = f"""
         WITH company_rows_with_raw_time AS (
             SELECT
                 details.match_id,
@@ -239,10 +294,11 @@ def fetch_company_47_suspensions(
             JOIN titan007_1x2_changes AS changes
               ON changes.match_id = details.match_id
              AND changes.company_id = 47
-            WHERE details.scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+            WHERE details.scheduled_time ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$'
               AND details.scheduled_time::TIMESTAMP >= (%s::DATE - INTERVAL '3 hours')
               AND details.scheduled_time::TIMESTAMP < (%s::DATE + INTERVAL '1 day')
-              AND changes.change_time ~ '^\\d{1,2}-\\d{1,2} \\d{1,2}:\\d{2}$'
+              AND ({status_filter_sql})
+              AND changes.change_time ~ '^\\d{{1,2}}-\\d{{1,2}} \\d{{1,2}}:\\d{{2}}$'
         ),
         company_rows AS (
             SELECT
@@ -295,7 +351,7 @@ def fetch_company_47_suspensions(
             WHERE COALESCE(next_row.change_at, suspension_runs.last_at)
                     - suspension_runs.start_at >= INTERVAL '3 minutes'
         )
-        SELECT
+        SELECT DISTINCT
             details.match_id,
             details.league,
             details.scheduled_time,
@@ -303,9 +359,11 @@ def fetch_company_47_suspensions(
             details.home_team,
             details.home_score,
             details.away_score,
-            details.away_team
+            details.away_team,
+            COALESCE(pb_status.status, '') AS pb_status
         FROM qualifying_runs
         JOIN match_details AS details USING (match_id)
+        LEFT JOIN match_web_pb_status AS pb_status USING (match_id)
         ORDER BY details.scheduled_time ASC, details.match_id ASC
     """
 
@@ -325,6 +383,7 @@ def fetch_company_47_suspensions(
             "home_score": row[5],
             "away_score": row[6],
             "away_team": row[7],
+            "pb_status": row[8],
         }
         for row in rows
     ]
@@ -415,6 +474,11 @@ class MatchWebApp:
                 raise ValueError("用户不存在")
             del self.users[username]
             self._save_users()
+
+    def set_pb_match_status(
+        self, match_id: int, status: str, updated_by: str
+    ) -> None:
+        set_pb_match_status(self.database_url, match_id, status, updated_by)
 
     def _save_users(self) -> None:
         if self.users_path is None:
@@ -566,6 +630,30 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_PUT(self) -> None:
+        pb_match_id = self.pb_status_api_match_id()
+        if pb_match_id is not None:
+            username = self.current_username()
+            if username is None:
+                self.send_json({"error": "未登录"}, HTTPStatus.UNAUTHORIZED)
+                return
+            payload = self.read_json()
+            if payload is None:
+                return
+            try:
+                self.server.app.set_pb_match_status(
+                    pb_match_id, str(payload.get("status", "")), username
+                )
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except psycopg2.Error:
+                self.send_json(
+                    {"error": "暂时无法保存 PB 状态"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self.send_json({"match_id": pb_match_id, "status": payload["status"]})
+            return
         username = self.user_api_username()
         if username is None:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -605,6 +693,17 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             return None
         username = unquote(parsed.path[len(prefix):])
         return username if username and "/" not in username else None
+
+    def pb_status_api_match_id(self) -> Optional[int]:
+        parsed = urlparse(self.path)
+        prefix = "/api/company-47-suspensions/"
+        suffix = "/status"
+        if not parsed.path.startswith(prefix) or not parsed.path.endswith(suffix):
+            return None
+        value = parsed.path[len(prefix):-len(suffix)]
+        if not value.isdigit():
+            return None
+        return int(value)
 
     def read_json(self) -> Optional[Dict[str, object]]:
         if self.headers.get_content_type() != "application/json":
@@ -655,9 +754,10 @@ class MatchWebHandler(BaseHTTPRequestHandler):
     def handle_company_47_suspensions(self, query: str) -> None:
         params = parse_qs(query)
         match_date = params.get("date", [today_in_shanghai()])[0]
+        statuses = params.get("status", list(DEFAULT_STATUSES))
         try:
             matches = fetch_company_47_suspensions(
-                self.server.app.database_url, match_date
+                self.server.app.database_url, match_date, statuses
             )
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -668,6 +768,7 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         self.send_json(
             {
                 "date": match_date,
+                "statuses": statuses,
                 "minimum_duration_minutes": 3,
                 "company_id": 47,
                 "market": "胜平负",
@@ -794,6 +895,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if not users:
         print("请先运行 python3 MatchWeb/manage_users.py add <账号> 创建账号。", file=sys.stderr)
+        return 2
+    try:
+        ensure_pb_status_table(database_url)
+    except psycopg2.Error:
+        print("无法初始化 PB 状态表。", file=sys.stderr)
         return 2
     secret_text = os.environ.get("MATCH_WEB_SESSION_SECRET", "")
     secret = secret_text.encode("utf-8") if secret_text else secrets.token_bytes(32)

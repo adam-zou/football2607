@@ -21,11 +21,68 @@ function text(value) {
   return value === null || value === undefined || value === '' ? '—' : String(value);
 }
 
+function selectedStatuses() {
+  return Array.from(document.querySelectorAll('input[name="status"]:checked'), ({ value }) => value);
+}
+
 function statusClass(status) {
   if (status === '完') return 'finished';
   if (status === '未开始') return 'pending';
   if (['推迟', '取消', '待定'].includes(status)) return 'other';
   return 'live';
+}
+
+function applyPBStatus(row, buttons, status) {
+  row.classList.toggle('pb-followed', status === '关注');
+  row.classList.toggle('pb-invalid', status === '作废');
+  for (const button of buttons) {
+    button.setAttribute('aria-pressed', String(button.dataset.status === status));
+  }
+}
+
+async function savePBStatus(match, row, buttons, status) {
+  buttons.forEach((button) => { button.disabled = true; });
+  errorState.hidden = true;
+  try {
+    const response = await fetch(
+      `/api/company-47-suspensions/${encodeURIComponent(match.match_id)}/status`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      },
+    );
+    if (response.status === 401) {
+      location.href = '/login';
+      return;
+    }
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '保存失败');
+    match.pb_status = payload.status;
+    applyPBStatus(row, buttons, payload.status);
+  } catch (error) {
+    errorState.hidden = false;
+    errorState.textContent = error.message || '保存 PB 状态失败';
+  } finally {
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+function createActions(match, row) {
+  const actions = document.createElement('div');
+  actions.className = 'pb-actions';
+  const buttons = ['关注', '作废'].map((status) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = status === '关注' ? 'pb-action follow' : 'pb-action invalid';
+    button.dataset.status = status;
+    button.textContent = status;
+    button.addEventListener('click', () => savePBStatus(match, row, buttons, status));
+    actions.append(button);
+    return button;
+  });
+  applyPBStatus(row, buttons, match.pb_status);
+  return actions;
 }
 
 function renderMatches(matches) {
@@ -46,6 +103,7 @@ function renderMatches(matches) {
       text(match.home_team),
       match.home_score == null || match.away_score == null ? '—' : `${match.home_score} : ${match.away_score}`,
       text(match.away_team),
+      createActions(match, row),
     ];
     cells.forEach((content, index) => {
       const cell = document.createElement('td');
@@ -66,6 +124,7 @@ async function loadMatches() {
   errorState.hidden = true;
   try {
     const params = new URLSearchParams({ date: dateInput.value });
+    selectedStatuses().forEach((status) => params.append('status', status));
     const response = await fetch(`/api/company-47-suspensions?${params}`, { cache: 'no-store' });
     if (response.status === 401) {
       location.href = '/login';
@@ -75,7 +134,7 @@ async function loadMatches() {
     if (!response.ok) throw new Error(payload.error || '读取失败');
     renderMatches(payload.matches);
     emptyState.hidden = payload.matches.length !== 0;
-    resultSummary.textContent = `${payload.date} · 共 ${payload.total} 场`;
+    resultSummary.textContent = `${payload.date} · ${payload.statuses.join('、')} · 共 ${payload.total} 场`;
     updatedAt.textContent = `更新于 ${new Date(payload.refreshed_at).toLocaleTimeString('zh-CN', { hour12: false })}`;
     refreshState.textContent = '每 60 秒自动刷新';
   } catch (error) {
@@ -94,4 +153,8 @@ async function loadMatches() {
 dateInput.value = localDateValue();
 queryButton.addEventListener('click', loadMatches);
 dateInput.addEventListener('change', loadMatches);
+document.querySelectorAll('input[name="status"]').forEach((input) => input.addEventListener('change', () => {
+  if (selectedStatuses().length === 0) input.checked = true;
+  loadMatches();
+}));
 loadMatches();
