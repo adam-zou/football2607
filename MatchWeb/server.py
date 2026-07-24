@@ -513,7 +513,7 @@ class MatchWebApp:
     def create_session(self, username: str) -> str:
         expires_at = datetime.now(SHANGHAI) + SESSION_LIFETIME
         session_id = secrets.token_urlsafe(32)
-        if username != ADMIN_USERNAME:
+        if is_pb_only_username(username):
             self._replace_active_session(username, session_id, expires_at)
         payload = json.dumps(
             {
@@ -543,7 +543,7 @@ class MatchWebApp:
                 and int(payload.get("expires", 0))
                 > int(datetime.now(SHANGHAI).timestamp())
             ):
-                if username != ADMIN_USERNAME:
+                if is_pb_only_username(str(username)):
                     session_id = payload.get("session_id")
                     if not isinstance(session_id, str) or not self._active_session_matches(
                         str(username), session_id
@@ -607,7 +607,7 @@ class MatchWebApp:
         return active_session_matches(self.database_url, username, session_id)
 
     def revoke_active_session(self, username: str) -> None:
-        if username != ADMIN_USERNAME:
+        if is_pb_only_username(username):
             delete_active_session(self.database_url, username)
 
     def _save_users(self) -> None:

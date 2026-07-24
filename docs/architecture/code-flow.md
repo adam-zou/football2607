@@ -67,7 +67,7 @@ flowchart LR
     SimpleOddsRows --> MatchWeb
     MatchWeb -->|"关注 / 作废"| PBStatus
     PBStatus --> MatchWeb
-    MatchWeb -->|"普通账号登录 / 退出"| UserSession
+    MatchWeb -->|"PB 专用账号登录 / 退出"| UserSession
     UserSession -->|"每次请求校验"| MatchWeb
     OddsFilterViews --> SimpleWeCom
     SimpleMatchDetails --> SimpleWeCom
@@ -153,13 +153,15 @@ status action writes.
 All HTML and JSON match routes require a server-validated, HMAC-signed login
 session. Multiple local accounts are stored in a separately managed JSON file;
 passwords use salted PBKDF2-SHA256 hashes and are never stored as plaintext.
-Every non-`admin` login generates a fresh random session ID and atomically replaces
-that username's row in `match_web_user_session`; only its SHA-256 hash is stored.
-Authenticated requests must match that current hash and its database expiry in
+Every username containing `user`, compared case-insensitively, generates a fresh
+random session ID on login and atomically replaces that username's row in
+`match_web_user_session`; only its SHA-256 hash is stored. Authenticated requests for
+those PB-only accounts must match that current hash and its database expiry in
 addition to passing the signed-Cookie checks. Consequently a new login immediately
-invalidates the same ordinary account's older device sessions. Logout deletes the
-registry row. `admin` deliberately bypasses this registry and may retain multiple
-valid signed sessions. A registry database failure fails closed for ordinary users.
+invalidates the same PB account's older device sessions, and logout deletes the row.
+`001`, other usernames without `user`, and `admin` bypass the registry and may retain
+multiple valid signed sessions. A registry database failure fails closed only for
+the accounts governed by it.
 Authenticated usernames containing `user`, compared case-insensitively, are PB-only
 accounts. Their successful login redirects to `/company-47-suspensions`; the server
 allows only that page, its script, list/status endpoints, shared public styling,
