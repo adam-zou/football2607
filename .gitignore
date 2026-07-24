@@ -5,3 +5,6 @@
 /titan007_match_status_snapshot.tsv
 *.egg-info/
 .DS_Store
+__pycache__/
+*.py[cod]
+*.lnk
