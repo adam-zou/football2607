@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import html
 import json
 import math
 import os
@@ -270,41 +269,47 @@ def format_line_value(value: Optional[Decimal]) -> str:
     return format(value, "f").rstrip("0").rstrip(".") or "0"
 
 
+def plain_text(value: object) -> str:
+    text = " ".join(str(value).split())
+    clean = text.translate(str.maketrans("", "", "#*[]`>"))
+    return " ".join(clean.split())
+
+
 def build_message(records: Sequence[PushRecord]) -> str:
     if not records:
         raise ValueError("推送消息至少需要一个市场")
     match = records[0]
-    matchup = f"{html.escape(match.home_team)} vs {html.escape(match.away_team)}"
+    matchup = f"{plain_text(match.home_team)} - {plain_text(match.away_team)}"
     lines = [
-        "### 赔率筛选命中",
-        f"> 联赛：{html.escape(match.league or '—')}",
-        f"> 对阵：{matchup}",
-        f"> 开赛时间：{html.escape(match.scheduled_time)}",
-        f"> 比赛 ID：{match.match_id}",
+        "赔率筛选命中",
+        f"联赛: {plain_text(match.league or '-')}",
+        f"对阵: {matchup}",
+        f"开赛时间: {plain_text(match.scheduled_time)}",
+        f"比赛ID: {match.match_id}",
         "",
-        "**命中市场**",
+        "命中市场",
     ]
     for record in records:
         lines.append(
-            f"> {MARKET_LABELS[record.market_type]}："
-            f"{record.company_count} 家，最大盘口 "
+            f"{MARKET_LABELS[record.market_type]}: "
+            f"{record.company_count} 家, 最大盘口 "
             f"{format_line_value(record.line_value)}"
         )
     link = (
         "https://live.nowscore.com/odds/3in1Odds.aspx?companyid=3"
         f"&id={match.match_id}"
     )
-    lines.extend(("", f"[查看赔率]({link})"))
+    lines.extend(("", "赔率链接", link))
     return "\n".join(lines)
 
 
-def send_wecom_markdown(
+def send_wecom_text(
     webhook_url: str,
     content: str,
     timeout_seconds: float,
 ) -> None:
     payload = json.dumps(
-        {"msgtype": "markdown", "markdown": {"content": content}},
+        {"msgtype": "text", "text": {"content": content}},
         ensure_ascii=False,
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -404,7 +409,7 @@ def run_once(
         for match_id, records in grouped.items():
             market_types = [record.market_type for record in records]
             try:
-                send_wecom_markdown(
+                send_wecom_text(
                     webhook_url,
                     build_message(records),
                     timeout_seconds,

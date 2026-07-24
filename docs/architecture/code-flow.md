@@ -134,9 +134,12 @@ the timestamps of its own consecutive suspension rows already prove a duration o
 at least three minutes. This prevents a lone latest suspension marker from being
 treated as a known-duration interval. The API uses those runs only as a predicate
 and returns each qualifying match once even when several runs qualify. The page
-uses the primary list's date and multi-status filters, including its default
-`未开始` plus `进行中` selection, and shows the same basic match columns without
-suspension details. Its final column exposes mutually exclusive `关注` and `作废`
+uses a date filter plus two presentation status options: `赛前预警` maps to
+`未开始` and `滚球预警` maps to the in-progress status group; both are selected by
+default and no finished/other option is accepted by the PB API. The rightmost
+detail marker reuses the primary list's tooltip styling and exposes the match's
+deduplicated suspension `change_time` values, without duration or `seq`. The action
+column exposes mutually exclusive `关注` and `作废`
 actions. MatchWeb creates `match_web_pb_status` at startup and upserts one shared
 status per match together with the acting username and update time. The list joins
 that state on refresh: followed rows render red and invalid rows render gray. The
@@ -210,7 +213,7 @@ normal polling or concurrent discovery from enqueuing the same market twice. A
 PostgreSQL advisory session lock also prevents two notification processes from
 delivering concurrently.
 
-Pending and failed markets for the same match are combined into one Markdown
+Pending and failed markets for the same match are combined into one plain-text
 message containing league, teams, kickoff time, company count, maximum line, and a
 company-3 Nowscore link. A confirmed webhook `errcode = 0` changes every included
 market to `sent`; a rejected or failed request changes it to `failed` for the next

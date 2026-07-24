@@ -13,7 +13,7 @@ from push_wecom_matches import (
     build_message,
     format_line_value,
     group_deliveries,
-    send_wecom_markdown,
+    send_wecom_text,
     validate_webhook_url,
 )
 
@@ -76,10 +76,30 @@ class MessageTests(unittest.TestCase):
         )
 
         self.assertIn("测试联赛", message)
-        self.assertIn("主队 vs 客队", message)
-        self.assertIn("大小球（大球）：3 家，最大盘口 2.5", message)
+        self.assertIn("主队 - 客队", message)
+        self.assertIn("大小球（大球）: 3 家, 最大盘口 2.5", message)
         self.assertIn("让球盘（主队）", message)
         self.assertIn("companyid=3&id=123", message)
+        self.assertNotIn("###", message)
+        self.assertNotIn("**", message)
+        self.assertNotIn("> ", message)
+        self.assertNotIn("[查看赔率]", message)
+
+    def test_removes_markdown_control_characters_from_match_text(self):
+        dirty = PushRecord(
+            **{
+                **record().__dict__,
+                "league": "#联赛*",
+                "home_team": "[主队]\n>",
+            }
+        )
+
+        message = build_message([dirty])
+
+        self.assertIn("联赛", message)
+        self.assertIn("主队 - 客队", message)
+        for marker in "#*[]`>":
+            self.assertNotIn(marker, message)
 
     def test_formats_zero_and_missing_lines(self):
         self.assertEqual(format_line_value(Decimal("0.00")), "0")
@@ -92,15 +112,15 @@ class WebhookTests(unittest.TestCase):
             validate_webhook_url("http://example.test/hook")
 
     @mock.patch("push_wecom_matches.urllib.request.urlopen")
-    def test_sends_markdown_and_accepts_confirmed_success(self, urlopen):
+    def test_sends_plain_text_and_accepts_confirmed_success(self, urlopen):
         urlopen.return_value = response_context({"errcode": 0, "errmsg": "ok"})
 
-        send_wecom_markdown("https://example.test/hook", "消息", 3.0)
+        send_wecom_text("https://example.test/hook", "消息", 3.0)
 
         request = urlopen.call_args.args[0]
         payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(payload["msgtype"], "markdown")
-        self.assertEqual(payload["markdown"]["content"], "消息")
+        self.assertEqual(payload["msgtype"], "text")
+        self.assertEqual(payload["text"]["content"], "消息")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 3.0)
 
     @mock.patch("push_wecom_matches.urllib.request.urlopen")
@@ -110,7 +130,7 @@ class WebhookTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(WeComDeliveryError, "93000"):
-            send_wecom_markdown("https://example.test/hook", "消息", 3.0)
+            send_wecom_text("https://example.test/hook", "消息", 3.0)
 
 
 if __name__ == "__main__":
