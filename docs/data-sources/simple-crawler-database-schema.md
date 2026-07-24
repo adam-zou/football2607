@@ -8,6 +8,7 @@
 主要代码来源：
 
 - `SimpleCrawler/fetch_match_ids.py`
+- `SimpleCrawler/fetch_archive_match_ids.py`
 - `SimpleCrawler/fetch_match_details.py`
 - `SimpleCrawler/odds_collection.py`
 - `SimpleCrawler/odds_market_state.py`
