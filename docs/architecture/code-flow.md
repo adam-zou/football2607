@@ -141,7 +141,8 @@ uses a date filter plus two presentation status options: `赛前预警` maps to
 `未开始` and `滚球预警` maps to the in-progress status group; both are selected by
 default and no finished/other option is accepted by the PB API. The rightmost
 detail marker reuses the primary list's tooltip styling and exposes the match's
-deduplicated suspension `change_time` values, without duration or `seq`. The action
+deduplicated suspension `change_time` plus `match_minute` values, rendering a missing
+minute as `-`, without duration or `seq`. The action
 column exposes mutually exclusive `关注` and `作废`
 actions. MatchWeb creates `match_web_pb_status` at startup and upserts one shared
 status per match together with the acting username and update time. The list joins

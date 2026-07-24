@@ -349,6 +349,7 @@ def fetch_company_47_suspensions(
                 details.away_score,
                 details.away_team,
                 changes.seq,
+                changes.match_minute,
                 changes.change_time,
                 changes.source_status,
                 changes.is_suspended,
@@ -426,18 +427,25 @@ def fetch_company_47_suspensions(
         suspension_time_points AS (
             SELECT
                 distinct_time_points.match_id,
-                ARRAY_AGG(
-                    distinct_time_points.change_time
+                JSONB_AGG(
+                    JSONB_BUILD_OBJECT(
+                        'change_time', distinct_time_points.change_time,
+                        'match_minute', distinct_time_points.match_minute
+                    )
                     ORDER BY distinct_time_points.first_seq
-                ) AS change_times
+                ) AS points
             FROM (
                 SELECT
                     suspended_rows.match_id,
                     suspended_rows.change_time,
+                    suspended_rows.match_minute,
                     MIN(suspended_rows.seq) AS first_seq
                 FROM suspended_rows
                 JOIN qualifying_match_ids USING (match_id)
-                GROUP BY suspended_rows.match_id, suspended_rows.change_time
+                GROUP BY
+                    suspended_rows.match_id,
+                    suspended_rows.change_time,
+                    suspended_rows.match_minute
             ) AS distinct_time_points
             GROUP BY distinct_time_points.match_id
         )
@@ -451,7 +459,7 @@ def fetch_company_47_suspensions(
             details.away_score,
             details.away_team,
             COALESCE(pb_status.status, '') AS pb_status,
-            suspension_time_points.change_times
+            suspension_time_points.points
         FROM qualifying_match_ids
         JOIN match_details AS details USING (match_id)
         LEFT JOIN match_web_pb_status AS pb_status USING (match_id)
@@ -476,7 +484,7 @@ def fetch_company_47_suspensions(
             "away_score": row[6],
             "away_team": row[7],
             "pb_status": row[8],
-            "suspension_times": row[9],
+            "suspension_points": row[9],
         }
         for row in rows
     ]

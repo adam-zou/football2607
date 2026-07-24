@@ -223,7 +223,10 @@ class MatchWebAppTests(unittest.TestCase):
                 1,
                 "客队",
                 "关注",
-                ["07-17 20:15", "07-17 20:18"],
+                [
+                    {"change_time": "07-17 20:15", "match_minute": 42},
+                    {"change_time": "07-17 20:18", "match_minute": None},
+                ],
             )
         ]
         cursor_context = MagicMock()
@@ -255,8 +258,11 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertNotIn("suspension_periods", matches[0])
         self.assertEqual(matches[0]["pb_status"], "关注")
         self.assertEqual(
-            matches[0]["suspension_times"],
-            ["07-17 20:15", "07-17 20:18"],
+            matches[0]["suspension_points"],
+            [
+                {"change_time": "07-17 20:15", "match_minute": 42},
+                {"change_time": "07-17 20:18", "match_minute": None},
+            ],
         )
 
     def test_fetch_company_47_suspensions_combines_status_groups(self):
@@ -686,7 +692,8 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("/api/company-47-suspensions", suspension_script)
         self.assertIn("companyid=47", suspension_script)
         self.assertNotIn("suspension_periods", suspension_script)
-        self.assertIn("suspension_times", suspension_script)
+        self.assertIn("suspension_points", suspension_script)
+        self.assertIn("比赛分钟", suspension_script)
         self.assertIn("赛前预警", suspension_script)
         self.assertIn("滚球预警", suspension_script)
         self.assertIn("60_000", suspension_script)
