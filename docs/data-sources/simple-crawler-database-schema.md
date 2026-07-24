@@ -34,7 +34,7 @@
 | `wecom_match_market_push_state` | 保存企业微信通知首次基线是否已建立 | `state_key` |
 | `wecom_match_market_pushes` | 保存每个比赛市场的通知去重、快照和发送状态 | `(match_id, market_type)` |
 | `match_web_pb_status` | 保存 PB 页面每场比赛的共享关注/作废状态 | `match_id` |
-| `match_web_user_session` | 保存普通账号当前唯一有效会话的哈希 | `username` |
+| `match_web_user_session` | 保存 PB 专用账号当前唯一有效会话的哈希 | `username` |
 
 仓库还提供三个不存储数据的可选 PostgreSQL 视图：
 
@@ -274,9 +274,10 @@
 
 ### 10.2 `match_web_user_session`
 
-该表由 `MatchWeb/server.py` 在服务启动时创建，用于限制非 `admin` 账号只能保留一个
-有效会话。新登录会覆盖同一用户名的旧记录，因此旧设备的签名 Cookie 随即失效；
-退出登录会删除当前用户名的记录。`admin` 不写入该表，可以同时保留多个会话。
+该表由 `MatchWeb/server.py` 在服务启动时创建，只用于限制用户名中包含 `user`（不区分
+大小写）的 PB 账号保留一个有效会话。新登录会覆盖同一用户名的旧记录，因此旧设备的
+签名 Cookie 随即失效；退出登录会删除当前用户名的记录。`001`、其他不含 `user` 的
+普通账号和 `admin` 不写入该表，可以同时保留多个会话。
 
 | 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
 | --- | --- | :---: | --- | --- | --- |
@@ -285,8 +286,8 @@
 | `expires_at` | `TIMESTAMPTZ` | 否 | 无 |  | 当前会话到期时间 |
 | `updated_at` | `TIMESTAMPTZ` | 否 | `NOW()` |  | 最近一次登录替换会话的时间 |
 
-每次普通账号请求都同时校验 HMAC 签名 Cookie、Cookie 到期时间以及该表中的会话哈希
-和数据库到期时间。数据库不可用时校验失败，不会降级为仅信任 Cookie。
+每次受单会话限制的 PB 账号请求都同时校验 HMAC 签名 Cookie、Cookie 到期时间以及
+该表中的会话哈希和数据库到期时间。数据库不可用时校验失败，不会降级为仅信任 Cookie。
 
 ### 10.3 企业微信通知状态表
 

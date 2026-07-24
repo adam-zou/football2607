@@ -47,7 +47,7 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertTrue(self.app.valid_session(token))
         self.assertFalse(self.app.valid_session(token + "x"))
 
-    def test_new_non_admin_login_replaces_previous_session(self):
+    def test_new_user_named_login_replaces_previous_session(self):
         active_sessions = {}
         server.MatchWebApp._replace_active_session.side_effect = (
             lambda username, session_id, _expires_at: active_sessions.__setitem__(
@@ -57,8 +57,13 @@ class MatchWebAppTests(unittest.TestCase):
         server.MatchWebApp._active_session_matches.side_effect = (
             lambda username, session_id: active_sessions.get(username) == session_id
         )
-        first = self.app.create_session("adam")
-        second = self.app.create_session("adam")
+        app = server.MatchWebApp(
+            "postgresql://test",
+            {"matchuser": hash_password("user-secret")},
+            b"key",
+        )
+        first = app.create_session("matchuser")
+        second = app.create_session("matchuser")
 
         first_session_id = json.loads(
             base64.urlsafe_b64decode(first.split(".", 1)[0] + "==")
@@ -71,16 +76,25 @@ class MatchWebAppTests(unittest.TestCase):
             server.MatchWebApp._replace_active_session.call_count,
             2,
         )
-        self.assertFalse(self.app.valid_session(first))
-        self.assertTrue(self.app.valid_session(second))
+        self.assertFalse(app.valid_session(first))
+        self.assertTrue(app.valid_session(second))
 
-    def test_admin_sessions_do_not_use_single_session_registry(self):
+    def test_non_user_named_accounts_do_not_use_single_session_registry(self):
         app = server.MatchWebApp(
-            "postgresql://test", {"admin": hash_password("admin-secret")}, b"key"
+            "postgresql://test",
+            {
+                "001": hash_password("account-secret"),
+                "admin": hash_password("admin-secret"),
+            },
+            b"key",
         )
-        token = app.create_session("admin")
+        first_001 = app.create_session("001")
+        second_001 = app.create_session("001")
+        admin_token = app.create_session("admin")
 
-        self.assertTrue(app.valid_session(token))
+        self.assertTrue(app.valid_session(first_001))
+        self.assertTrue(app.valid_session(second_001))
+        self.assertTrue(app.valid_session(admin_token))
         server.MatchWebApp._replace_active_session.assert_not_called()
 
     def test_validate_date(self):
