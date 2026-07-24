@@ -171,6 +171,7 @@ class MatchWebAppTests(unittest.TestCase):
                 1,
                 "客队",
                 "关注",
+                ["07-17 20:15", "07-17 20:18"],
             )
         ]
         cursor_context = MagicMock()
@@ -201,6 +202,10 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertEqual(matches[0]["match_id"], 3020831)
         self.assertNotIn("suspension_periods", matches[0])
         self.assertEqual(matches[0]["pb_status"], "关注")
+        self.assertEqual(
+            matches[0]["suspension_times"],
+            ["07-17 20:15", "07-17 20:18"],
+        )
 
     def test_fetch_company_47_suspensions_combines_status_groups(self):
         cursor = MagicMock()
@@ -214,13 +219,20 @@ class MatchWebAppTests(unittest.TestCase):
 
         with patch.object(server.psycopg2, "connect", return_value=connection_context):
             server.fetch_company_47_suspensions(
-                "postgresql://test", "2026-07-17", ["未开始", "完"]
+                "postgresql://test", "2026-07-17", ["未开始", "进行中"]
             )
 
         query = cursor.execute.call_args.args[0]
         self.assertIn("details.status_text = '未开始'", query)
-        self.assertIn("details.status_text = '完'", query)
+        self.assertIn("details.status_text IN ('上', '中', '下'", query)
         self.assertIn("SELECT DISTINCT", query)
+
+        with patch.object(server.psycopg2, "connect") as connect:
+            with self.assertRaisesRegex(ValueError, "状态无效"):
+                server.fetch_company_47_suspensions(
+                    "postgresql://test", "2026-07-17", ["完"]
+                )
+            connect.assert_not_called()
 
     def test_ensure_pb_status_table_creates_matchweb_owned_table(self):
         cursor = MagicMock()
@@ -584,6 +596,9 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("/api/company-47-suspensions", suspension_script)
         self.assertIn("companyid=47", suspension_script)
         self.assertNotIn("suspension_periods", suspension_script)
+        self.assertIn("suspension_times", suspension_script)
+        self.assertIn("赛前预警", suspension_script)
+        self.assertIn("滚球预警", suspension_script)
         self.assertIn("60_000", suspension_script)
 
     def test_password_hash_is_salted_and_verifiable(self):

@@ -85,6 +85,26 @@ function createActions(match, row) {
   return actions;
 }
 
+function createSuspensionMarker(times) {
+  if (!Array.isArray(times) || times.length === 0) return '—';
+  const marker = document.createElement('span');
+  marker.className = 'filter-marker';
+  marker.tabIndex = 0;
+  marker.textContent = '详情';
+  marker.setAttribute('aria-label', `封盘时间点 ${times.length} 条，聚焦后查看详情`);
+
+  const tooltip = document.createElement('span');
+  tooltip.className = 'filter-tooltip';
+  tooltip.setAttribute('role', 'tooltip');
+  for (const changeTime of times) {
+    const line = document.createElement('span');
+    line.textContent = changeTime;
+    tooltip.append(line);
+  }
+  marker.append(tooltip);
+  return marker;
+}
+
 function renderMatches(matches) {
   rows.replaceChildren();
   for (const match of matches) {
@@ -103,6 +123,7 @@ function renderMatches(matches) {
       text(match.home_team),
       match.home_score == null || match.away_score == null ? '—' : `${match.home_score} : ${match.away_score}`,
       text(match.away_team),
+      createSuspensionMarker(match.suspension_times),
       createActions(match, row),
     ];
     cells.forEach((content, index) => {
@@ -134,7 +155,8 @@ async function loadMatches() {
     if (!response.ok) throw new Error(payload.error || '读取失败');
     renderMatches(payload.matches);
     emptyState.hidden = payload.matches.length !== 0;
-    resultSummary.textContent = `${payload.date} · ${payload.statuses.join('、')} · 共 ${payload.total} 场`;
+    const statusLabels = payload.statuses.map((status) => status === '未开始' ? '赛前预警' : '滚球预警');
+    resultSummary.textContent = `${payload.date} · ${statusLabels.join('、')} · 共 ${payload.total} 场`;
     updatedAt.textContent = `更新于 ${new Date(payload.refreshed_at).toLocaleTimeString('zh-CN', { hour12: false })}`;
     refreshState.textContent = '每 60 秒自动刷新';
   } catch (error) {

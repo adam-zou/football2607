@@ -44,6 +44,7 @@ SESSION_COOKIE = "match_web_session"
 SESSION_LIFETIME = timedelta(hours=12)
 ALLOWED_STATUSES = {"未开始", "进行中", "完", "其它"}
 DEFAULT_STATUSES = ("未开始", "进行中")
+PB_ALLOWED_STATUSES = set(DEFAULT_STATUSES)
 ADMIN_USERNAME = "admin"
 DEFAULT_MONITOR_URL = "http://127.0.0.1:8081"
 MONITOR_TIMEOUT_SECONDS = 2
@@ -265,7 +266,7 @@ def fetch_company_47_suspensions(
     if isinstance(statuses, str):
         statuses = [statuses]
     statuses = list(dict.fromkeys(statuses))
-    if not statuses or any(status not in ALLOWED_STATUSES for status in statuses):
+    if not statuses or any(status not in PB_ALLOWED_STATUSES for status in statuses):
         raise ValueError("比赛状态无效")
     status_filter_sql = " OR ".join(f"({STATUS_SQL[status]})" for status in statuses)
 
@@ -350,8 +351,30 @@ def fetch_company_47_suspensions(
              AND next_row.seq = suspension_runs.end_seq + 1
             WHERE COALESCE(next_row.change_at, suspension_runs.last_at)
                     - suspension_runs.start_at >= INTERVAL '3 minutes'
+        ),
+        qualifying_match_ids AS (
+            SELECT DISTINCT match_id
+            FROM qualifying_runs
+        ),
+        suspension_time_points AS (
+            SELECT
+                distinct_time_points.match_id,
+                ARRAY_AGG(
+                    distinct_time_points.change_time
+                    ORDER BY distinct_time_points.first_seq
+                ) AS change_times
+            FROM (
+                SELECT
+                    suspended_rows.match_id,
+                    suspended_rows.change_time,
+                    MIN(suspended_rows.seq) AS first_seq
+                FROM suspended_rows
+                JOIN qualifying_match_ids USING (match_id)
+                GROUP BY suspended_rows.match_id, suspended_rows.change_time
+            ) AS distinct_time_points
+            GROUP BY distinct_time_points.match_id
         )
-        SELECT DISTINCT
+        SELECT
             details.match_id,
             details.league,
             details.scheduled_time,
@@ -360,10 +383,12 @@ def fetch_company_47_suspensions(
             details.home_score,
             details.away_score,
             details.away_team,
-            COALESCE(pb_status.status, '') AS pb_status
-        FROM qualifying_runs
+            COALESCE(pb_status.status, '') AS pb_status,
+            suspension_time_points.change_times
+        FROM qualifying_match_ids
         JOIN match_details AS details USING (match_id)
         LEFT JOIN match_web_pb_status AS pb_status USING (match_id)
+        JOIN suspension_time_points USING (match_id)
         ORDER BY details.scheduled_time ASC, details.match_id ASC
     """
 
@@ -384,6 +409,7 @@ def fetch_company_47_suspensions(
             "away_score": row[6],
             "away_team": row[7],
             "pb_status": row[8],
+            "suspension_times": row[9],
         }
         for row in rows
     ]

@@ -40,6 +40,7 @@ a { color: var(--green); text-underline-offset: 3px; }
 .segmented { display: flex; padding: 3px; border: 1px solid #d5ddd7; border-radius: 10px; background: var(--wash); }
 .segmented input { position: absolute; opacity: 0; pointer-events: none; }
 .segmented label { min-width: 70px; padding: 8px 12px; border-radius: 7px; text-align: center; color: var(--muted); cursor: pointer; }
+.pb-status-filter .segmented label { min-width: 88px; }
 .segmented input:checked + label { color: var(--green-dark); background: white; box-shadow: 0 1px 4px rgba(22,36,28,.12); font-weight: 700; }
 .checkbox-filter { display: flex; align-items: center; gap: 8px; min-height: 42px; color: var(--ink); font-size: 14px; cursor: pointer; }
 .checkbox-filter input { width: 18px; height: 18px; margin: 0; accent-color: var(--green); }
