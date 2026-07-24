@@ -85,20 +85,23 @@ function createActions(match, row) {
   return actions;
 }
 
-function createSuspensionMarker(times) {
-  if (!Array.isArray(times) || times.length === 0) return '—';
+function createSuspensionMarker(points) {
+  if (!Array.isArray(points) || points.length === 0) return '—';
   const marker = document.createElement('span');
   marker.className = 'filter-marker';
   marker.tabIndex = 0;
   marker.textContent = '详情';
-  marker.setAttribute('aria-label', `封盘时间点 ${times.length} 条，聚焦后查看详情`);
+  marker.setAttribute('aria-label', `封盘时间点 ${points.length} 条，聚焦后查看详情`);
 
   const tooltip = document.createElement('span');
   tooltip.className = 'filter-tooltip';
   tooltip.setAttribute('role', 'tooltip');
-  for (const changeTime of times) {
+  for (const point of points) {
     const line = document.createElement('span');
-    line.textContent = changeTime;
+    const matchMinute = point.match_minute === null || point.match_minute === undefined
+      ? '-'
+      : point.match_minute;
+    line.textContent = `${point.change_time} · 比赛分钟：${matchMinute}`;
     tooltip.append(line);
   }
   marker.append(tooltip);
@@ -123,7 +126,7 @@ function renderMatches(matches) {
       text(match.home_team),
       match.home_score == null || match.away_score == null ? '—' : `${match.home_score} : ${match.away_score}`,
       text(match.away_team),
-      createSuspensionMarker(match.suspension_times),
+      createSuspensionMarker(match.suspension_points),
       createActions(match, row),
     ];
     cells.forEach((content, index) => {

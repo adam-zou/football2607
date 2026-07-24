@@ -1,3 +1,4 @@
+import base64
 import sys
 import tempfile
 import threading
@@ -17,6 +18,21 @@ from simple_crawler.monitoring import DashboardServer, RuntimeMonitor
 
 class MatchWebAppTests(unittest.TestCase):
     def setUp(self):
+        self.replace_session_patch = patch.object(
+            server.MatchWebApp, "_replace_active_session"
+        )
+        self.match_session_patch = patch.object(
+            server.MatchWebApp, "_active_session_matches", return_value=True
+        )
+        self.revoke_session_patch = patch.object(
+            server.MatchWebApp, "revoke_active_session"
+        )
+        self.replace_session_patch.start()
+        self.match_session_patch.start()
+        self.revoke_session_patch.start()
+        self.addCleanup(self.replace_session_patch.stop)
+        self.addCleanup(self.match_session_patch.stop)
+        self.addCleanup(self.revoke_session_patch.stop)
         self.app = server.MatchWebApp(
             "postgresql://test", {"adam": hash_password("secret-123")}, b"key"
         )
@@ -30,6 +46,42 @@ class MatchWebAppTests(unittest.TestCase):
         token = self.app.create_session("adam")
         self.assertTrue(self.app.valid_session(token))
         self.assertFalse(self.app.valid_session(token + "x"))
+
+    def test_new_non_admin_login_replaces_previous_session(self):
+        active_sessions = {}
+        server.MatchWebApp._replace_active_session.side_effect = (
+            lambda username, session_id, _expires_at: active_sessions.__setitem__(
+                username, session_id
+            )
+        )
+        server.MatchWebApp._active_session_matches.side_effect = (
+            lambda username, session_id: active_sessions.get(username) == session_id
+        )
+        first = self.app.create_session("adam")
+        second = self.app.create_session("adam")
+
+        first_session_id = json.loads(
+            base64.urlsafe_b64decode(first.split(".", 1)[0] + "==")
+        )["session_id"]
+        second_session_id = json.loads(
+            base64.urlsafe_b64decode(second.split(".", 1)[0] + "==")
+        )["session_id"]
+        self.assertNotEqual(first_session_id, second_session_id)
+        self.assertEqual(
+            server.MatchWebApp._replace_active_session.call_count,
+            2,
+        )
+        self.assertFalse(self.app.valid_session(first))
+        self.assertTrue(self.app.valid_session(second))
+
+    def test_admin_sessions_do_not_use_single_session_registry(self):
+        app = server.MatchWebApp(
+            "postgresql://test", {"admin": hash_password("admin-secret")}, b"key"
+        )
+        token = app.create_session("admin")
+
+        self.assertTrue(app.valid_session(token))
+        server.MatchWebApp._replace_active_session.assert_not_called()
 
     def test_validate_date(self):
         self.assertEqual(server.validate_date("2026-07-17"), "2026-07-17")
@@ -171,7 +223,10 @@ class MatchWebAppTests(unittest.TestCase):
                 1,
                 "客队",
                 "关注",
-                ["07-17 20:15", "07-17 20:18"],
+                [
+                    {"change_time": "07-17 20:15", "match_minute": 42},
+                    {"change_time": "07-17 20:18", "match_minute": None},
+                ],
             )
         ]
         cursor_context = MagicMock()
@@ -203,8 +258,11 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertNotIn("suspension_periods", matches[0])
         self.assertEqual(matches[0]["pb_status"], "关注")
         self.assertEqual(
-            matches[0]["suspension_times"],
-            ["07-17 20:15", "07-17 20:18"],
+            matches[0]["suspension_points"],
+            [
+                {"change_time": "07-17 20:15", "match_minute": 42},
+                {"change_time": "07-17 20:18", "match_minute": None},
+            ],
         )
 
     def test_fetch_company_47_suspensions_combines_status_groups(self):
@@ -249,6 +307,44 @@ class MatchWebAppTests(unittest.TestCase):
         query = cursor.execute.call_args.args[0]
         self.assertIn("CREATE TABLE IF NOT EXISTS match_web_pb_status", query)
         self.assertIn("status IN ('关注', '作废')", query)
+
+    def test_single_session_registry_hashes_and_checks_session_id(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (True,)
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        expires_at = server.datetime.now(server.SHANGHAI) + server.SESSION_LIFETIME
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.ensure_user_session_table("postgresql://test")
+            create_query = cursor.execute.call_args.args[0]
+            self.assertIn(
+                "CREATE TABLE IF NOT EXISTS match_web_user_session", create_query
+            )
+
+            server.replace_active_session(
+                "postgresql://test", "viewer", "raw-session-id", expires_at
+            )
+            replace_query, replace_params = cursor.execute.call_args.args
+            self.assertIn("ON CONFLICT (username) DO UPDATE", replace_query)
+            self.assertNotIn("raw-session-id", replace_params)
+            self.assertEqual(len(replace_params[1]), 64)
+
+            self.assertTrue(
+                server.active_session_matches(
+                    "postgresql://test", "viewer", "raw-session-id"
+                )
+            )
+            connection.set_session.assert_called_once_with(readonly=True)
+
+            server.delete_active_session("postgresql://test", "viewer")
+            delete_query, delete_params = cursor.execute.call_args.args
+            self.assertIn("DELETE FROM match_web_user_session", delete_query)
+            self.assertEqual(delete_params, ("viewer",))
 
     def test_set_pb_match_status_upserts_shared_status(self):
         cursor = MagicMock()
@@ -596,7 +692,8 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("/api/company-47-suspensions", suspension_script)
         self.assertIn("companyid=47", suspension_script)
         self.assertNotIn("suspension_periods", suspension_script)
-        self.assertIn("suspension_times", suspension_script)
+        self.assertIn("suspension_points", suspension_script)
+        self.assertIn("比赛分钟", suspension_script)
         self.assertIn("赛前预警", suspension_script)
         self.assertIn("滚球预警", suspension_script)
         self.assertIn("60_000", suspension_script)
