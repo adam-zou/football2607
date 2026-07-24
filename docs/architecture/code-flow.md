@@ -29,6 +29,7 @@ flowchart LR
     SimpleOddsRows[("SimpleCrawler database<br/>three Titan007 odds-change tables")]
     SimpleOddsState[("SimpleCrawler database<br/>titan007_odds_market_state")]
     PBStatus[("MatchWeb database state<br/>match_web_pb_status")]
+    UserSession[("MatchWeb database state<br/>match_web_user_session")]
     OddsFilterSql["SimpleCrawler/sql/create_odds_filter_views.sql"]
     OddsFilterViews[("Optional PostgreSQL views<br/>hits, match and market summaries")]
     WeComState[("SimpleCrawler database<br/>WeCom baseline and push ledger")]
@@ -66,6 +67,8 @@ flowchart LR
     SimpleOddsRows --> MatchWeb
     MatchWeb -->|"关注 / 作废"| PBStatus
     PBStatus --> MatchWeb
+    MatchWeb -->|"普通账号登录 / 退出"| UserSession
+    UserSession -->|"每次请求校验"| MatchWeb
     OddsFilterViews --> SimpleWeCom
     SimpleMatchDetails --> SimpleWeCom
     SimpleWeCom --> WeComState
@@ -88,7 +91,7 @@ flowchart LR
 | `python3 SimpleCrawler/check_match_completion.py` | `SimpleCrawler/check_match_completion.py:main` | Persist resumable 18-page final snapshots for matches whose finished detail has been stable for five minutes or whose kickoff is more than four hours old | Three odds-change tables, `titan007_odds_market_state`, and `match_ids.crawl_status` |
 | `python3 SimpleCrawler/push_wecom_matches.py` | `SimpleCrawler/push_wecom_matches.py:main` | Baseline existing qualifying markets, then notify newly qualifying not-started matches through a configured WeCom group webhook | `wecom_match_market_push_state` and `wecom_match_market_pushes`; external WeCom message side effect |
 | `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
-| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status`; crawler-owned tables remain read-only |
+| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status` and `match_web_user_session`; crawler-owned tables remain read-only |
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
 | `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, and market-summary views | Three `match_odds_filter_*` views |
 
@@ -102,8 +105,8 @@ windows. The Python entrypoints remain independently usable and retain ownership
 of their own validation, lifecycle, and shutdown behavior.
 
 `MatchWeb/server.py` is an independently started presentation service. Crawler-owned
-match and odds tables remain read-only to MatchWeb; the service owns only the
-`match_web_pb_status` table used by PB actions.
+match and odds tables remain read-only to MatchWeb; the service owns
+`match_web_pb_status` for PB actions and `match_web_user_session` for login control.
 It loads the same `SIMPLE_CRAWLER_DATABASE_URL` used by the crawler, accepts a
 Shanghai-calendar match date and one or more of four presentation status groups,
 then reads `match_details`. A selected match date covers scheduled times from 21:00
@@ -149,6 +152,13 @@ status action writes.
 All HTML and JSON match routes require a server-validated, HMAC-signed login
 session. Multiple local accounts are stored in a separately managed JSON file;
 passwords use salted PBKDF2-SHA256 hashes and are never stored as plaintext.
+Every non-`admin` login generates a fresh random session ID and atomically replaces
+that username's row in `match_web_user_session`; only its SHA-256 hash is stored.
+Authenticated requests must match that current hash and its database expiry in
+addition to passing the signed-Cookie checks. Consequently a new login immediately
+invalidates the same ordinary account's older device sessions. Logout deletes the
+registry row. `admin` deliberately bypasses this registry and may retain multiple
+valid signed sessions. A registry database failure fails closed for ordinary users.
 Authenticated usernames containing `user`, compared case-insensitively, are PB-only
 accounts. Their successful login redirects to `/company-47-suspensions`; the server
 allows only that page, its script, list/status endpoints, shared public styling,

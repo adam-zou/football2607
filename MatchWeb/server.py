@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS match_web_pb_status (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
+USER_SESSION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS match_web_user_session (
+    username TEXT PRIMARY KEY,
+    token_hash CHAR(64) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
 
 STATUS_SQL = {
     "未开始": "details.status_text = '未开始'",
@@ -109,6 +117,65 @@ def ensure_pb_status_table(database_url: str) -> None:
     with psycopg2.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(PB_STATUS_TABLE_SQL)
+
+
+def ensure_user_session_table(database_url: str) -> None:
+    """Create the MatchWeb-owned single-session registry when absent."""
+
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(USER_SESSION_TABLE_SQL)
+
+
+def replace_active_session(
+    database_url: str,
+    username: str,
+    session_id: str,
+    expires_at: datetime,
+) -> None:
+    token_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    query = """
+        INSERT INTO match_web_user_session (username, token_hash, expires_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (username) DO UPDATE SET
+            token_hash = EXCLUDED.token_hash,
+            expires_at = EXCLUDED.expires_at,
+            updated_at = NOW()
+    """
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query, (username, token_hash, expires_at))
+
+
+def active_session_matches(
+    database_url: str,
+    username: str,
+    session_id: str,
+) -> bool:
+    token_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    query = """
+        SELECT EXISTS (
+            SELECT 1
+            FROM match_web_user_session
+            WHERE username = %s
+              AND token_hash = %s
+              AND expires_at > NOW()
+        )
+    """
+    with psycopg2.connect(database_url) as connection:
+        connection.set_session(readonly=True)
+        with connection.cursor() as cursor:
+            cursor.execute(query, (username, token_hash))
+            return bool(cursor.fetchone()[0])
+
+
+def delete_active_session(database_url: str, username: str) -> None:
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM match_web_user_session WHERE username = %s",
+                (username,),
+            )
 
 
 def set_pb_match_status(
@@ -436,10 +503,15 @@ class MatchWebApp:
         return bool(password_hash and verify_password(password, password_hash))
 
     def create_session(self, username: str) -> str:
+        expires_at = datetime.now(SHANGHAI) + SESSION_LIFETIME
+        session_id = secrets.token_urlsafe(32)
+        if username != ADMIN_USERNAME:
+            self._replace_active_session(username, session_id, expires_at)
         payload = json.dumps(
             {
                 "username": username,
-                "expires": int((datetime.now(SHANGHAI) + SESSION_LIFETIME).timestamp()),
+                "expires": int(expires_at.timestamp()),
+                "session_id": session_id,
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -463,9 +535,21 @@ class MatchWebApp:
                 and int(payload.get("expires", 0))
                 > int(datetime.now(SHANGHAI).timestamp())
             ):
+                if username != ADMIN_USERNAME:
+                    session_id = payload.get("session_id")
+                    if not isinstance(session_id, str) or not self._active_session_matches(
+                        str(username), session_id
+                    ):
+                        return None
                 return str(username)
             return None
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            psycopg2.Error,
+        ):
             return None
 
     def valid_session(self, token: str) -> bool:
@@ -505,6 +589,18 @@ class MatchWebApp:
         self, match_id: int, status: str, updated_by: str
     ) -> None:
         set_pb_match_status(self.database_url, match_id, status, updated_by)
+
+    def _replace_active_session(
+        self, username: str, session_id: str, expires_at: datetime
+    ) -> None:
+        replace_active_session(self.database_url, username, session_id, expires_at)
+
+    def _active_session_matches(self, username: str, session_id: str) -> bool:
+        return active_session_matches(self.database_url, username, session_id)
+
+    def revoke_active_session(self, username: str) -> None:
+        if username != ADMIN_USERNAME:
+            delete_active_session(self.database_url, username)
 
     def _save_users(self) -> None:
         if self.users_path is None:
@@ -607,6 +703,16 @@ class MatchWebHandler(BaseHTTPRequestHandler):
                 }
             )
         elif parsed.path == "/logout":
+            username = self.current_username()
+            try:
+                if username:
+                    self.server.app.revoke_active_session(username)
+            except psycopg2.Error:
+                self.send_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "暂时无法退出登录",
+                )
+                return
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/login")
             self.send_header(
@@ -644,13 +750,18 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         if not self.server.app.authenticate(username, password):
             self.redirect("/login?error=1")
             return
+        try:
+            session_token = self.server.app.create_session(username)
+        except psycopg2.Error:
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "暂时无法登录")
+            return
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header(
             "Location", PB_ONLY_PAGE if is_pb_only_username(username) else "/"
         )
         self.send_header(
             "Set-Cookie",
-            f"{SESSION_COOKIE}={self.server.app.create_session(username)}; Path=/; "
+            f"{SESSION_COOKIE}={session_token}; Path=/; "
             "HttpOnly; SameSite=Lax; Max-Age=43200",
         )
         self.end_headers()
@@ -808,9 +919,13 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         return self.current_username() is not None
 
     def current_username(self) -> Optional[str]:
+        if hasattr(self, "_cached_current_username"):
+            return self._cached_current_username
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
         morsel = cookie.get(SESSION_COOKIE)
-        return self.server.app.session_username(morsel.value) if morsel else None
+        username = self.server.app.session_username(morsel.value) if morsel else None
+        self._cached_current_username = username
+        return username
 
     def is_admin(self) -> bool:
         return self.current_username() == ADMIN_USERNAME
@@ -924,8 +1039,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     try:
         ensure_pb_status_table(database_url)
+        ensure_user_session_table(database_url)
     except psycopg2.Error:
-        print("无法初始化 PB 状态表。", file=sys.stderr)
+        print("无法初始化 MatchWeb 数据表。", file=sys.stderr)
         return 2
     secret_text = os.environ.get("MATCH_WEB_SESSION_SECRET", "")
     secret = secret_text.encode("utf-8") if secret_text else secrets.token_bytes(32)
