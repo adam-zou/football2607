@@ -9,10 +9,12 @@ database schemas, provider interfaces, or CLI entry points change.
 ```mermaid
 flowchart LR
     TitanList["Titan007 match list page"]
+    TitanArchive["Titan007 completed-match archive pages<br/>Over_YYYYMMDD.htm"]
     TitanDetail["Titan007 crown-name detail page<br/>{match_id}sb.htm"]
     TitanOdds["Titan007 odds-change pages"]
 
     SimpleList["SimpleCrawler/fetch_match_ids.py"]
+    SimpleArchive["SimpleCrawler/fetch_archive_match_ids.py"]
     SimpleDetail["SimpleCrawler/fetch_match_details.py"]
     SimpleOdds["SimpleCrawler/fetch_odds_pages.py"]
     SimpleCompletion["SimpleCrawler/check_match_completion.py"]
@@ -35,7 +37,9 @@ flowchart LR
     WeComState[("SimpleCrawler database<br/>WeCom baseline and push ledger")]
 
     TitanList --> SimpleList
+    TitanArchive --> SimpleArchive
     SimpleList --> SimpleMatchIds
+    SimpleArchive --> SimpleMatchIds
     SimpleMatchIds --> SimpleDetail
     TitanDetail --> SimpleDetail
     SimpleDetail --> SimpleMatchDetails
@@ -86,6 +90,7 @@ flowchart LR
 | `start_all.bat` | Windows launcher for `SimpleCrawler/run_scheduler.py:main` and `MatchWeb/server.py:main` | Start the crawler supervisor and authenticated match view in separate command windows, preferring the repository `.venv` | None directly; the launched crawler jobs own their writes |
 | `python3 SimpleCrawler/run_scheduler.py` | `SimpleCrawler/run_scheduler.py:main` | Run the proxy service and the five independent, single-instance crawler loops | None directly; child jobs own their writes |
 | `python3 SimpleCrawler/fetch_match_ids.py` | `SimpleCrawler/fetch_match_ids.py:main` | Fetch the currently rendered Titan007 match IDs, print them, and store unseen IDs | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
+| `python3 SimpleCrawler/fetch_archive_match_ids.py [--start-date YYYYMMDD] [--end-date YYYYMMDD]` | `SimpleCrawler/fetch_archive_match_ids.py:main` | Backfill unique match IDs from a descending Titan007 completed-match archive date range | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
 | `python3 SimpleCrawler/fetch_match_details.py [match_id ...]` | `SimpleCrawler/fetch_match_details.py:main` | Fetch and store detail-page fields for selected IDs or every database ID | Dedicated PostgreSQL database configured by `SIMPLE_CRAWLER_DATABASE_URL` |
 | `python3 SimpleCrawler/fetch_odds_pages.py [match_id ...]` | `SimpleCrawler/fetch_odds_pages.py:main` | Fetch, parse, and store three odds markets for each configured company and selected match | Three odds-change tables and `titan007_odds_market_state` in the dedicated PostgreSQL database |
 | `python3 SimpleCrawler/check_match_completion.py` | `SimpleCrawler/check_match_completion.py:main` | Persist resumable 18-page final snapshots for matches whose finished detail has been stable for five minutes or whose kickoff is more than four hours old | Three odds-change tables, `titan007_odds_market_state`, and `match_ids.crawl_status` |
@@ -336,6 +341,21 @@ different proxy; success stops the retry loop. Only after all three attempts fai
 does the one-shot command return a failure for the supervisor's normal 15-minute
 post-round wait. A successful attempt prints the unique positive IDs in ascending
 order, inserts unseen IDs into its dedicated PostgreSQL database, and exits.
+
+`SimpleCrawler/fetch_archive_match_ids.py` is a separate historical backfill
+entrypoint. Its date range defaults to January 1 of the current Shanghai-calendar
+year through today and may be overridden with inclusive `--start-date` and
+`--end-date` values in `YYYYMMDD` format. It visits the corresponding
+`Over_YYYYMMDD.htm` pages from newest to oldest with direct HTTP requests and
+parses the server-rendered `#table_live` rows without launching a browser or
+executing JavaScript. Numeric `sId` values are deduplicated across the whole range,
+then existing `match_ids` rows are removed before insertion. New IDs are written
+in batches controlled by `SIMPLE_CRAWLER_ARCHIVE_BATCH_SIZE` (default 20), with
+`SIMPLE_CRAWLER_ARCHIVE_INTERVAL_SECONDS` (default 300 seconds) between batches.
+Every batch still uses `ON CONFLICT DO NOTHING` to remain safe if another worker
+inserts the same ID after the initial existence check. The command uses the shared
+database but is not scheduled by `run_scheduler.py` and does not use the proxy
+scheduler.
 
 The connection string comes only from `SIMPLE_CRAWLER_DATABASE_URL` in
 `SimpleCrawler/.env`. The script creates `match_ids` on first use. Its `match_id`

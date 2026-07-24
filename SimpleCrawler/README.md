@@ -200,6 +200,30 @@ python SimpleCrawler/fetch_match_ids.py --headed
 代理视为失败并立即更换。`SIMPLE_CRAWLER_LIST_SETTLE_SECONDS` 仅为旧配置兼容
 保留，当前响应解析模式不会额外等待。
 
+### 获取完场归档页比赛 ID
+
+独立脚本通过普通 HTTP 请求按日期倒序下载完场归档页，从服务器返回的比赛表格
+中读取每行的 `sId`。默认范围是上海时区当年 1 月 1 日至今天，最近日期优先；
+也可指定包含首尾日期的范围：
+
+```bash
+python SimpleCrawler/fetch_archive_match_ids.py
+python SimpleCrawler/fetch_archive_match_ids.py \
+  --start-date 20260701 --end-date 20260724
+```
+
+脚本先对整个日期范围去重，再查询 `match_ids` 排除已存在记录。剩余 ID 默认每轮
+写入 20 个，每轮之间等待 300 秒（5 分钟）；最后一轮结束后不再等待。以下两个
+环境变量可修改批次大小和间隔：
+
+```dotenv
+SIMPLE_CRAWLER_ARCHIVE_BATCH_SIZE=20
+SIMPLE_CRAWLER_ARCHIVE_INTERVAL_SECONDS=300
+```
+
+每批仍使用 `ON CONFLICT DO NOTHING`，因此脚本运行期间即使其他任务写入相同 ID，
+也不会产生重复记录。该脚本不启动浏览器，也不依赖代理调度服务。
+
 ### 获取比赛详情
 
 不传比赛 ID 时，从数据库读取所有符合爬取状态的比赛：
