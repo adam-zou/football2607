@@ -112,6 +112,8 @@ def extract_match_ids_from_html(source: bytes) -> List[int]:
     seen = set()
     for raw_id in tables[0].xpath('.//tr[@sid]/@sid'):
         value = raw_id.strip()
+        if not value:
+            continue
         if not value.isdigit() or int(value) <= 0:
             raise RuntimeError(f"比赛行包含无效 sId：{raw_id!r}")
         match_id = int(value)
@@ -145,26 +147,6 @@ def fetch_archive_match_ids(
             f"{archive_date:%Y%m%d} 无法访问：{error.reason}"
         ) from error
     return extract_match_ids_from_html(source)
-
-
-def collect_match_ids(
-    start_date: date,
-    end_date: date,
-    fetcher: Callable[[date], List[int]] = fetch_archive_match_ids,
-) -> List[int]:
-    match_ids: List[int] = []
-    seen = set()
-    for archive_date in iter_dates_descending(start_date, end_date):
-        daily_ids = fetcher(archive_date)
-        print(
-            f"{TASK_PREFIX} {archive_date:%Y%m%d}：获取 {len(daily_ids)} 个。",
-            file=sys.stderr,
-        )
-        for match_id in daily_ids:
-            if match_id not in seen:
-                seen.add(match_id)
-                match_ids.append(match_id)
-    return match_ids
 
 
 def load_existing_match_ids(
@@ -207,29 +189,54 @@ def insert_match_id_batch(
         connection.close()
 
 
-def write_in_batches(
+def backfill_date_range(
     database_url: str,
-    match_ids: Sequence[int],
+    start_date: date,
+    end_date: date,
     batch_size: int,
     interval_seconds: float,
+    fetcher: Callable[[date], List[int]] = fetch_archive_match_ids,
+    existing_loader: Callable[
+        [str, Sequence[int]], Set[int]
+    ] = load_existing_match_ids,
     writer: Callable[[str, Sequence[int]], int] = insert_match_id_batch,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> int:
     total_inserted = 0
-    batches = [
-        match_ids[index : index + batch_size]
-        for index in range(0, len(match_ids), batch_size)
-    ]
-    for batch_number, batch in enumerate(batches, start=1):
-        inserted = writer(database_url, batch)
-        total_inserted += inserted
+    for archive_date in iter_dates_descending(start_date, end_date):
+        daily_ids = fetcher(archive_date)
+        existing_ids = existing_loader(database_url, daily_ids)
+        new_ids = [
+            match_id for match_id in daily_ids if match_id not in existing_ids
+        ]
         print(
-            f"{TASK_PREFIX} 第 {batch_number}/{len(batches)} 轮："
-            f"提交 {len(batch)} 个，新增 {inserted} 个。",
+            f"{TASK_PREFIX} {archive_date:%Y%m%d}：获取 {len(daily_ids)} 个，"
+            f"已存在 {len(existing_ids)} 个，待写入 {len(new_ids)} 个。",
             file=sys.stderr,
         )
-        if batch_number < len(batches):
-            sleeper(interval_seconds)
+
+        daily_inserted = 0
+        batches = [
+            new_ids[index : index + batch_size]
+            for index in range(0, len(new_ids), batch_size)
+        ]
+        for batch_number, batch in enumerate(batches, start=1):
+            if batch_number > 1:
+                sleeper(interval_seconds)
+            inserted = writer(database_url, batch)
+            daily_inserted += inserted
+            total_inserted += inserted
+            print(
+                f"{TASK_PREFIX} {archive_date:%Y%m%d} 第 "
+                f"{batch_number}/{len(batches)} 轮：提交 {len(batch)} 个，"
+                f"新增 {inserted} 个。",
+                file=sys.stderr,
+            )
+        print(
+            f"{TASK_PREFIX} {archive_date:%Y%m%d} 完成："
+            f"新增 {daily_inserted} 个。",
+            file=sys.stderr,
+        )
     return total_inserted
 
 
@@ -251,17 +258,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             INTERVAL_ENV_NAME,
             DEFAULT_INTERVAL_SECONDS,
         )
-        match_ids = collect_match_ids(args.start_date, args.end_date)
-        existing_ids = load_existing_match_ids(database_url, match_ids)
-        new_ids = [match_id for match_id in match_ids if match_id not in existing_ids]
-        print(
-            f"{TASK_PREFIX} 汇总 {len(match_ids)} 个唯一 ID，"
-            f"已存在 {len(existing_ids)} 个，待写入 {len(new_ids)} 个。",
-            file=sys.stderr,
-        )
-        inserted = write_in_batches(
+        inserted = backfill_date_range(
             database_url,
-            new_ids,
+            args.start_date,
+            args.end_date,
             batch_size,
             interval_seconds,
         )

@@ -4,13 +4,12 @@ from urllib.error import HTTPError
 from unittest.mock import patch
 
 from fetch_archive_match_ids import (
-    collect_match_ids,
+    backfill_date_range,
     env_number,
     extract_match_ids_from_html,
     fetch_archive_match_ids,
     iter_dates_descending,
     parse_args,
-    write_in_batches,
 )
 
 
@@ -94,6 +93,20 @@ class ArchiveMatchIdTests(unittest.TestCase):
             [],
         )
 
+    def test_ignores_empty_sid_rows_and_keeps_valid_matches(self) -> None:
+        source = b"""
+            <table id="table_live">
+              <tr sId="3006702"></tr>
+              <tr sId=""></tr>
+              <tr sId="3013636"></tr>
+            </table>
+        """
+
+        self.assertEqual(
+            extract_match_ids_from_html(source),
+            [3006702, 3013636],
+        )
+
     def test_rejects_page_without_match_table(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "table_live"):
             extract_match_ids_from_html(b"<html></html>")
@@ -131,44 +144,75 @@ class ArchiveMatchIdTests(unittest.TestCase):
                 FakeUrlOpen(error),
             )
 
-    def test_collects_dates_in_reverse_order_and_deduplicates(self) -> None:
-        calls = []
+    def test_finishes_each_day_and_does_not_sleep_between_dates(self) -> None:
+        events = []
+        database_ids = {2}
 
         def fetcher(archive_date):
-            calls.append(archive_date)
+            events.append(("fetch", archive_date))
             return {
-                date(2026, 7, 3): [3, 2],
-                date(2026, 7, 2): [2, 1],
-                date(2026, 7, 1): [1, 0],
+                date(2026, 7, 2): [4, 3, 2],
+                date(2026, 7, 1): [2, 1],
             }[archive_date]
 
-        result = collect_match_ids(
+        def existing_loader(database_url, match_ids):
+            events.append(("existing", list(match_ids)))
+            return database_ids.intersection(match_ids)
+
+        def writer(database_url, match_ids):
+            events.append(("write", list(match_ids)))
+            database_ids.update(match_ids)
+            return len(match_ids)
+
+        def sleeper(seconds):
+            events.append(("sleep", seconds))
+
+        inserted = backfill_date_range(
+            "postgresql://test",
             date(2026, 7, 1),
-            date(2026, 7, 3),
+            date(2026, 7, 2),
+            20,
+            300,
             fetcher,
+            existing_loader,
+            writer,
+            sleeper,
         )
 
-        self.assertEqual(calls, [date(2026, 7, 3), date(2026, 7, 2), date(2026, 7, 1)])
-        self.assertEqual(result, [3, 2, 1, 0])
+        self.assertEqual(inserted, 3)
+        self.assertEqual(
+            events,
+            [
+                ("fetch", date(2026, 7, 2)),
+                ("existing", [4, 3, 2]),
+                ("write", [4, 3]),
+                ("fetch", date(2026, 7, 1)),
+                ("existing", [2, 1]),
+                ("write", [1]),
+            ],
+        )
 
     def test_writes_twenty_ids_per_round_and_sleeps_between_rounds(self) -> None:
         batches = []
         sleeps = []
 
         def writer(database_url, match_ids):
-            batches.append((database_url, list(match_ids)))
+            batches.append(list(match_ids))
             return len(match_ids)
 
-        inserted = write_in_batches(
+        inserted = backfill_date_range(
             "postgresql://test",
-            list(range(45)),
+            date(2026, 7, 1),
+            date(2026, 7, 1),
             20,
             300,
+            lambda archive_date: list(range(45)),
+            lambda database_url, match_ids: set(),
             writer,
             sleeps.append,
         )
 
-        self.assertEqual([len(batch) for _, batch in batches], [20, 20, 5])
+        self.assertEqual([len(batch) for batch in batches], [20, 20, 5])
         self.assertEqual(sleeps, [300, 300])
         self.assertEqual(inserted, 45)
 
