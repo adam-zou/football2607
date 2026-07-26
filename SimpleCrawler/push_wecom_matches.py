@@ -33,22 +33,23 @@ MARKET_LABELS = {
     "over_under": "大小球（大球）",
     "handicap_home": "让球盘（主队）",
     "handicap_away": "让球盘（客队）",
+    "pb_warning": "PB 预警盘口",
 }
 
 CREATE_NOTIFICATION_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS public.wecom_match_market_push_state (
     state_key TEXT PRIMARY KEY,
     initialized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CHECK (state_key = 'match_market_baseline')
+    CHECK (state_key IN ('match_market_baseline', 'pb_warning_baseline'))
 );
 
 CREATE TABLE IF NOT EXISTS public.wecom_match_market_pushes (
     match_id BIGINT NOT NULL,
     market_type TEXT NOT NULL
-        CHECK (market_type IN ('over_under', 'handicap_home', 'handicap_away')),
+        CHECK (market_type IN ('over_under', 'handicap_home', 'handicap_away', 'pb_warning')),
     push_status TEXT NOT NULL
         CHECK (push_status IN ('baseline', 'pending', 'sent', 'failed', 'expired')),
-    company_count BIGINT NOT NULL CHECK (company_count >= 3),
+    company_count BIGINT NOT NULL CHECK (company_count >= 1),
     line_value NUMERIC(6, 2),
     league TEXT,
     scheduled_time TEXT NOT NULL,
@@ -60,7 +61,160 @@ CREATE TABLE IF NOT EXISTS public.wecom_match_market_pushes (
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error TEXT,
     PRIMARY KEY (match_id, market_type)
+);
+
+DO $migration$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wecom_match_market_push_state_state_key_check'
+          AND pg_get_constraintdef(oid) LIKE '%pb_warning_baseline%'
+    ) THEN
+        ALTER TABLE public.wecom_match_market_push_state
+            DROP CONSTRAINT IF EXISTS wecom_match_market_push_state_state_key_check;
+        ALTER TABLE public.wecom_match_market_push_state
+            ADD CONSTRAINT wecom_match_market_push_state_state_key_check
+            CHECK (state_key IN ('match_market_baseline', 'pb_warning_baseline'));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wecom_match_market_pushes_market_type_check'
+          AND pg_get_constraintdef(oid) LIKE '%pb_warning%'
+    ) THEN
+        ALTER TABLE public.wecom_match_market_pushes
+            DROP CONSTRAINT IF EXISTS wecom_match_market_pushes_market_type_check;
+        ALTER TABLE public.wecom_match_market_pushes
+            ADD CONSTRAINT wecom_match_market_pushes_market_type_check
+            CHECK (market_type IN (
+                'over_under', 'handicap_home', 'handicap_away', 'pb_warning'
+            ));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'wecom_match_market_pushes_company_count_check'
+          AND pg_get_constraintdef(oid) LIKE '%>= 1%'
+    ) THEN
+        ALTER TABLE public.wecom_match_market_pushes
+            DROP CONSTRAINT IF EXISTS wecom_match_market_pushes_company_count_check;
+        ALTER TABLE public.wecom_match_market_pushes
+            ADD CONSTRAINT wecom_match_market_pushes_company_count_check
+            CHECK (company_count >= 1);
+    END IF;
+END
+$migration$;
+"""
+
+PB_WARNING_CTE = """
+WITH pb_company_rows AS (
+    SELECT
+        changes.match_id,
+        changes.seq,
+        changes.match_minute,
+        changes.change_time,
+        changes.source_status,
+        changes.is_suspended,
+        details.scheduled_time::TIMESTAMP AS scheduled_at,
+        CASE
+            WHEN raw_change_at < details.scheduled_time::TIMESTAMP - INTERVAL '180 days'
+                THEN raw_change_at + INTERVAL '1 year'
+            WHEN raw_change_at > details.scheduled_time::TIMESTAMP + INTERVAL '180 days'
+                THEN raw_change_at - INTERVAL '1 year'
+            ELSE raw_change_at
+        END AS change_at
+    FROM match_details AS details
+    JOIN titan007_1x2_changes AS changes
+      ON changes.match_id = details.match_id
+     AND changes.company_id = 47
+    CROSS JOIN LATERAL (
+        SELECT TO_TIMESTAMP(
+            EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
+            || '-' || changes.change_time,
+            'YYYY-MM-DD HH24:MI'
+        ) AS raw_change_at
+    ) AS parsed
+    WHERE details.scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+      AND changes.change_time ~ '^\\d{1,2}-\\d{1,2} \\d{1,2}:\\d{2}$'
+),
+pb_suspended_rows AS (
+    SELECT
+        pb_company_rows.*,
+        seq - ROW_NUMBER() OVER (PARTITION BY match_id ORDER BY seq) AS suspension_group
+    FROM pb_company_rows
+    WHERE source_status = '滚'
+      AND is_suspended
+),
+pb_suspension_runs AS (
+    SELECT
+        match_id,
+        suspension_group,
+        MIN(seq) AS start_seq,
+        MAX(seq) AS end_seq,
+        (ARRAY_AGG(change_at ORDER BY seq))[1] AS start_at,
+        (ARRAY_AGG(change_at ORDER BY seq DESC))[1] AS last_at,
+        (ARRAY_AGG(match_minute ORDER BY seq))[1] AS start_match_minute
+    FROM pb_suspended_rows
+    GROUP BY match_id, suspension_group
+),
+pb_qualifying_runs AS (
+    SELECT runs.*
+    FROM pb_suspension_runs AS runs
+    LEFT JOIN pb_company_rows AS next_row
+      ON next_row.match_id = runs.match_id
+     AND next_row.seq = runs.end_seq + 1
+    WHERE COALESCE(next_row.change_at, runs.last_at) - runs.start_at >= INTERVAL '3 minutes'
+),
+pb_warning_triggers AS (
+    SELECT DISTINCT ON (match_id)
+        match_id,
+        start_match_minute + 3 AS warning_minute
+    FROM pb_qualifying_runs
+    WHERE start_match_minute IS NOT NULL
+    ORDER BY match_id, start_seq
+),
+pb_warning_candidates AS (
+    SELECT
+        triggers.match_id,
+        warning_totals.total_line_value AS line_value
+    FROM pb_warning_triggers AS triggers
+    JOIN LATERAL (
+        SELECT totals.total_line_value
+        FROM titan007_over_under_changes AS totals
+        WHERE totals.match_id = triggers.match_id
+          AND totals.company_id = 47
+          AND totals.match_minute >= triggers.warning_minute
+        ORDER BY totals.seq ASC
+        LIMIT 1
+    ) AS warning_totals ON TRUE
+    WHERE warning_totals.total_line_value IN (1.5, 3.5)
 )
+"""
+
+PB_BASELINE_SQL = PB_WARNING_CTE + """
+INSERT INTO public.wecom_match_market_pushes (
+    match_id, market_type, push_status, company_count, line_value,
+    league, scheduled_time, home_team, away_team
+)
+SELECT candidates.match_id, 'pb_warning', 'baseline', 1, candidates.line_value,
+       details.league, details.scheduled_time, details.home_team, details.away_team
+FROM pb_warning_candidates AS candidates
+JOIN public.match_details AS details USING (match_id)
+ON CONFLICT (match_id, market_type) DO NOTHING
+"""
+
+PB_DISCOVER_SQL = PB_WARNING_CTE + """
+INSERT INTO public.wecom_match_market_pushes (
+    match_id, market_type, push_status, company_count, line_value,
+    league, scheduled_time, home_team, away_team
+)
+SELECT candidates.match_id, 'pb_warning', 'pending', 1, candidates.line_value,
+       details.league, details.scheduled_time, details.home_team, details.away_team
+FROM pb_warning_candidates AS candidates
+JOIN public.match_details AS details USING (match_id)
+JOIN public.match_ids AS ids USING (match_id)
+CROSS JOIN public.wecom_match_market_push_state AS state
+WHERE state.state_key = 'pb_warning_baseline'
+  AND ids.created_at > state.initialized_at
+ON CONFLICT (match_id, market_type) DO NOTHING
 """
 
 BASELINE_SQL = """
@@ -127,6 +281,7 @@ EXPIRE_SQL = """
 UPDATE public.wecom_match_market_pushes AS pushes
 SET push_status = 'expired'
 WHERE pushes.push_status IN ('pending', 'failed')
+  AND pushes.market_type <> 'pb_warning'
   AND NOT EXISTS (
       SELECT 1
       FROM public.match_details AS details
@@ -220,10 +375,11 @@ def prepare_notifications(connection: Connection) -> PreparationResult:
             WHERE state_key = 'match_market_baseline'
             """
         )
-        initialized = cursor.fetchone() is not None
-        if not initialized:
+        market_initialized = cursor.fetchone() is not None
+        recorded_count = 0
+        if not market_initialized:
             cursor.execute(BASELINE_SQL)
-            recorded_count = cursor.rowcount
+            recorded_count += cursor.rowcount
             cursor.execute(
                 """
                 INSERT INTO public.wecom_match_market_push_state (state_key)
@@ -231,11 +387,30 @@ def prepare_notifications(connection: Connection) -> PreparationResult:
                 ON CONFLICT (state_key) DO NOTHING
                 """
             )
+        cursor.execute(
+            "SELECT 1 FROM public.wecom_match_market_push_state "
+            "WHERE state_key = 'pb_warning_baseline'"
+        )
+        pb_initialized = cursor.fetchone() is not None
+        if not pb_initialized:
+            cursor.execute(PB_BASELINE_SQL)
+            recorded_count += cursor.rowcount
+            cursor.execute(
+                """
+                INSERT INTO public.wecom_match_market_push_state (state_key)
+                VALUES ('pb_warning_baseline')
+                ON CONFLICT (state_key) DO NOTHING
+                """
+            )
+
+        if not market_initialized or not pb_initialized:
             return PreparationResult(False, recorded_count)
 
         cursor.execute(EXPIRE_SQL)
         cursor.execute(DISCOVER_SQL)
-        return PreparationResult(True, cursor.rowcount)
+        recorded_count = cursor.rowcount
+        cursor.execute(PB_DISCOVER_SQL)
+        return PreparationResult(True, recorded_count + cursor.rowcount)
 
 
 def load_deliveries(connection: Connection) -> List[PushRecord]:
@@ -290,11 +465,17 @@ def build_message(records: Sequence[PushRecord]) -> str:
         "命中市场",
     ]
     for record in records:
-        lines.append(
-            f"{MARKET_LABELS[record.market_type]}: "
-            f"{record.company_count} 家, 最大盘口 "
-            f"{format_line_value(record.line_value)}"
-        )
+        if record.market_type == "pb_warning":
+            lines.append(
+                f"{MARKET_LABELS[record.market_type]}: "
+                f"{format_line_value(record.line_value)}"
+            )
+        else:
+            lines.append(
+                f"{MARKET_LABELS[record.market_type]}: "
+                f"{record.company_count} 家, 最大盘口 "
+                f"{format_line_value(record.line_value)}"
+            )
     link = (
         "https://live.nowscore.com/odds/3in1Odds.aspx?companyid=3"
         f"&id={match.match_id}"

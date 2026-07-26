@@ -244,9 +244,18 @@ deployments do not require a webhook. A configured worker requires the optional
 odds-filter views and reads `match_odds_filter_market_summary` joined to
 `match_details`, selecting only exact `status_text = '未开始'` rows.
 
-The worker owns two PostgreSQL tables. `wecom_match_market_push_state` records a
-durable singleton initialization marker, including when the first query finds no
-candidates. On the first configured run, every currently qualifying not-started
+The worker also reproduces the PB page's company-47 warning calculation.
+Consecutive live 1x2 suspension rows must prove a three-minute interval; the
+earliest qualifying run's `start_match_minute + 3` is the trigger, and the first
+company-47 totals row at or after that minute supplies the warning line. A line
+value of exactly `1.5` or `3.5` creates a `pb_warning` notification. This live
+warning type is not expired by the ordinary rule that requires a queued market
+notification's match to remain `未开始`.
+
+The worker owns two PostgreSQL tables. `wecom_match_market_push_state` records
+durable initialization markers for ordinary markets and PB warnings, including
+when a first query finds no candidates. On the first configured run for each
+type, every currently qualifying
 `(match_id, market_type)` is inserted into `wecom_match_market_pushes` with
 `baseline` status and no message is sent. Later runs insert unseen keys as
 `pending` with match and market snapshots only when `match_ids.created_at` is
@@ -257,7 +266,7 @@ PostgreSQL advisory session lock also prevents two notification processes from
 delivering concurrently.
 
 Pending and failed markets for the same match are combined into one plain-text
-message containing league, teams, kickoff time, company count, maximum line, and a
+message containing league, teams, kickoff time, applicable market details, and a
 company-3 Nowscore link. A confirmed webhook `errcode = 0` changes every included
 market to `sent`; a rejected or failed request changes it to `failed` for the next
 round. Before discovery, failed or pending rows whose current detail is no longer
