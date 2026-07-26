@@ -242,6 +242,10 @@ class MatchWebAppTests(unittest.TestCase):
                     {"change_time": "07-17 20:15", "match_minute": 42},
                     {"change_time": "07-17 20:18", "match_minute": None},
                 ],
+                [
+                    {"bet_period": "全场", "market_type": "胜平负", "market_value": "主"},
+                    {"bet_period": "半场", "market_type": "大小球", "market_value": "2.5"},
+                ],
             )
         ]
         cursor_context = MagicMock()
@@ -273,6 +277,9 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("totals.company_id = 47", query)
         self.assertIn("totals.match_minute >= warning_triggers.warning_minute", query)
         self.assertIn("ORDER BY totals.seq ASC", query)
+        self.assertIn("match_web_pb_bet", query)
+        self.assertIn("'home_handicap', saved_bets.home_handicap", query)
+        self.assertIn("'away_handicap', saved_bets.away_handicap", query)
         self.assertEqual(cursor.execute.call_args.args[1], ("2026-07-17", "2026-07-17"))
         self.assertEqual(matches[0]["match_id"], 3020831)
         self.assertNotIn("suspension_periods", matches[0])
@@ -283,6 +290,13 @@ class MatchWebAppTests(unittest.TestCase):
             [
                 {"change_time": "07-17 20:15", "match_minute": 42},
                 {"change_time": "07-17 20:18", "match_minute": None},
+            ],
+        )
+        self.assertEqual(
+            matches[0]["bets"],
+            [
+                {"bet_period": "全场", "market_type": "胜平负", "market_value": "主"},
+                {"bet_period": "半场", "market_type": "大小球", "market_value": "2.5"},
             ],
         )
 
@@ -298,18 +312,19 @@ class MatchWebAppTests(unittest.TestCase):
 
         with patch.object(server.psycopg2, "connect", return_value=connection_context):
             server.fetch_company_47_suspensions(
-                "postgresql://test", "2026-07-17", ["未开始", "进行中"]
+                "postgresql://test", "2026-07-17", ["未开始", "进行中", "完"]
             )
 
         query = cursor.execute.call_args.args[0]
         self.assertIn("details.status_text = '未开始'", query)
         self.assertIn("details.status_text IN ('上', '中', '下'", query)
+        self.assertIn("details.status_text = '完'", query)
         self.assertIn("SELECT DISTINCT", query)
 
         with patch.object(server.psycopg2, "connect") as connect:
             with self.assertRaisesRegex(ValueError, "状态无效"):
                 server.fetch_company_47_suspensions(
-                    "postgresql://test", "2026-07-17", ["完"]
+                    "postgresql://test", "2026-07-17", ["其它"]
                 )
             connect.assert_not_called()
 
@@ -328,6 +343,96 @@ class MatchWebAppTests(unittest.TestCase):
         query = cursor.execute.call_args.args[0]
         self.assertIn("CREATE TABLE IF NOT EXISTS match_web_pb_status", query)
         self.assertIn("status IN ('关注', '作废')", query)
+
+    def test_pb_bets_allow_more_than_three_fixed_choice_entries(self):
+        self.assertEqual(len(server.PB_HANDICAP_VALUES), 41)
+        self.assertEqual(server.PB_HANDICAP_VALUES[0], "-5")
+        self.assertEqual(server.PB_HANDICAP_VALUES[-1], "+5")
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (True,)
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection = MagicMock()
+        connection.cursor.return_value = cursor_context
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        bets = [
+            {
+                "bet_period": "全场", "market_type": "让球",
+                "market_value": None, "home_handicap": "-0.25",
+                "away_handicap": "+0.5",
+            },
+            {"bet_period": "半场", "market_type": "胜平负", "market_value": "客"},
+            {"bet_period": "全场", "market_type": "大小球", "market_value": "0.5"},
+            {"bet_period": "半场", "market_type": "大小球", "market_value": "9"},
+        ]
+
+        with patch.object(server.psycopg2, "connect", return_value=connection_context):
+            server.ensure_pb_bet_table("postgresql://test")
+            create_query = cursor.execute.call_args_list[0].args[0]
+            period_query = cursor.execute.call_args_list[1].args[0]
+            handicap_query = cursor.execute.call_args_list[2].args[0]
+            constraint_query = cursor.execute.call_args_list[3].args[0]
+            self.assertIn("CREATE TABLE IF NOT EXISTS match_web_pb_bet", create_query)
+            self.assertIn("CHECK (bet_number > 0)", create_query)
+            self.assertNotIn("bet_number <= 3", create_query)
+            self.assertIn("bet_period", period_query)
+            self.assertIn("'全场', '半场'", period_query)
+            self.assertIn("home_handicap", handicap_query)
+            self.assertIn("away_handicap", handicap_query)
+            self.assertIn("DROP NOT NULL", handicap_query)
+            self.assertIn("'让球'", constraint_query)
+
+            saved = server.replace_pb_bets(
+                "postgresql://test", 3020831, bets, "matchuser"
+            )
+
+        self.assertEqual(saved[0], bets[0])
+        self.assertEqual(saved[1]["market_value"], "客")
+        self.assertIsNone(saved[1]["home_handicap"])
+        self.assertIsNone(saved[1]["away_handicap"])
+        inserted_rows = cursor.executemany.call_args.args[1]
+        self.assertEqual([row[1] for row in inserted_rows], [1, 2, 3, 4])
+        self.assertEqual(inserted_rows[0][5:7], ("-0.25", "+0.5"))
+
+        self.assertEqual(
+            server.validate_pb_bets([
+                {
+                    "bet_period": "半场", "market_type": "让球",
+                    "home_handicap": None, "away_handicap": "+5",
+                },
+            ]),
+            [{
+                "bet_period": "半场", "market_type": "让球",
+                "market_value": None, "home_handicap": None,
+                "away_handicap": "+5",
+            }],
+        )
+
+        with self.assertRaisesRegex(ValueError, "主队让或客队让"):
+            server.validate_pb_bets([{
+                "bet_period": "全场", "market_type": "让球",
+                "home_handicap": "", "away_handicap": "",
+            }])
+
+        with self.assertRaisesRegex(ValueError, "下注1请选择大类"):
+            server.validate_pb_bets([
+                {"bet_period": "", "market_type": "大小球", "market_value": "2.5"},
+            ])
+
+        with self.assertRaisesRegex(ValueError, "下注1请选择盘口值"):
+            server.validate_pb_bets([
+                {"bet_period": "全场", "market_type": "大小球", "market_value": ""},
+            ])
+
+        with self.assertRaisesRegex(ValueError, "至少增加一个"):
+            server.validate_pb_bets([])
+
+        with self.assertRaisesRegex(ValueError, "盘口类型或盘口值无效"):
+            server.validate_pb_bets([
+                {"bet_period": "全场", "market_type": "胜平负", "market_value": "主"},
+                {"bet_period": "半场", "market_type": "大小球", "market_value": "9.25"},
+            ])
 
     def test_single_session_registry_hashes_and_checks_session_id(self):
         cursor = MagicMock()
@@ -547,6 +652,12 @@ class MatchWebAppTests(unittest.TestCase):
         thread.start()
         connection = HTTPConnection(*http_server.server_address, timeout=2)
         app.set_pb_match_status = MagicMock()
+        app.replace_pb_bets = MagicMock(return_value=[
+            {"bet_period": "全场", "market_type": "胜平负", "market_value": "主"},
+            {"bet_period": "半场", "market_type": "大小球", "market_value": "0.5"},
+            {"bet_period": "全场", "market_type": "胜平负", "market_value": "客"},
+            {"bet_period": "半场", "market_type": "大小球", "market_value": "9"},
+        ])
         try:
             body = "username=matchuser&password=user-secret"
             connection.request(
@@ -602,6 +713,28 @@ class MatchWebAppTests(unittest.TestCase):
             app.set_pb_match_status.assert_called_once_with(
                 3020831, "关注", "matchuser"
             )
+
+            bet_body = json.dumps({"bets": [
+                {"bet_period": "全场", "market_type": "胜平负", "market_value": "主"},
+                {"bet_period": "半场", "market_type": "大小球", "market_value": "0.5"},
+                {"bet_period": "全场", "market_type": "胜平负", "market_value": "客"},
+                {"bet_period": "半场", "market_type": "大小球", "market_value": "9"},
+            ]}, ensure_ascii=False).encode("utf-8")
+            connection.request(
+                "PUT",
+                "/api/company-47-suspensions/3020831/bets",
+                body=bet_body,
+                headers={
+                    "Cookie": cookie,
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(bet_body)),
+                },
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(len(payload["bets"]), 4)
+            self.assertEqual(app.replace_pb_bets.call_args.args[2], "matchuser")
         finally:
             connection.close()
             http_server.shutdown()
@@ -717,7 +850,24 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("比赛分钟", suspension_script)
         self.assertIn("赛前预警", suspension_script)
         self.assertIn("滚球预警", suspension_script)
+        self.assertIn("完场", suspension_script)
+        self.assertIn("length: 35", suspension_script)
+        self.assertIn("length: 41", suspension_script)
+        self.assertIn("HANDICAP_ZERO_INDEX", suspension_script)
+        self.assertIn("bet-home-handicap", suspension_script)
+        self.assertIn("bet-away-handicap", suspension_script)
+        self.assertIn("请选择主队让或客队让盘口值", suspension_script)
+        self.assertIn("下注${missingPeriodIndex + 1}请选择大类", suspension_script)
+        self.assertIn("下注${missingValueIndex + 1}请选择盘口值", suspension_script)
+        self.assertIn("bet_period: '', market_type: '大小球', market_value: ''", suspension_script)
+        self.assertIn("/bets", suspension_script)
         self.assertIn("60_000", suspension_script)
+        suspension_page = (
+            server.STATIC_DIR / "company-47-suspensions.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("增加注单", suspension_page)
+        self.assertIn('value="完"', suspension_page)
+        self.assertNotIn('value="完" checked', suspension_page)
 
     def test_password_hash_is_salted_and_verifiable(self):
         first = hash_password("a-secure-password")

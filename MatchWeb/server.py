@@ -44,7 +44,7 @@ SESSION_COOKIE = "match_web_session"
 SESSION_LIFETIME = timedelta(hours=12)
 ALLOWED_STATUSES = {"未开始", "进行中", "完", "其它"}
 DEFAULT_STATUSES = ("未开始", "进行中")
-PB_ALLOWED_STATUSES = set(DEFAULT_STATUSES)
+PB_ALLOWED_STATUSES = {*DEFAULT_STATUSES, "完"}
 ADMIN_USERNAME = "admin"
 DEFAULT_MONITOR_URL = "http://127.0.0.1:8081"
 MONITOR_TIMEOUT_SECONDS = 2
@@ -56,6 +56,17 @@ PB_ONLY_PATHS = {
     "/logout",
 }
 PB_MATCH_STATUSES = {"关注", "作废"}
+PB_BET_PERIODS = {"全场", "半场"}
+PB_ONE_X_TWO_VALUES = ("主", "平", "客")
+PB_TOTAL_VALUES = tuple(f"{quarter / 4:g}" for quarter in range(2, 37))
+PB_HANDICAP_VALUES = tuple(
+    "0" if quarter == 0 else f"{quarter / 4:+g}"
+    for quarter in range(-20, 21)
+)
+PB_BET_VALUES = {
+    "胜平负": set(PB_ONE_X_TWO_VALUES),
+    "大小球": set(PB_TOTAL_VALUES),
+}
 PB_STATUS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS match_web_pb_status (
     match_id BIGINT PRIMARY KEY,
@@ -71,6 +82,63 @@ CREATE TABLE IF NOT EXISTS match_web_user_session (
     expires_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
+"""
+PB_BET_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS match_web_pb_bet (
+    match_id BIGINT NOT NULL,
+    bet_number INTEGER NOT NULL CHECK (bet_number > 0),
+    bet_period TEXT NOT NULL,
+    market_type TEXT NOT NULL,
+    market_value TEXT,
+    home_handicap TEXT,
+    away_handicap TEXT,
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (match_id, bet_number)
+)
+"""
+PB_BET_HANDICAP_MIGRATION_SQL = """
+ALTER TABLE match_web_pb_bet
+    ADD COLUMN IF NOT EXISTS home_handicap TEXT;
+ALTER TABLE match_web_pb_bet
+    ADD COLUMN IF NOT EXISTS away_handicap TEXT;
+ALTER TABLE match_web_pb_bet
+    ALTER COLUMN market_value DROP NOT NULL;
+UPDATE match_web_pb_bet
+SET
+    home_handicap = CASE
+        WHEN market_value = '客让' THEN home_handicap
+        WHEN market_value = '主让' THEN COALESCE(home_handicap, '0')
+        ELSE COALESCE(home_handicap, market_value)
+    END,
+    away_handicap = CASE
+        WHEN market_value = '客让' THEN COALESCE(away_handicap, '0')
+        ELSE away_handicap
+    END,
+    market_value = NULL
+WHERE market_type = '让球'
+  AND market_value IS NOT NULL
+"""
+PB_BET_PERIOD_MIGRATION_SQL = """
+ALTER TABLE match_web_pb_bet
+    ADD COLUMN IF NOT EXISTS bet_period TEXT;
+UPDATE match_web_pb_bet
+SET bet_period = '全场'
+WHERE bet_period IS NULL;
+ALTER TABLE match_web_pb_bet
+    ALTER COLUMN bet_period SET NOT NULL;
+ALTER TABLE match_web_pb_bet
+    DROP CONSTRAINT IF EXISTS match_web_pb_bet_period_check;
+ALTER TABLE match_web_pb_bet
+    ADD CONSTRAINT match_web_pb_bet_period_check
+    CHECK (bet_period IN ('全场', '半场'))
+"""
+PB_BET_MARKET_CONSTRAINT_SQL = """
+ALTER TABLE match_web_pb_bet
+    DROP CONSTRAINT IF EXISTS match_web_pb_bet_market_type_check;
+ALTER TABLE match_web_pb_bet
+    ADD CONSTRAINT match_web_pb_bet_market_type_check
+    CHECK (market_type IN ('胜平负', '大小球', '让球'))
 """
 
 STATUS_SQL = {
@@ -125,6 +193,119 @@ def ensure_user_session_table(database_url: str) -> None:
     with psycopg2.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(USER_SESSION_TABLE_SQL)
+
+
+def ensure_pb_bet_table(database_url: str) -> None:
+    """Create the MatchWeb-owned PB bet-slip table when absent."""
+
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(PB_BET_TABLE_SQL)
+            cursor.execute(PB_BET_PERIOD_MIGRATION_SQL)
+            cursor.execute(PB_BET_HANDICAP_MIGRATION_SQL)
+            cursor.execute(PB_BET_MARKET_CONSTRAINT_SQL)
+
+
+def validate_pb_bets(value: object) -> List[Dict[str, Optional[str]]]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("请至少增加一个下注单")
+    validated = []
+    for number, bet in enumerate(value, start=1):
+        if not isinstance(bet, dict):
+            raise ValueError("注单内容无效")
+        bet_period = str(bet.get("bet_period", ""))
+        market_type = str(bet.get("market_type", ""))
+        market_value_raw = bet.get("market_value")
+        home_handicap_raw = bet.get("home_handicap")
+        away_handicap_raw = bet.get("away_handicap")
+        market_value = "" if market_value_raw is None else str(market_value_raw)
+        home_handicap = (
+            "" if home_handicap_raw is None else str(home_handicap_raw)
+        )
+        away_handicap = (
+            "" if away_handicap_raw is None else str(away_handicap_raw)
+        )
+        if not bet_period:
+            raise ValueError(f"下注{number}请选择大类")
+        if bet_period not in PB_BET_PERIODS:
+            raise ValueError("下注大类无效")
+        if market_type == "让球":
+            if not home_handicap and not away_handicap:
+                raise ValueError(f"下注{number}请选择主队让或客队让盘口值")
+            if (
+                home_handicap and home_handicap not in PB_HANDICAP_VALUES
+            ) or (
+                away_handicap and away_handicap not in PB_HANDICAP_VALUES
+            ):
+                raise ValueError("让球盘口值无效")
+            market_value = ""
+        else:
+            allowed_values = PB_BET_VALUES.get(market_type)
+            if allowed_values is None:
+                raise ValueError("盘口类型或盘口值无效")
+            if not market_value:
+                raise ValueError(f"下注{number}请选择盘口值")
+            if market_value not in allowed_values:
+                raise ValueError("盘口类型或盘口值无效")
+            home_handicap = ""
+            away_handicap = ""
+        if market_type not in {"胜平负", "大小球", "让球"}:
+            raise ValueError("盘口类型或盘口值无效")
+        validated.append(
+            {
+                "bet_period": bet_period,
+                "market_type": market_type,
+                "market_value": market_value or None,
+                "home_handicap": home_handicap or None,
+                "away_handicap": away_handicap or None,
+            }
+        )
+    return validated
+
+
+def replace_pb_bets(
+    database_url: str,
+    match_id: int,
+    bets: object,
+    updated_by: str,
+) -> List[Dict[str, Optional[str]]]:
+    if match_id <= 0:
+        raise ValueError("比赛 ID 无效")
+    validated = validate_pb_bets(bets)
+    with psycopg2.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM match_details WHERE match_id = %s)",
+                (match_id,),
+            )
+            if not cursor.fetchone()[0]:
+                raise ValueError("比赛不存在")
+            cursor.execute(
+                "DELETE FROM match_web_pb_bet WHERE match_id = %s",
+                (match_id,),
+            )
+            cursor.executemany(
+                """
+                INSERT INTO match_web_pb_bet (
+                    match_id, bet_number, bet_period, market_type,
+                    market_value, home_handicap, away_handicap, updated_by
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        match_id,
+                        number,
+                        bet["bet_period"],
+                        bet["market_type"],
+                        bet["market_value"],
+                        bet["home_handicap"],
+                        bet["away_handicap"],
+                        updated_by,
+                    )
+                    for number, bet in enumerate(validated, start=1)
+                ],
+            )
+    return validated
 
 
 def replace_active_session(
@@ -469,7 +650,8 @@ def fetch_company_47_suspensions(
             details.away_team,
             COALESCE(pb_status.status, '') AS pb_status,
             warning_totals.total_line_raw AS warning_line,
-            suspension_time_points.points
+            suspension_time_points.points,
+            COALESCE(pb_bets.bets, '[]'::JSONB) AS bets
         FROM qualifying_match_ids
         JOIN match_details AS details USING (match_id)
         LEFT JOIN match_web_pb_status AS pb_status USING (match_id)
@@ -483,6 +665,20 @@ def fetch_company_47_suspensions(
             ORDER BY totals.seq ASC
             LIMIT 1
         ) AS warning_totals ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT JSONB_AGG(
+                JSONB_BUILD_OBJECT(
+                    'bet_period', saved_bets.bet_period,
+                    'market_type', saved_bets.market_type,
+                    'market_value', saved_bets.market_value,
+                    'home_handicap', saved_bets.home_handicap,
+                    'away_handicap', saved_bets.away_handicap
+                )
+                ORDER BY saved_bets.bet_number
+            ) AS bets
+            FROM match_web_pb_bet AS saved_bets
+            WHERE saved_bets.match_id = details.match_id
+        ) AS pb_bets ON TRUE
         JOIN suspension_time_points USING (match_id)
         ORDER BY details.scheduled_time ASC, details.match_id ASC
     """
@@ -506,6 +702,7 @@ def fetch_company_47_suspensions(
             "pb_status": row[8],
             "warning_line": row[9],
             "suspension_points": row[10],
+            "bets": row[11],
         }
         for row in rows
     ]
@@ -618,6 +815,11 @@ class MatchWebApp:
         self, match_id: int, status: str, updated_by: str
     ) -> None:
         set_pb_match_status(self.database_url, match_id, status, updated_by)
+
+    def replace_pb_bets(
+        self, match_id: int, bets: object, updated_by: str
+    ) -> List[Dict[str, Optional[str]]]:
+        return replace_pb_bets(self.database_url, match_id, bets, updated_by)
 
     def _replace_active_session(
         self, username: str, session_id: str, expires_at: datetime
@@ -796,6 +998,30 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_PUT(self) -> None:
+        pb_bets_match_id = self.pb_bets_api_match_id()
+        if pb_bets_match_id is not None:
+            username = self.current_username()
+            if username is None:
+                self.send_json({"error": "未登录"}, HTTPStatus.UNAUTHORIZED)
+                return
+            payload = self.read_json()
+            if payload is None:
+                return
+            try:
+                bets = self.server.app.replace_pb_bets(
+                    pb_bets_match_id, payload.get("bets"), username
+                )
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except psycopg2.Error:
+                self.send_json(
+                    {"error": "暂时无法保存注单"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self.send_json({"match_id": pb_bets_match_id, "bets": bets})
+            return
         pb_match_id = self.pb_status_api_match_id()
         if pb_match_id is not None:
             username = self.current_username()
@@ -864,6 +1090,17 @@ class MatchWebHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         prefix = "/api/company-47-suspensions/"
         suffix = "/status"
+        if not parsed.path.startswith(prefix) or not parsed.path.endswith(suffix):
+            return None
+        value = parsed.path[len(prefix):-len(suffix)]
+        if not value.isdigit():
+            return None
+        return int(value)
+
+    def pb_bets_api_match_id(self) -> Optional[int]:
+        parsed = urlparse(self.path)
+        prefix = "/api/company-47-suspensions/"
+        suffix = "/bets"
         if not parsed.path.startswith(prefix) or not parsed.path.endswith(suffix):
             return None
         value = parsed.path[len(prefix):-len(suffix)]
@@ -1069,6 +1306,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         ensure_pb_status_table(database_url)
         ensure_user_session_table(database_url)
+        ensure_pb_bet_table(database_url)
     except psycopg2.Error:
         print("无法初始化 MatchWeb 数据表。", file=sys.stderr)
         return 2
