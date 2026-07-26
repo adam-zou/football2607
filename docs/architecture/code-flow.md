@@ -396,7 +396,9 @@ Every standalone network page must acquire a lease from
 The scheduler is one long-running localhost HTTP service and is the only process
 that calls the supplier. It calls immediately and then every 1.6 seconds by default; each
 response contributes up to ten `host:port` addresses to the one shared in-memory
-pool only after validation. The ten candidates are checked concurrently through
+pool only after validation. Supplier API calls explicitly bypass operating-system
+and environment proxy settings so local tools such as Clash cannot change the
+public source IP used for supplier authorization. The ten candidates are checked concurrently through
 their authenticated HTTPS proxy against `PROXY_TEST_URL`; only a 2xx or 3xx
 response enters the pool. `/health` reports the latest received and validated
 counts, distinct available and quarantined proxies, remaining page-assignment slots,

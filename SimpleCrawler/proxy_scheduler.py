@@ -553,7 +553,12 @@ class ProxyScheduler:
     @staticmethod
     def _fetch_proxy_text(url: str, timeout: float) -> str:
         request = urllib.request.Request(url, headers=DEFAULT_HEADERS)
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # The supplier commonly authorizes the machine's public IP.  Do not let
+        # Windows system-proxy settings (for example Clash) change that egress.
+        direct_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({})
+        )
+        with direct_opener.open(request, timeout=timeout) as response:
             return response.read().decode("utf-8", errors="replace")
 
     @staticmethod
