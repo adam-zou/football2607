@@ -347,17 +347,18 @@ entrypoint. Its date range defaults to January 1 of the current Shanghai-calenda
 year through today and may be overridden with inclusive `--start-date` and
 `--end-date` values in `YYYYMMDD` format. It visits the corresponding
 `Over_YYYYMMDD.htm` pages from newest to oldest with direct HTTP requests and
-parses the server-rendered `#table_live` rows without launching a browser or
-executing JavaScript. Each date is completed before the preceding date is fetched:
-empty `sId` placeholder rows are ignored, numeric IDs are deduplicated within the
-page, existing `match_ids` rows are removed, and all new IDs for that date are
-written. Batches are controlled by `SIMPLE_CRAWLER_ARCHIVE_BATCH_SIZE` (default
-20), with `SIMPLE_CRAWLER_ARCHIVE_INTERVAL_SECONDS` (default 300 seconds) between
-database-write batches for the same date. Date boundaries add no delay, so the
-preceding date begins immediately after the current date is complete. Every batch
-still uses `ON CONFLICT DO NOTHING` to remain safe if another worker inserts the
-same ID after the daily existence check. The command uses the shared database but
-is not scheduled by `run_scheduler.py` and does not use the proxy scheduler.
+parses numeric `sId` attributes directly from the raw `table_live` HTML fragment
+without launching a browser, executing JavaScript, or depending on DOM recovery
+for malformed source markup. Each date is completed before the preceding date is
+fetched: empty `sId` placeholder rows are ignored, numeric IDs are deduplicated
+within the page, existing `match_ids` rows are removed, and all new IDs for that
+date are written. Batches are controlled by `SIMPLE_CRAWLER_ARCHIVE_BATCH_SIZE`
+(default 20), with `SIMPLE_CRAWLER_ARCHIVE_INTERVAL_SECONDS` (default 300 seconds)
+between database-write batches for the same date. Date boundaries add no delay,
+so the preceding date begins immediately after the current date is complete. Every
+batch still uses `ON CONFLICT DO NOTHING` to remain safe if another worker inserts
+the same ID after the daily existence check. The command uses the shared database
+but is not scheduled by `run_scheduler.py` and does not use the proxy scheduler.
 
 The connection string comes only from `SIMPLE_CRAWLER_DATABASE_URL` in
 `SimpleCrawler/.env`. The script creates `match_ids` on first use. Its `match_id`

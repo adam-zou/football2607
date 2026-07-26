@@ -202,9 +202,10 @@ python SimpleCrawler/fetch_match_ids.py --headed
 
 ### 获取完场归档页比赛 ID
 
-独立脚本通过普通 HTTP 请求按日期倒序下载完场归档页，从服务器返回的比赛表格
-中读取每行的 `sId`。默认范围是上海时区当年 1 月 1 日至今天，最近日期优先；
-也可指定包含首尾日期的范围：
+独立脚本通过普通 HTTP 请求按日期倒序下载完场归档页，直接从原始响应中的
+`table_live` 表格片段读取每行的 `sId`，因此源站局部 HTML 畸形不会导致整天
+比赛被漏掉。默认范围是上海时区当年 1 月 1 日至今天，最近日期优先；也可指定
+包含首尾日期的范围：
 
 ```bash
 python SimpleCrawler/fetch_archive_match_ids.py

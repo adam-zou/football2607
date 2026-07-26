@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -14,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 from dotenv import load_dotenv
-from lxml import html as lxml_html
 from psycopg2.extras import execute_values
 
 
@@ -29,6 +29,15 @@ ENV_FILE = Path(__file__).with_name(".env")
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 TASK_PREFIX = "[归档比赛 ID]"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/138.0"
+MATCH_TABLE_OPEN_PATTERN = re.compile(
+    rb"<table\b(?=[^>]*\bid\s*=\s*(?:['\"]table_live['\"]|table_live\b))[^>]*>",
+    re.IGNORECASE,
+)
+MATCH_TABLE_CLOSE_PATTERN = re.compile(rb"</table\s*>", re.IGNORECASE)
+SID_ATTRIBUTE_PATTERN = re.compile(
+    rb'''\bsid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))''',
+    re.IGNORECASE,
+)
 
 CREATE_MATCH_IDS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS match_ids (
@@ -103,14 +112,18 @@ def iter_dates_descending(start_date: date, end_date: date) -> Iterable[date]:
 
 
 def extract_match_ids_from_html(source: bytes) -> List[int]:
-    document = lxml_html.fromstring(source)
-    tables = document.xpath('//*[@id="table_live"]')
-    if not tables:
+    table_open = MATCH_TABLE_OPEN_PATTERN.search(source)
+    if table_open is None:
         raise RuntimeError("页面缺少比赛列表 table_live")
+    table_close = MATCH_TABLE_CLOSE_PATTERN.search(source, table_open.end())
+    if table_close is None:
+        raise RuntimeError("比赛列表 table_live 响应不完整")
+    table_source = source[table_open.end() : table_close.start()]
 
     match_ids: List[int] = []
     seen = set()
-    for raw_id in tables[0].xpath('.//tr[@sid]/@sid'):
+    for match in SID_ATTRIBUTE_PATTERN.finditer(table_source):
+        raw_id = next(group for group in match.groups() if group is not None)
         value = raw_id.strip()
         if not value:
             continue
