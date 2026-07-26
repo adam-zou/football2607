@@ -35,6 +35,7 @@
 | `wecom_match_market_push_state` | 保存企业微信通知首次基线是否已建立 | `state_key` |
 | `wecom_match_market_pushes` | 保存每个比赛市场的通知去重、快照和发送状态 | `(match_id, market_type)` |
 | `match_web_pb_status` | 保存 PB 页面每场比赛的共享关注/作废状态 | `match_id` |
+| `match_web_pb_bet` | 保存 PB 页面每场比赛的有序共享注单 | `(match_id, bet_number)` |
 | `match_web_user_session` | 保存 PB 专用账号当前唯一有效会话的哈希 | `username` |
 
 仓库还提供四个不存储数据的可选 PostgreSQL 视图：
@@ -274,7 +275,25 @@
 再次设置同一比赛时使用 `ON CONFLICT (match_id) DO UPDATE` 覆盖状态、操作者和更新时间。
 该表不声明外键，以免展示侧状态改变爬虫表的删除和生命周期语义。
 
-### 10.2 `match_web_user_session`
+### 10.2 `match_web_pb_bet`
+
+该表由 `MatchWeb/server.py` 在服务启动时创建。PB 页面保存注单时先校验比赛存在，
+再在同一事务中删除该比赛原有注单并按弹窗顺序重新写入。每场至少保存一单，但不限制
+最大数量；所有 PB 用户共享同一比赛的注单。
+
+| 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
+| --- | --- | :---: | --- | --- | --- |
+| `match_id` | `BIGINT` | 否 | 无 | 联合主键 | Titan007 比赛 ID |
+| `bet_number` | `INTEGER` | 否 | 无 | 联合主键；`> 0` | 注单显示顺序，从 1 连续编号且无上限 |
+| `bet_period` | `TEXT` | 否 | 无 | 检查约束 | 必填大类：`全场`或`半场`；迁移前已有注单补为`全场` |
+| `market_type` | `TEXT` | 否 | 无 | 检查约束 | `胜平负`、`大小球`或`让球` |
+| `market_value` | `TEXT` | 是 | `NULL` | 应用校验 | 胜平负为主/平/客；大小球为 0.5 至 9、按 0.25 递增；让球时为空 |
+| `home_handicap` | `TEXT` | 是 | `NULL` | 应用校验 | 主队让盘口，-5 至 +5、按 0.25 递增；让球时与客队让至少一个非空 |
+| `away_handicap` | `TEXT` | 是 | `NULL` | 应用校验 | 客队让盘口，-5 至 +5、按 0.25 递增；让球时与主队让至少一个非空 |
+| `updated_by` | `TEXT` | 否 | 无 |  | 保存该注单的登录用户名 |
+| `updated_at` | `TIMESTAMPTZ` | 否 | `NOW()` |  | 注单最近保存时间 |
+
+### 10.3 `match_web_user_session`
 
 该表由 `MatchWeb/server.py` 在服务启动时创建，只用于限制用户名中包含 `user`（不区分
 大小写）的 PB 账号保留一个有效会话。新登录会覆盖同一用户名的旧记录，因此旧设备的
@@ -291,7 +310,7 @@
 每次受单会话限制的 PB 账号请求都同时校验 HMAC 签名 Cookie、Cookie 到期时间以及
 该表中的会话哈希和数据库到期时间。数据库不可用时校验失败，不会降级为仅信任 Cookie。
 
-### 10.3 企业微信通知状态表
+### 10.4 企业微信通知状态表
 
 `SimpleCrawler/push_wecom_matches.py` 以 `CREATE TABLE IF NOT EXISTS` 创建并拥有
 以下两张表。

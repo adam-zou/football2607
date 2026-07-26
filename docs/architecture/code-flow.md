@@ -31,6 +31,7 @@ flowchart LR
     SimpleOddsRows[("SimpleCrawler database<br/>three Titan007 odds-change tables")]
     SimpleOddsState[("SimpleCrawler database<br/>titan007_odds_market_state")]
     PBStatus[("MatchWeb database state<br/>match_web_pb_status")]
+    PBBet[("MatchWeb database state<br/>match_web_pb_bet")]
     UserSession[("MatchWeb database state<br/>match_web_user_session")]
     OddsFilterSql["SimpleCrawler/sql/create_odds_filter_views.sql"]
     OddsFilterViews[("Optional PostgreSQL views<br/>hits, match and market summaries")]
@@ -71,6 +72,8 @@ flowchart LR
     SimpleOddsRows --> MatchWeb
     MatchWeb -->|"关注 / 作废"| PBStatus
     PBStatus --> MatchWeb
+    MatchWeb -->|"保存不限数量注单"| PBBet
+    PBBet --> MatchWeb
     MatchWeb -->|"PB 专用账号登录 / 退出"| UserSession
     UserSession -->|"每次请求校验"| MatchWeb
     OddsFilterViews --> SimpleWeCom
@@ -96,7 +99,7 @@ flowchart LR
 | `python3 SimpleCrawler/check_match_completion.py` | `SimpleCrawler/check_match_completion.py:main` | Persist resumable 18-page final snapshots for matches whose finished detail has been stable for five minutes or whose kickoff is more than four hours old | Three odds-change tables, `titan007_odds_market_state`, and `match_ids.crawl_status` |
 | `python3 SimpleCrawler/push_wecom_matches.py` | `SimpleCrawler/push_wecom_matches.py:main` | Baseline existing qualifying markets, then notify newly qualifying not-started matches through a configured WeCom group webhook | `wecom_match_market_push_state` and `wecom_match_market_pushes`; external WeCom message side effect |
 | `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
-| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status` and `match_web_user_session`; crawler-owned tables remain read-only |
+| `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status/bet controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status`, `match_web_pb_bet`, and `match_web_user_session`; crawler-owned tables remain read-only |
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
 | `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, market-summary, and market-statistics views | Four `match_odds_filter_*` views |
 
@@ -112,6 +115,7 @@ of their own validation, lifecycle, and shutdown behavior.
 `MatchWeb/server.py` is an independently started presentation service. Crawler-owned
 match and odds tables remain read-only to MatchWeb; the service owns
 `match_web_pb_status` for PB actions and `match_web_user_session` for login control.
+It also owns `match_web_pb_bet` for the PB page's shared per-match bet entries.
 It loads the same `SIMPLE_CRAWLER_DATABASE_URL` used by the crawler, accepts a
 Shanghai-calendar match date and one or more of four presentation status groups,
 then reads `match_details`. A selected match date covers scheduled times from 21:00
@@ -142,9 +146,10 @@ the timestamps of its own consecutive suspension rows already prove a duration o
 at least three minutes. This prevents a lone latest suspension marker from being
 treated as a known-duration interval. The API uses those runs only as a predicate
 and returns each qualifying match once even when several runs qualify. The page
-uses a date filter plus two presentation status options: `赛前预警` maps to
-`未开始` and `滚球预警` maps to the in-progress status group; both are selected by
-default and no finished/other option is accepted by the PB API. The rightmost
+uses a date filter plus three presentation status options: `赛前预警` maps to
+`未开始`, `滚球预警` maps to the in-progress status group, and `完场` maps to exact
+status `完`. The first two are selected by default while finished is initially
+unselected; the PB API still rejects the other-status group. The rightmost
 detail marker reuses the primary list's tooltip styling and exposes the match's
 deduplicated suspension `change_time` plus `match_minute` values, rendering a missing
 minute as `-`, without duration or `seq`. The `预警盘口` column uses the earliest
@@ -156,8 +161,21 @@ column exposes mutually exclusive `关注` and `作废`
 actions. MatchWeb creates `match_web_pb_status` at startup and upserts one shared
 status per match together with the acting username and update time. The list joins
 that state on refresh: followed rows render red and invalid rows render gray. The
-match query remains read-only and refreshes every 60 seconds; only the explicit PB
-status action writes.
+match query remains read-only and refreshes every 60 seconds; explicit PB status
+and bet-save actions own the presentation-side writes. A final `下注` column opens
+a modal with one initial entry whose market defaults to totals and whose value is
+blank. Each entry also requires a period category of `全场` or `半场`. The fixed
+market/value choices are: one-x-two accepts `主`, `平`, or `客`; totals accepts
+quarter steps from `0.5` through `9`; and handicap replaces the single value control
+with independent home-handicap and away-handicap selects, each spanning `-5` through
+`+5` in quarter steps. At least one handicap side must be selected, while selecting
+both is valid.
+`增加注单` appends entries without an upper
+limit, and every entry exposes a delete control. Client and server validation require
+at least one entry plus a selected period and valid market value(s) for every entry.
+Saving atomically replaces
+that match's numbered rows in `match_web_pb_bet`; the list query aggregates them in
+number order so all PB users and browsers see the same saved entries.
 
 All HTML and JSON match routes require a server-validated, HMAC-signed login
 session. Multiple local accounts are stored in a separately managed JSON file;

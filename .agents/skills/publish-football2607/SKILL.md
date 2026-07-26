@@ -1,11 +1,11 @@
 ---
 name: publish-football2607
-description: Safely publish changes from the adam-zou/football2607 repository by reviewing scope, validating the project, committing selected files, pushing a feature branch, and creating or updating a draft pull request. Use when the user asks to Git push, sync this project, publish current Football2607 changes, submit the project, or create a PR from local work.
+description: Safely publish changes from the adam-zou/football2607 repository by reviewing scope, validating the project, committing selected files, pushing a feature branch, creating or updating a pull request, and optionally merging it when explicitly requested. Use when the user asks to Git push, sync this project, publish current Football2607 changes, submit the project, create a PR, or merge the published PR.
 ---
 
 # Publish Football2607
 
-Publish the current repository changes without silently including unrelated files, secrets, local accounts, or data snapshots. Stop after creating or updating a draft PR; never merge it unless the user explicitly asks.
+Publish the current repository changes without silently including unrelated files, secrets, local accounts, or data snapshots. Stop after creating or updating a draft PR unless the current user request explicitly asks to merge it.
 
 ## 1. Confirm repository and authority
 
@@ -84,15 +84,40 @@ The PR title must summarize the full branch diff. The body must contain:
 - root cause when publishing a fix;
 - exact validation commands and results.
 
-Do not mark the PR ready or merge it without explicit user authorization.
+Do not mark the PR ready or merge it without explicit authorization in the current
+user request. A request to commit, push, publish, submit, or create a PR alone is not
+authorization to merge.
 
-## 7. Verify and report
+## 7. Merge when explicitly requested
+
+Run this section only when the current user request explicitly asks to merge the PR.
+
+1. Resolve the exact PR for the current head branch and require it to be open, target
+   `main`, and contain the remote branch's latest commit.
+2. Inspect mergeability, review decision, and status checks. Do not merge when the PR
+   has conflicts, requested changes, or failing/pending required checks. Report the
+   blocker instead.
+3. If the PR is a draft and all gates pass, mark it ready with `gh pr ready`.
+4. Merge with the repository's normal merge method, defaulting to
+   `gh pr merge <number> --merge`. Never use `--admin` to bypass branch protection.
+5. Verify the PR state is `MERGED`, fetch `origin`, and confirm the merge commit is in
+   `origin/main`. When the worktree is clean, switch to `main` and update it with
+   `git pull --ff-only origin main`.
+
+Do not delete local or remote feature branches automatically. Do not enable auto-merge
+unless the user explicitly asks for auto-merge.
+
+## 8. Verify and report
 
 After publishing, verify:
 
 - `git status --short --branch`;
 - local `HEAD` equals the remote feature branch;
 - the PR head and base branches are correct;
-- the PR contains the latest commit.
+- the PR contains the latest commit;
+- when merging was requested, the PR is merged and its merge commit is present in
+  `origin/main`.
 
-Report the branch, commit SHA and subject, PR link and draft state, validations, and any untracked or unstaged files left locally. Emit the product's Git stage, commit, push, and PR directives only for actions that actually succeeded.
+Report the branch, commit SHA and subject, PR link and draft/merge state, validations,
+and any untracked or unstaged files left locally. Emit the product's Git stage,
+commit, push, and PR directives only for actions that actually succeeded.

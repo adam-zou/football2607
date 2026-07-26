@@ -7,7 +7,23 @@ const errorState = document.getElementById('error-state');
 const resultSummary = document.getElementById('result-summary');
 const updatedAt = document.getElementById('updated-at');
 const refreshState = document.getElementById('refresh-state');
+const betDialog = document.getElementById('bet-dialog');
+const betForm = document.getElementById('bet-form');
+const betEntries = document.getElementById('bet-entries');
+const betMatchLabel = document.getElementById('bet-match-label');
+const betFormError = document.getElementById('bet-form-error');
+const addBetButton = document.getElementById('add-bet-button');
+const betDialogSave = document.getElementById('bet-dialog-save');
+const ONE_X_TWO_VALUES = ['主', '平', '客'];
+const TOTAL_VALUES = Array.from({ length: 35 }, (_, index) => String((index + 2) / 4));
+const HANDICAP_VALUES = Array.from({ length: 41 }, (_, index) => {
+  const value = (index - 20) / 4;
+  if (value === 0) return '0';
+  return value > 0 ? `+${value}` : String(value);
+});
+const HANDICAP_ZERO_INDEX = HANDICAP_VALUES.indexOf('0');
 let refreshTimer;
+let activeBetMatch;
 
 function localDateValue() {
   const parts = new Intl.DateTimeFormat('zh-CN', {
@@ -108,6 +124,163 @@ function createSuspensionMarker(points) {
   return marker;
 }
 
+function marketValues(marketType) {
+  if (marketType === '大小球') return TOTAL_VALUES;
+  return ONE_X_TWO_VALUES;
+}
+
+function replaceSelectOptions(
+  select, values, selectedValue, includePlaceholder = true, placeholderIndex = 0,
+) {
+  select.replaceChildren();
+  let placeholder;
+  if (includePlaceholder) {
+    placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '请选择';
+    placeholder.selected = !selectedValue;
+  }
+  values.forEach((value, index) => {
+    if (placeholder && index === placeholderIndex) select.append(placeholder);
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = value;
+    option.selected = value === selectedValue;
+    select.append(option);
+  });
+  if (placeholder && placeholderIndex >= values.length) select.append(placeholder);
+}
+
+function appendBetEntry(bet = {
+  bet_period: '', market_type: '大小球', market_value: '',
+  home_handicap: '', away_handicap: '',
+}) {
+  const entry = document.createElement('section');
+  entry.className = 'bet-entry';
+
+  const heading = document.createElement('div');
+  heading.className = 'bet-entry-heading';
+  const title = document.createElement('strong');
+  heading.append(title);
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'text-button danger-text';
+  removeButton.textContent = '删除';
+  removeButton.addEventListener('click', () => {
+    entry.remove();
+    renumberBetEntries();
+  });
+  heading.append(removeButton);
+
+  const periodLabel = document.createElement('label');
+  periodLabel.className = 'form-field';
+  periodLabel.append('大类');
+  const periodSelect = document.createElement('select');
+  periodSelect.className = 'bet-period';
+  replaceSelectOptions(periodSelect, ['全场', '半场'], bet.bet_period);
+  periodLabel.append(periodSelect);
+
+  const marketLabel = document.createElement('label');
+  marketLabel.className = 'form-field';
+  marketLabel.append('盘口类型');
+  const marketSelect = document.createElement('select');
+  marketSelect.className = 'bet-market-type';
+  replaceSelectOptions(marketSelect, ['胜平负', '大小球', '让球'], bet.market_type, false);
+  marketLabel.append(marketSelect);
+
+  const valueLabel = document.createElement('label');
+  valueLabel.className = 'form-field bet-standard-value';
+  valueLabel.append('盘口值');
+  const valueSelect = document.createElement('select');
+  valueSelect.className = 'bet-market-value';
+  replaceSelectOptions(valueSelect, marketValues(bet.market_type), bet.market_value);
+  valueLabel.append(valueSelect);
+
+  const homeHandicapLabel = document.createElement('label');
+  homeHandicapLabel.className = 'form-field bet-handicap-value';
+  homeHandicapLabel.append('主队让');
+  const homeHandicapSelect = document.createElement('select');
+  homeHandicapSelect.className = 'bet-home-handicap';
+  replaceSelectOptions(
+    homeHandicapSelect, HANDICAP_VALUES, bet.home_handicap, true,
+    HANDICAP_ZERO_INDEX,
+  );
+  homeHandicapLabel.append(homeHandicapSelect);
+
+  const awayHandicapLabel = document.createElement('label');
+  awayHandicapLabel.className = 'form-field bet-handicap-value';
+  awayHandicapLabel.append('客队让');
+  const awayHandicapSelect = document.createElement('select');
+  awayHandicapSelect.className = 'bet-away-handicap';
+  replaceSelectOptions(
+    awayHandicapSelect, HANDICAP_VALUES, bet.away_handicap, true,
+    HANDICAP_ZERO_INDEX,
+  );
+  awayHandicapLabel.append(awayHandicapSelect);
+
+  function syncMarketFields() {
+    const isHandicap = marketSelect.value === '让球';
+    valueLabel.hidden = isHandicap;
+    homeHandicapLabel.hidden = !isHandicap;
+    awayHandicapLabel.hidden = !isHandicap;
+  }
+
+  marketSelect.addEventListener('change', () => {
+    replaceSelectOptions(valueSelect, marketValues(marketSelect.value), '');
+    replaceSelectOptions(
+      homeHandicapSelect, HANDICAP_VALUES, '', true, HANDICAP_ZERO_INDEX,
+    );
+    replaceSelectOptions(
+      awayHandicapSelect, HANDICAP_VALUES, '', true, HANDICAP_ZERO_INDEX,
+    );
+    syncMarketFields();
+  });
+
+  entry.append(
+    heading, periodLabel, marketLabel, valueLabel,
+    homeHandicapLabel, awayHandicapLabel,
+  );
+  betEntries.append(entry);
+  syncMarketFields();
+  renumberBetEntries();
+}
+
+function renumberBetEntries() {
+  Array.from(betEntries.children).forEach((entry, index) => {
+    entry.querySelector('strong').textContent = `下注${index + 1}`;
+  });
+}
+
+function openBetDialog(match) {
+  activeBetMatch = match;
+  betMatchLabel.textContent = `比赛 ID：${match.match_id}`;
+  betEntries.replaceChildren();
+  betFormError.hidden = true;
+  const savedBets = Array.isArray(match.bets) && match.bets.length > 0
+    ? match.bets
+    : [{
+      bet_period: '', market_type: '大小球', market_value: '',
+      home_handicap: '', away_handicap: '',
+    }];
+  savedBets.forEach((bet) => appendBetEntry(bet));
+  betDialog.showModal();
+}
+
+function closeBetDialog() {
+  betDialog.close();
+  activeBetMatch = undefined;
+}
+
+function createBetButton(match) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'pb-action bet';
+  button.textContent = '下注';
+  button.setAttribute('aria-pressed', String(Array.isArray(match.bets) && match.bets.length > 0));
+  button.addEventListener('click', () => openBetDialog(match));
+  return button;
+}
+
 function renderMatches(matches) {
   rows.replaceChildren();
   for (const match of matches) {
@@ -129,6 +302,7 @@ function renderMatches(matches) {
       text(match.warning_line),
       createSuspensionMarker(match.suspension_points),
       createActions(match, row),
+      createBetButton(match),
     ];
     cells.forEach((content, index) => {
       const cell = document.createElement('td');
@@ -159,7 +333,11 @@ async function loadMatches() {
     if (!response.ok) throw new Error(payload.error || '读取失败');
     renderMatches(payload.matches);
     emptyState.hidden = payload.matches.length !== 0;
-    const statusLabels = payload.statuses.map((status) => status === '未开始' ? '赛前预警' : '滚球预警');
+    const statusLabels = payload.statuses.map((status) => ({
+      未开始: '赛前预警',
+      进行中: '滚球预警',
+      完: '完场',
+    })[status] || status);
     resultSummary.textContent = `${payload.date} · ${statusLabels.join('、')} · 共 ${payload.total} 场`;
     updatedAt.textContent = `更新于 ${new Date(payload.refreshed_at).toLocaleTimeString('zh-CN', { hour12: false })}`;
     refreshState.textContent = '每 60 秒自动刷新';
@@ -183,4 +361,72 @@ document.querySelectorAll('input[name="status"]').forEach((input) => input.addEv
   if (selectedStatuses().length === 0) input.checked = true;
   loadMatches();
 }));
+addBetButton.addEventListener('click', () => appendBetEntry());
+document.getElementById('bet-dialog-close').addEventListener('click', closeBetDialog);
+document.getElementById('bet-dialog-cancel').addEventListener('click', closeBetDialog);
+betForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!activeBetMatch) return;
+  const bets = Array.from(betEntries.children, (entry) => ({
+    bet_period: entry.querySelector('.bet-period').value,
+    market_type: entry.querySelector('.bet-market-type').value,
+    market_value: entry.querySelector('.bet-market-value').value,
+    home_handicap: entry.querySelector('.bet-home-handicap').value,
+    away_handicap: entry.querySelector('.bet-away-handicap').value,
+  }));
+  if (bets.length === 0) {
+    betFormError.hidden = false;
+    betFormError.textContent = '请至少增加一个下注单';
+    return;
+  }
+  const missingPeriodIndex = bets.findIndex((bet) => !bet.bet_period);
+  if (missingPeriodIndex !== -1) {
+    betFormError.hidden = false;
+    betFormError.textContent = `下注${missingPeriodIndex + 1}请选择大类`;
+    betEntries.children[missingPeriodIndex].querySelector('.bet-period').focus();
+    return;
+  }
+  const missingValueIndex = bets.findIndex((bet) => (
+    bet.market_type === '让球'
+      ? !bet.home_handicap && !bet.away_handicap
+      : !bet.market_value
+  ));
+  if (missingValueIndex !== -1) {
+    betFormError.hidden = false;
+    const missingBet = bets[missingValueIndex];
+    betFormError.textContent = missingBet.market_type === '让球'
+      ? `下注${missingValueIndex + 1}请选择主队让或客队让盘口值`
+      : `下注${missingValueIndex + 1}请选择盘口值`;
+    const selector = missingBet.market_type === '让球'
+      ? '.bet-home-handicap'
+      : '.bet-market-value';
+    betEntries.children[missingValueIndex].querySelector(selector).focus();
+    return;
+  }
+  betDialogSave.disabled = true;
+  betFormError.hidden = true;
+  try {
+    const response = await fetch(
+      `/api/company-47-suspensions/${encodeURIComponent(activeBetMatch.match_id)}/bets`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bets }),
+      },
+    );
+    if (response.status === 401) {
+      location.href = '/login';
+      return;
+    }
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '保存失败');
+    activeBetMatch.bets = payload.bets;
+    closeBetDialog();
+  } catch (error) {
+    betFormError.hidden = false;
+    betFormError.textContent = error.message || '保存注单失败';
+  } finally {
+    betDialogSave.disabled = false;
+  }
+});
 loadMatches();

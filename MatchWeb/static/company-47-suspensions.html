@@ -28,6 +28,8 @@
             <label for="status-not-started">赛前预警</label>
             <input id="status-live" name="status" type="checkbox" value="进行中" checked />
             <label for="status-live">滚球预警</label>
+            <input id="status-finished" name="status" type="checkbox" value="完" />
+            <label for="status-finished">完场</label>
           </div>
         </fieldset>
         <button id="query-button" class="query-button" type="button">查询</button>
@@ -55,6 +57,7 @@
                 <th>预警盘口</th>
                 <th>详情</th>
                 <th>操作</th>
+                <th>下注</th>
               </tr>
             </thead>
             <tbody id="match-rows"></tbody>
@@ -64,6 +67,22 @@
         </div>
       </section>
     </main>
+
+    <dialog id="bet-dialog" class="user-dialog bet-dialog">
+      <form id="bet-form">
+        <div class="dialog-heading">
+          <div><h2>下注设置</h2><p id="bet-match-label"></p></div>
+          <button id="bet-dialog-close" class="icon-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="bet-entries" class="bet-entries"></div>
+        <button id="add-bet-button" class="secondary-button add-bet-button" type="button">＋ 增加注单</button>
+        <p id="bet-form-error" class="inline-error" hidden></p>
+        <div class="dialog-actions">
+          <button id="bet-dialog-cancel" class="secondary-button" type="button">取消</button>
+          <button id="bet-dialog-save" class="primary-button" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
     <script src="/company-47-suspensions.js" defer></script>
   </body>
 </html>
