@@ -8,6 +8,9 @@ from push_wecom_matches import (
     BASELINE_SQL,
     CREATE_NOTIFICATION_SCHEMA_SQL,
     DISCOVER_SQL,
+    EXPIRE_SQL,
+    PB_BASELINE_SQL,
+    PB_DISCOVER_SQL,
     PushRecord,
     WeComDeliveryError,
     build_message,
@@ -60,6 +63,22 @@ class NotificationSchemaTests(unittest.TestCase):
         self.assertIn("'pending'", DISCOVER_SQL)
         self.assertIn("ON CONFLICT (match_id, market_type) DO NOTHING", DISCOVER_SQL)
 
+    def test_pb_warning_reuses_page_trigger_and_targets_1_5_and_3_5(self):
+        for statement in (PB_BASELINE_SQL, PB_DISCOVER_SQL):
+            self.assertIn("changes.company_id = 47", statement)
+            self.assertIn("changes.source_status,", statement)
+            self.assertIn("changes.is_suspended,", statement)
+            self.assertIn("WHERE source_status = '滚'", statement)
+            self.assertIn("AND is_suspended", statement)
+            self.assertIn("next_row.seq = runs.end_seq + 1", statement)
+            self.assertIn("INTERVAL '3 minutes'", statement)
+            self.assertIn("start_match_minute + 3 AS warning_minute", statement)
+            self.assertIn("totals.company_id = 47", statement)
+            self.assertIn("total_line_value IN (1.5, 3.5)", statement)
+            self.assertIn("'pb_warning'", statement)
+        self.assertIn("'pb_warning_baseline'", PB_DISCOVER_SQL)
+        self.assertIn("pushes.market_type <> 'pb_warning'", EXPIRE_SQL)
+
 
 class MessageTests(unittest.TestCase):
     def test_groups_markets_by_match(self):
@@ -84,6 +103,12 @@ class MessageTests(unittest.TestCase):
         self.assertNotIn("**", message)
         self.assertNotIn("> ", message)
         self.assertNotIn("[查看赔率]", message)
+
+    def test_builds_pb_warning_message_without_fake_company_count(self):
+        message = build_message([record(123, "pb_warning")])
+
+        self.assertIn("PB 预警盘口: 2.5", message)
+        self.assertNotIn("1 家", message)
 
     def test_removes_markdown_control_characters_from_match_text(self):
         dirty = PushRecord(

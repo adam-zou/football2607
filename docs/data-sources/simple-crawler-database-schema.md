@@ -319,20 +319,20 @@
 
 | 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
 | --- | --- | :---: | --- | --- | --- |
-| `state_key` | `TEXT` | 否 | 无 | 主键；固定为 `match_market_baseline` | 基线类型 |
+| `state_key` | `TEXT` | 否 | 无 | 主键；`match_market_baseline` 或 `pb_warning_baseline` | 基线类型 |
 | `initialized_at` | `TIMESTAMPTZ` | 否 | `NOW()` |  | 首次基线建立时间 |
 
 独立初始化表保证即使首轮没有符合条件的比赛，后续新比赛也不会被
 错当成基线而漏发。
 
-`wecom_match_market_pushes` 每个“比赛 + 市场类别”一行：
+`wecom_match_market_pushes` 每个“比赛 + 推送类别”一行：
 
 | 字段 | PostgreSQL 类型 | 可空 | 默认值 | 约束/键 | 字段说明 |
 | --- | --- | :---: | --- | --- | --- |
 | `match_id` | `BIGINT` | 否 | 无 | 联合主键 | Titan007 比赛 ID |
-| `market_type` | `TEXT` | 否 | 无 | 联合主键；检查约束 | `over_under`、`handicap_home` 或 `handicap_away` |
+| `market_type` | `TEXT` | 否 | 无 | 联合主键；检查约束 | `over_under`、`handicap_home`、`handicap_away` 或 `pb_warning` |
 | `push_status` | `TEXT` | 否 | 无 | 检查约束 | `baseline`、`pending`、`sent`、`failed` 或 `expired` |
-| `company_count` | `BIGINT` | 否 | 无 | `company_count >= 3` | 发现时的命中公司数快照 |
+| `company_count` | `BIGINT` | 否 | 无 | `company_count >= 1` | 发现时的命中公司数快照；PB 预警固定为公司 47，因此为 1 |
 | `line_value` | `NUMERIC(6,2)` | 是 | `NULL` |  | 发现时的最大盘口快照 |
 | `league` | `TEXT` | 是 | `NULL` |  | 发现时的联赛快照 |
 | `scheduled_time` | `TEXT` | 否 | 无 |  | 发现时的开赛时间快照 |
@@ -344,7 +344,9 @@
 | `attempt_count` | `INTEGER` | 否 | `0` | `attempt_count >= 0` | Webhook 尝试次数 |
 | `last_error` | `TEXT` | 是 | `NULL` |  | 最近一次失败摘要，不含 Webhook URL |
 
-首次运行将当前符合条件且“未开始”的记录写为 `baseline`。之后候选
+普通赔率类型和 PB 预警类型分别建立首次基线，将当时符合条件的记录写为
+`baseline`。PB 预警复用 PB 页面的公司 47 连续封盘三分钟规则，并仅接收触发时
+大小球盘口数值为 `1.5` 或 `3.5` 的比赛。之后候选
 记录还必须满足 `match_ids.created_at > initialized_at`，以排除基线前已发现、
 但之后才补齐赔率数据的旧比赛。新记录使用
 `INSERT ... ON CONFLICT DO NOTHING` 写为 `pending`，联合主键防止
