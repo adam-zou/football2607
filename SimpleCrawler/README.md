@@ -397,6 +397,10 @@ python SimpleCrawler/fetch_odds_pages.py --help
 | `PROXY_TEST_URL` | `https://live.titan007.com/oldIndexall.aspx` | 新代理入池前的验证地址 |
 | `PROXY_TEST_TIMEOUT_SECONDS` | `5` | 单个代理验证请求超时 |
 
+代理供应商取 IP 接口始终直连，不继承 Windows 系统代理或
+`HTTP_PROXY`/`HTTPS_PROXY` 等环境变量。因而开启 Clash 系统代理不会改变供应商
+看到的出口 IP；拿到候选 IP 后的可用性验证仍会通过候选代理本身发起。
+
 所有间隔、超时和并发配置必须是有效的正数。需要禁用单轮数量限制时，将对应
 `LIMIT` 配置留空。
 

@@ -1,10 +1,35 @@
 import threading
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from proxy_scheduler import ProxyClient, ProxyScheduler, ProxySchedulerError
+
+
+class ProxySupplierRequestTests(unittest.TestCase):
+    def test_supplier_request_ignores_system_proxy_settings(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"192.0.2.10:8000"
+        opener = MagicMock()
+        opener.open.return_value = response
+
+        with patch(
+            "proxy_scheduler.urllib.request.build_opener",
+            return_value=opener,
+        ) as build_opener:
+            text = ProxyScheduler._fetch_proxy_text(
+                "https://proxy.example.test/getip",
+                3.0,
+            )
+
+        handler = build_opener.call_args.args[0]
+        self.assertIsInstance(handler, urllib.request.ProxyHandler)
+        self.assertEqual(handler.proxies, {})
+        opener.open.assert_called_once()
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 3.0)
+        self.assertEqual(text, "192.0.2.10:8000")
 
 
 class GlobalApiRateLimitTests(unittest.TestCase):
