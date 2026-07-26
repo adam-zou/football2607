@@ -98,7 +98,7 @@ flowchart LR
 | `python3 SimpleCrawler/proxy_scheduler.py` | `SimpleCrawler/proxy_scheduler.py:main` | Run the single localhost proxy-pool and lease service | In-memory proxy and lease state |
 | `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status` and `match_web_user_session`; crawler-owned tables remain read-only |
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
-| `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, and market-summary views | Three `match_odds_filter_*` views |
+| `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, market-summary, and market-statistics views | Four `match_odds_filter_*` views |
 
 ## Authenticated match view
 
@@ -147,7 +147,11 @@ uses a date filter plus two presentation status options: `赛前预警` maps to
 default and no finished/other option is accepted by the PB API. The rightmost
 detail marker reuses the primary list's tooltip styling and exposes the match's
 deduplicated suspension `change_time` plus `match_minute` values, rendering a missing
-minute as `-`, without duration or `seq`. The action
+minute as `-`, without duration or `seq`. The `预警盘口` column uses the earliest
+qualifying suspension run's starting `match_minute + 3` as the warning trigger
+minute, then selects the first company-47 over-under row in `seq ASC` order whose
+`match_minute` is at or after that trigger and displays its `total_line_raw`; a
+missing trigger or matching totals row renders as `—`. The action
 column exposes mutually exclusive `关注` and `作废`
 actions. MatchWeb creates `match_web_pb_status` at startup and upserts one shared
 status per match together with the acting username and update time. The list joins
@@ -201,9 +205,12 @@ non-company-4 handicap-side and over-price rows for matches that have company-3
 data; `match_odds_filter_summary`, which retains matches where at least one of the
 over, handicap-home, or handicap-away categories is hit by three distinct
 companies; and `match_odds_filter_market_summary`, which emits each qualifying
-category with its maximum line plus a score-derived Asian-market result. The views
-read the persisted odds-change tables and `match_details` at query time and own no
-independent data.
+category with its maximum line plus a score-derived Asian-market result.
+`match_odds_filter_market_statistics` then groups non-null settlement results by
+those three market types and publishes result counts, result percentages, and a
+win percentage that treats full and half wins as wins and includes pushes in the
+settled denominator. The views read the persisted odds-change tables and
+`match_details` at query time and own no independent data.
 MatchWeb currently implements its display predicate directly and does not depend
 on these optional views. The WeCom notification worker does depend on
 `match_odds_filter_market_summary` when its webhook is configured; leaving the
@@ -583,7 +590,7 @@ It no longer re-fetches pages solely to compare row counts or spawns
 | `SimpleCrawler/proxy_scheduler.py` | Shared proxy pool, validation, leasing, quarantine, and health endpoint |
 | `SimpleCrawler/run_scheduler.py` | Process supervision, task intervals, lifecycle, and dashboard composition |
 | `SimpleCrawler/pyproject.toml` | SimpleCrawler package metadata and complete runtime dependency declaration |
-| `SimpleCrawler/sql/create_odds_filter_views.sql` | Manually installed live views for low-odds hits, three-company category summaries, and score settlement |
+| `SimpleCrawler/sql/create_odds_filter_views.sql` | Manually installed live views for low-odds hits, three-company category summaries, score settlement, and per-market result rates |
 
 ## Documentation update checklist
 

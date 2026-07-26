@@ -37,13 +37,14 @@
 | `match_web_pb_status` | 保存 PB 页面每场比赛的共享关注/作废状态 | `match_id` |
 | `match_web_user_session` | 保存 PB 专用账号当前唯一有效会话的哈希 | `username` |
 
-仓库还提供三个不存储数据的可选 PostgreSQL 视图：
+仓库还提供四个不存储数据的可选 PostgreSQL 视图：
 
 | 视图名 | 用途 |
 | --- | --- |
 | `match_odds_filter_hits` | 展开每条满足低赔率筛选条件的历史记录 |
 | `match_odds_filter_summary` | 汇总任一赔率类别至少命中三家公司的比赛 |
 | `match_odds_filter_market_summary` | 按命中类别汇总最大盘口及其比分结算结果 |
+| `match_odds_filter_market_statistics` | 按大小球、主让和客让统计已结算结果数量与占比 |
 
 表关系如下：
 
@@ -345,9 +346,9 @@ CREATE INDEX IF NOT EXISTS titan007_odds_market_state_final_pending_idx
 
 ## 12. 可选赔率筛选视图
 
-`SimpleCrawler/sql/create_odds_filter_views.sql` 创建三个实时视图。该脚本需要由
+`SimpleCrawler/sql/create_odds_filter_views.sql` 创建四个实时视图。该脚本需要由
 操作人员通过 `psql` 手工执行，不属于爬虫建表或
-调度器启动流程；MatchWeb 当前查询也不依赖这三个视图。脚本可以重复执行，视图
+调度器启动流程；MatchWeb 当前查询也不依赖这四个视图。脚本可以重复执行，视图
 每次查询都读取三张赔率变动表的当前数据，不保存独立快照。
 
 `match_odds_filter_hits` 先要求比赛在三种市场的任意一张表中存在公司 3 数据，
@@ -368,6 +369,11 @@ CREATE INDEX IF NOT EXISTS titan007_odds_market_state_final_pending_idx
 类别为 `over_under`、`handicap_home` 或 `handicap_away`，`line_value` 取该类别命中
 记录中的最大盘口值。视图左连接 `match_details` 读取比分，并按亚洲盘差值返回
 `全赢`、`赢半`、`走水`、`输半` 或 `全输`；比分或盘口缺失时结果为 `NULL`。
+
+`match_odds_filter_market_statistics` 只聚合上述视图中 `result` 非空的已结算样本，
+按 `over_under`、`handicap_home` 和 `handicap_away` 分组。每行输出已结算总数、
+五种结果的数量及保留两位小数的百分比。`win_rate_pct` 将“全赢”和“赢半”
+都计为胜，分母是包含走水在内的全部已结算样本；没有已结算样本的市场不输出行。
 
 ## 13. 数据完整性注意事项
 

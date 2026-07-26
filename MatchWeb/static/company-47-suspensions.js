@@ -126,6 +126,7 @@ function renderMatches(matches) {
       text(match.home_team),
       match.home_score == null || match.away_score == null ? '—' : `${match.home_score} : ${match.away_score}`,
       text(match.away_team),
+      text(match.warning_line),
       createSuspensionMarker(match.suspension_points),
       createActions(match, row),
     ];

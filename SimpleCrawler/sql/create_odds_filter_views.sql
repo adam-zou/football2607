@@ -1,12 +1,14 @@
 -- PostgreSQL
 --
--- Create three live views for the MatchWeb odds-filter rules:
+-- Create four live views for the MatchWeb odds-filter rules:
 --   1. public.match_odds_filter_hits: every qualifying historical odds row.
 --   2. public.match_odds_filter_summary: matches where at least one odds
 --      category is hit by three or more companies.
 --   3. public.match_odds_filter_market_summary: one row per match and odds
 --      category hit by three or more companies, with the largest line value
 --      and its score-based Asian-market result.
+--   4. public.match_odds_filter_market_statistics: settled-result counts and
+--      percentages for each qualifying odds category.
 --
 -- This script intentionally does not filter by match date or match status.
 -- It can be run repeatedly.
@@ -209,10 +211,63 @@ SELECT
 FROM scored_markets;
 
 
--- Verify that all three views now exist. All columns should be non-NULL.
+CREATE OR REPLACE VIEW public.match_odds_filter_market_statistics AS
+WITH settled_markets AS (
+    SELECT
+        market_type,
+        result
+    FROM public.match_odds_filter_market_summary
+    WHERE result IS NOT NULL
+)
+SELECT
+    market_type,
+    COUNT(*) AS settled_count,
+    COUNT(*) FILTER (WHERE result = '全赢') AS full_win_count,
+    COUNT(*) FILTER (WHERE result = '赢半') AS half_win_count,
+    COUNT(*) FILTER (WHERE result = '走水') AS push_count,
+    COUNT(*) FILTER (WHERE result = '输半') AS half_loss_count,
+    COUNT(*) FILTER (WHERE result = '全输') AS full_loss_count,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE result IN ('全赢', '赢半'))
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS win_rate_pct,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE result = '全赢')
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS full_win_rate_pct,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE result = '赢半')
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS half_win_rate_pct,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE result = '走水')
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS push_rate_pct,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE result = '输半')
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS half_loss_rate_pct,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE result = '全输')
+        / NULLIF(COUNT(*), 0),
+        2
+    ) AS full_loss_rate_pct
+FROM settled_markets
+GROUP BY market_type;
+
+
+-- Verify that all four views now exist. All columns should be non-NULL.
 SELECT
     to_regclass('public.match_odds_filter_hits') AS hits_view,
     to_regclass('public.match_odds_filter_summary') AS summary_view,
     to_regclass(
         'public.match_odds_filter_market_summary'
-    ) AS market_summary_view;
+    ) AS market_summary_view,
+    to_regclass(
+        'public.match_odds_filter_market_statistics'
+    ) AS market_statistics_view;
