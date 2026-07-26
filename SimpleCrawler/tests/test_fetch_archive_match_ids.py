@@ -107,9 +107,30 @@ class ArchiveMatchIdTests(unittest.TestCase):
             [3006702, 3013636],
         )
 
+    def test_rejects_nonempty_invalid_sid(self) -> None:
+        source = b'<table id="table_live"><tr sId="bad"></tr></table>'
+
+        with self.assertRaisesRegex(RuntimeError, "无效 sId"):
+            extract_match_ids_from_html(source)
+
     def test_rejects_page_without_match_table(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "table_live"):
             extract_match_ids_from_html(b"<html></html>")
+
+    def test_extracts_ids_when_malformed_html_hides_table_from_dom_parser(self) -> None:
+        source = b"""
+            <html><body><style>
+            <table id="table_live">
+              <tr sId="3006702"></tr>
+              <tr sId="3013636"></tr>
+            </table>
+            </body></html>
+        """
+
+        self.assertEqual(
+            extract_match_ids_from_html(source),
+            [3006702, 3013636],
+        )
 
     def test_builds_url_from_date_without_a_browser(self) -> None:
         source = b'<table id="table_live"><tr sId="3006702"></tr></table>'
