@@ -562,6 +562,56 @@ def fetch_company_47_suspensions(
                 END AS change_at
             FROM company_rows_with_raw_time
         ),
+        other_market_rows_with_raw_time AS (
+            SELECT
+                details.match_id,
+                details.scheduled_time::TIMESTAMP AS scheduled_at,
+                TO_TIMESTAMP(
+                    EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
+                    || '-' || changes.change_time,
+                    'YYYY-MM-DD HH24:MI'
+                ) AS raw_change_at
+            FROM match_details AS details
+            JOIN titan007_handicap_changes AS changes
+              ON changes.match_id = details.match_id
+             AND changes.company_id = 47
+            WHERE details.match_id IN (SELECT DISTINCT match_id FROM company_rows)
+              AND changes.source_status = '滚'
+              AND changes.change_time ~ '^\\d{{1,2}}-\\d{{1,2}} \\d{{1,2}}:\\d{{2}}$'
+
+            UNION ALL
+
+            SELECT
+                details.match_id,
+                details.scheduled_time::TIMESTAMP AS scheduled_at,
+                TO_TIMESTAMP(
+                    EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
+                    || '-' || changes.change_time,
+                    'YYYY-MM-DD HH24:MI'
+                ) AS raw_change_at
+            FROM match_details AS details
+            JOIN titan007_over_under_changes AS changes
+              ON changes.match_id = details.match_id
+             AND changes.company_id = 47
+            WHERE details.match_id IN (SELECT DISTINCT match_id FROM company_rows)
+              AND changes.source_status = '滚'
+              AND changes.change_time ~ '^\\d{{1,2}}-\\d{{1,2}} \\d{{1,2}}:\\d{{2}}$'
+        ),
+        other_market_heartbeats AS (
+            SELECT
+                match_id,
+                MAX(
+                    CASE
+                        WHEN raw_change_at < scheduled_at - INTERVAL '180 days'
+                            THEN raw_change_at + INTERVAL '1 year'
+                        WHEN raw_change_at > scheduled_at + INTERVAL '180 days'
+                            THEN raw_change_at - INTERVAL '1 year'
+                        ELSE raw_change_at
+                    END
+                ) AS latest_change_at
+            FROM other_market_rows_with_raw_time
+            GROUP BY match_id
+        ),
         suspended_rows AS (
             SELECT
                 company_rows.*,
@@ -590,17 +640,35 @@ def fetch_company_47_suspensions(
             SELECT
                 suspension_runs.*,
                 COALESCE(next_row.change_time, suspension_runs.last_time) AS end_time,
-                COALESCE(next_row.change_at, suspension_runs.last_at) AS end_at,
+                CASE
+                    WHEN next_row.seq IS NOT NULL THEN next_row.change_at
+                    ELSE GREATEST(
+                        suspension_runs.last_at,
+                        other_market_heartbeats.latest_change_at
+                    )
+                END AS end_at,
                 EXTRACT(
-                    EPOCH FROM COALESCE(next_row.change_at, suspension_runs.last_at)
-                    - suspension_runs.start_at
+                    EPOCH FROM CASE
+                        WHEN next_row.seq IS NOT NULL THEN next_row.change_at
+                        ELSE GREATEST(
+                            suspension_runs.last_at,
+                            other_market_heartbeats.latest_change_at
+                        )
+                    END - suspension_runs.start_at
                 ) / 60 AS duration_minutes
             FROM suspension_runs
             LEFT JOIN company_rows AS next_row
               ON next_row.match_id = suspension_runs.match_id
              AND next_row.seq = suspension_runs.end_seq + 1
-            WHERE COALESCE(next_row.change_at, suspension_runs.last_at)
-                    - suspension_runs.start_at >= INTERVAL '3 minutes'
+            LEFT JOIN other_market_heartbeats
+              ON other_market_heartbeats.match_id = suspension_runs.match_id
+            WHERE CASE
+                    WHEN next_row.seq IS NOT NULL THEN next_row.change_at
+                    ELSE GREATEST(
+                        suspension_runs.last_at,
+                        other_market_heartbeats.latest_change_at
+                    )
+                  END - suspension_runs.start_at >= INTERVAL '3 minutes'
         ),
         qualifying_match_ids AS (
             SELECT DISTINCT match_id

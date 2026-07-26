@@ -141,10 +141,15 @@ The authenticated `/company-47-suspensions` view uses the same Shanghai match-da
 window and reads company 47's one-x-two rows. It groups rows satisfying
 `source_status = '滚' AND is_suspended = TRUE` into stable consecutive-`seq` runs.
 A run's duration starts at its first suspension `change_time` and ends at the
-immediately following row; an open run without a following row qualifies only when
-the timestamps of its own consecutive suspension rows already prove a duration of
-at least three minutes. This prevents a lone latest suspension marker from being
-treated as a known-duration interval. The API uses those runs only as a predicate
+immediately following one-x-two row. For an open run without a following one-x-two
+row, MatchWeb uses the latest rolling company-47 handicap or over-under timestamp as
+a cross-market heartbeat; the later of that heartbeat and the run's own last
+suspension timestamp is its confirmation boundary. This recognizes a one-x-two
+market that remains suspended and stops emitting rows while another market for the
+same match and company continues updating. Without either kind of timestamp proving
+three elapsed minutes, the open run remains excluded. All market timestamps are
+parsed before comparison so both one- and two-digit month/day forms are supported.
+The API uses those runs only as a predicate
 and returns each qualifying match once even when several runs qualify. The page
 uses a date filter plus three presentation status options: `赛前预警` maps to
 `未开始`, `滚球预警` maps to the in-progress status group, and `完场` maps to exact
