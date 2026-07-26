@@ -237,6 +237,7 @@ class MatchWebAppTests(unittest.TestCase):
                 1,
                 "客队",
                 "关注",
+                "2.5",
                 [
                     {"change_time": "07-17 20:15", "match_minute": 42},
                     {"change_time": "07-17 20:18", "match_minute": None},
@@ -267,10 +268,16 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("seq - ROW_NUMBER()", query)
         self.assertIn("next_row.seq = suspension_runs.end_seq + 1", query)
         self.assertIn("INTERVAL '3 minutes'", query)
+        self.assertIn("start_match_minute + 3 AS warning_minute", query)
+        self.assertIn("titan007_over_under_changes AS totals", query)
+        self.assertIn("totals.company_id = 47", query)
+        self.assertIn("totals.match_minute >= warning_triggers.warning_minute", query)
+        self.assertIn("ORDER BY totals.seq ASC", query)
         self.assertEqual(cursor.execute.call_args.args[1], ("2026-07-17", "2026-07-17"))
         self.assertEqual(matches[0]["match_id"], 3020831)
         self.assertNotIn("suspension_periods", matches[0])
         self.assertEqual(matches[0]["pb_status"], "关注")
+        self.assertEqual(matches[0]["warning_line"], "2.5")
         self.assertEqual(
             matches[0]["suspension_points"],
             [

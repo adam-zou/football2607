@@ -400,7 +400,8 @@ def fetch_company_47_suspensions(
                 (ARRAY_AGG(change_time ORDER BY seq))[1] AS start_time,
                 (ARRAY_AGG(change_time ORDER BY seq DESC))[1] AS last_time,
                 (ARRAY_AGG(change_at ORDER BY seq))[1] AS start_at,
-                (ARRAY_AGG(change_at ORDER BY seq DESC))[1] AS last_at
+                (ARRAY_AGG(change_at ORDER BY seq DESC))[1] AS last_at,
+                (ARRAY_AGG(match_minute ORDER BY seq))[1] AS start_match_minute
             FROM suspended_rows
             GROUP BY match_id, suspension_group
         ),
@@ -423,6 +424,14 @@ def fetch_company_47_suspensions(
         qualifying_match_ids AS (
             SELECT DISTINCT match_id
             FROM qualifying_runs
+        ),
+        warning_triggers AS (
+            SELECT DISTINCT ON (match_id)
+                match_id,
+                start_match_minute + 3 AS warning_minute
+            FROM qualifying_runs
+            WHERE start_match_minute IS NOT NULL
+            ORDER BY match_id, start_seq
         ),
         suspension_time_points AS (
             SELECT
@@ -459,10 +468,21 @@ def fetch_company_47_suspensions(
             details.away_score,
             details.away_team,
             COALESCE(pb_status.status, '') AS pb_status,
+            warning_totals.total_line_raw AS warning_line,
             suspension_time_points.points
         FROM qualifying_match_ids
         JOIN match_details AS details USING (match_id)
         LEFT JOIN match_web_pb_status AS pb_status USING (match_id)
+        LEFT JOIN warning_triggers USING (match_id)
+        LEFT JOIN LATERAL (
+            SELECT totals.total_line_raw
+            FROM titan007_over_under_changes AS totals
+            WHERE totals.match_id = details.match_id
+              AND totals.company_id = 47
+              AND totals.match_minute >= warning_triggers.warning_minute
+            ORDER BY totals.seq ASC
+            LIMIT 1
+        ) AS warning_totals ON TRUE
         JOIN suspension_time_points USING (match_id)
         ORDER BY details.scheduled_time ASC, details.match_id ASC
     """
@@ -484,7 +504,8 @@ def fetch_company_47_suspensions(
             "away_score": row[6],
             "away_team": row[7],
             "pb_status": row[8],
-            "suspension_points": row[9],
+            "warning_line": row[9],
+            "suspension_points": row[10],
         }
         for row in rows
     ]
