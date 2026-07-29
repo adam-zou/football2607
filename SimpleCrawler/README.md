@@ -104,7 +104,7 @@ Windows 用户如需同时启动采集调度器和 MatchWeb 网页应用，可�
 python SimpleCrawler/run_scheduler.py
 ```
 
-总调度器会自动启动统一代理服务，并并行调度五类任务：
+总调度器会自动启动统一代理服务，并并行调度四类任务：
 
 | 任务 | 默认间隔 | 脚本 |
 | --- | ---: | --- |
@@ -112,7 +112,6 @@ python SimpleCrawler/run_scheduler.py
 | 抓取比赛详情 | 5 秒 | `fetch_match_details.py` |
 | 抓取赔率变化 | 5 秒 | `fetch_odds_pages.py` |
 | 核验完场数据 | 60 秒 | `check_match_completion.py` |
-| 企业微信通知 | 10 分钟 | `push_wecom_matches.py` |
 
 这里的间隔是上一轮结束后到下一轮开始前的等待时间。按 `Ctrl+C` 可以停止调度器
 及其启动的子进程。
@@ -138,8 +137,7 @@ python SimpleCrawler/run_scheduler.py
 http://127.0.0.1:8081/
 ```
 
-页面分窗口显示代理服务、比赛 ID、比赛详情、赔率变化、完成核验和
-企业微信通知的运行状态、
+页面分窗口显示代理服务、比赛 ID、比赛详情、赔率变化和完成核验的运行状态、
 最近一轮耗时、退出码、下轮时间及滚动日志。每个窗口最多保留最近 400 行日志，
 浏览器每秒更新一次；终端仍会同步输出完整的实时日志。页面顶部集中提示任务、
 数据库、代理和数据质量告警，并展示待获取详情、当前赔率队列、完场待核验、
@@ -379,8 +377,9 @@ python SimpleCrawler/fetch_odds_pages.py --help
 | `SIMPLE_CRAWLER_DETAIL_INTERVAL_SECONDS` | `5` | 详情任务间隔 |
 | `SIMPLE_CRAWLER_ODDS_INTERVAL_SECONDS` | `5` | 赔率任务间隔 |
 | `SIMPLE_CRAWLER_COMPLETION_INTERVAL_SECONDS` | `60` | 完成核验任务间隔 |
-| `SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS` | `600` | 企业微信通知任务间隔 |
+| `SIMPLE_CRAWLER_WECOM_ENABLED` | `false` | 通知总开关；仅显式设为真时允许发送 |
 | `SIMPLE_CRAWLER_WECOM_WEBHOOK_URL` | 空 | 企业微信群机器人 Webhook；留空时跳过通知 |
+| `SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS` | `600` | 总调度器两轮企业微信通知之间的等待秒数 |
 | `SIMPLE_CRAWLER_WECOM_TIMEOUT_SECONDS` | `10` | 企业微信 Webhook 请求超时 |
 | `SIMPLE_CRAWLER_COMPLETION_MATCH_CONCURRENCY` | `2` | 同时进入最终核验的比赛数；共享赔率公司任务并发上限 |
 | `SIMPLE_CRAWLER_COMPLETION_MATCH_TIMEOUT_SECONDS` | `180` | 单场最终快照总超时 |
@@ -406,15 +405,26 @@ python SimpleCrawler/fetch_odds_pages.py --help
 
 ## 企业微信赔率通知
 
+总调度器默认每 600 秒运行一次企业微信通知任务，间隔可通过
+`SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS` 修改。任务只有在 `.env` 中显式设置
+`SIMPLE_CRAWLER_WECOM_ENABLED=true` 且配置 Webhook 时才会发送；否则每轮安全跳过。
+也可单独手工运行：
+
+```bash
+python SimpleCrawler/push_wecom_matches.py
+```
+
 `push_wecom_matches.py` 读取手工安装的
 `match_odds_filter_market_summary` 视图，关联 `match_details` 并仅处理
-`status_text = '未开始'` 的比赛。同一比赛同一市场以
+`status_text = '未开始'` 的比赛。首次基线和后续发现都只接受上海时间开赛时间严格晚于
+“当前时间减 2 小时”的比赛；PB 预警同样使用这个时间下限。同一比赛同一市场以
 `(match_id, market_type)` 持久去重；同轮新增的多个市场会合并成
 一条群消息。
 
 任务也复用 PB 页面的公司 47 预警逻辑：滚球胜平负连续封盘达到 3 分钟后，
-以封盘起始比赛分钟加 3 为触发点，取公司 47 第一条达到该分钟的大小球盘口；
-盘口数值为 `1.5` 或 `3.5` 时，以 `PB 预警盘口` 类型推送。普通赔率类型和
+只接受开始比赛分钟在 0–70 之间且不等于 45 的封盘段，再取公司 47 在封盘
+开始时间之前最后一条大小球盘口。盘口数值为 `1.5` 或 `3.5` 时，以 `PB 预警盘口`
+类型推送。普通赔率类型和
 PB 预警类型分别建立首次基线，启用新类型不会补发历史预警。
 
 第一次在已配置 Webhook 的情况下运行时，任务会把当前全部符合条件的

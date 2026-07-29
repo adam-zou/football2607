@@ -133,6 +133,8 @@ WITH pb_company_rows AS (
         ) AS raw_change_at
     ) AS parsed
     WHERE details.scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+      AND details.scheduled_time::TIMESTAMP
+            > (NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '2 hours'
       AND changes.change_time ~ '^\\d{1,2}-\\d{1,2} \\d{1,2}:\\d{2}$'
 ),
 pb_suspended_rows AS (
@@ -161,14 +163,15 @@ pb_qualifying_runs AS (
     LEFT JOIN pb_company_rows AS next_row
       ON next_row.match_id = runs.match_id
      AND next_row.seq = runs.end_seq + 1
-    WHERE COALESCE(next_row.change_at, runs.last_at) - runs.start_at >= INTERVAL '3 minutes'
+    WHERE runs.start_match_minute BETWEEN 0 AND 70
+      AND runs.start_match_minute <> 45
+      AND COALESCE(next_row.change_at, runs.last_at) - runs.start_at >= INTERVAL '3 minutes'
 ),
 pb_warning_triggers AS (
     SELECT DISTINCT ON (match_id)
         match_id,
-        start_match_minute + 3 AS warning_minute
+        start_at AS suspension_start_at
     FROM pb_qualifying_runs
-    WHERE start_match_minute IS NOT NULL
     ORDER BY match_id, start_seq
 ),
 pb_warning_candidates AS (
@@ -177,12 +180,36 @@ pb_warning_candidates AS (
         warning_totals.total_line_value AS line_value
     FROM pb_warning_triggers AS triggers
     JOIN LATERAL (
-        SELECT totals.total_line_value
-        FROM titan007_over_under_changes AS totals
-        WHERE totals.match_id = triggers.match_id
-          AND totals.company_id = 47
-          AND totals.match_minute >= triggers.warning_minute
-        ORDER BY totals.seq ASC
+        SELECT normalized_totals.total_line_value
+        FROM (
+            SELECT
+                totals.seq,
+                totals.total_line_value,
+                CASE
+                    WHEN parsed.raw_change_at
+                            < details.scheduled_time::TIMESTAMP - INTERVAL '180 days'
+                        THEN parsed.raw_change_at + INTERVAL '1 year'
+                    WHEN parsed.raw_change_at
+                            > details.scheduled_time::TIMESTAMP + INTERVAL '180 days'
+                        THEN parsed.raw_change_at - INTERVAL '1 year'
+                    ELSE parsed.raw_change_at
+                END AS change_at
+            FROM titan007_over_under_changes AS totals
+            JOIN match_details AS details
+              ON details.match_id = totals.match_id
+            CROSS JOIN LATERAL (
+                SELECT TO_TIMESTAMP(
+                    EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
+                    || '-' || totals.change_time,
+                    'YYYY-MM-DD HH24:MI'
+                ) AS raw_change_at
+            ) AS parsed
+            WHERE totals.match_id = triggers.match_id
+              AND totals.company_id = 47
+              AND totals.change_time ~ '^\\d{1,2}-\\d{1,2} \\d{1,2}:\\d{2}$'
+        ) AS normalized_totals
+        WHERE normalized_totals.change_at <= triggers.suspension_start_at
+        ORDER BY normalized_totals.change_at DESC, normalized_totals.seq DESC
         LIMIT 1
     ) AS warning_totals ON TRUE
     WHERE warning_totals.total_line_value IN (1.5, 3.5)
@@ -242,6 +269,9 @@ SELECT
 FROM public.match_odds_filter_market_summary AS summary
 JOIN public.match_details AS details USING (match_id)
 WHERE details.status_text = '未开始'
+  AND details.scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+  AND details.scheduled_time::TIMESTAMP
+        > (NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '2 hours'
 ON CONFLICT (match_id, market_type) DO NOTHING
 """
 
@@ -272,6 +302,9 @@ JOIN public.match_details AS details USING (match_id)
 JOIN public.match_ids AS ids USING (match_id)
 CROSS JOIN public.wecom_match_market_push_state AS state
 WHERE details.status_text = '未开始'
+  AND details.scheduled_time ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}$'
+  AND details.scheduled_time::TIMESTAMP
+        > (NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '2 hours'
   AND state.state_key = 'match_market_baseline'
   AND ids.created_at > state.initialized_at
 ON CONFLICT (match_id, market_type) DO NOTHING
@@ -619,6 +652,11 @@ def run_once(
 
 def main() -> int:
     load_dotenv(ENV_FILE)
+    enabled = os.environ.get("SIMPLE_CRAWLER_WECOM_ENABLED", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        print(f"{TASK_PREFIX} 推送已暂停，本轮跳过。")
+        print(format_round_match_count(TASK_PREFIX, 0))
+        return 0
     webhook_text = os.environ.get("SIMPLE_CRAWLER_WECOM_WEBHOOK_URL", "").strip()
     if not webhook_text:
         print(f"{TASK_PREFIX} 未配置 Webhook，本轮跳过。")

@@ -7,6 +7,11 @@ const errorState = document.getElementById('error-state');
 const resultSummary = document.getElementById('result-summary');
 const updatedAt = document.getElementById('updated-at');
 const refreshState = document.getElementById('refresh-state');
+const totalCount = document.getElementById('total-count');
+const invalidCount = document.getElementById('invalid-count');
+const followedCount = document.getElementById('followed-count');
+const sessionUsername = document.getElementById('session-username');
+const homeLink = document.getElementById('home-link');
 const betDialog = document.getElementById('bet-dialog');
 const betForm = document.getElementById('bet-form');
 const betEntries = document.getElementById('bet-entries');
@@ -46,6 +51,33 @@ function statusClass(status) {
   if (status === '未开始') return 'pending';
   if (['推迟', '取消', '待定'].includes(status)) return 'other';
   return 'live';
+}
+
+function createMatchup(match) {
+  const matchup = document.createElement('span');
+  const home = document.createElement('span');
+  home.className = 'team-name';
+  home.textContent = text(match.home_team);
+  const versus = document.createElement('span');
+  versus.className = 'vs-text';
+  versus.textContent = 'vs';
+  const away = document.createElement('span');
+  away.className = 'team-name';
+  away.textContent = text(match.away_team);
+  matchup.append(home, versus, away);
+  return matchup;
+}
+
+function createStatus(status) {
+  const badge = document.createElement('span');
+  badge.className = `realtime ${statusClass(status)}`;
+  badge.textContent = text(status);
+  return badge;
+}
+
+function formatScheduledTime(value) {
+  const match = String(value || '').match(/(\d{2}:\d{2})$/);
+  return match ? match[1] : text(value);
 }
 
 function applyPBStatus(row, buttons, status) {
@@ -289,16 +321,16 @@ function renderMatches(matches) {
     link.href = `https://live.nowscore.com/odds/3in1Odds.aspx?companyid=47&id=${encodeURIComponent(match.match_id)}`;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
+    link.className = 'match-id-link';
     link.textContent = match.match_id;
 
     const cells = [
       link,
       text(match.league),
-      text(match.scheduled_time),
-      text(match.status_text),
-      text(match.home_team),
+      createMatchup(match),
+      formatScheduledTime(match.scheduled_time),
+      createStatus(match.status_text),
       match.home_score == null || match.away_score == null ? '—' : `${match.home_score} : ${match.away_score}`,
-      text(match.away_team),
       text(match.warning_line),
       createSuspensionMarker(match.suspension_points),
       createActions(match, row),
@@ -308,7 +340,6 @@ function renderMatches(matches) {
       const cell = document.createElement('td');
       if (content instanceof Node) cell.append(content);
       else cell.textContent = content;
-      if (index === 3) cell.className = `match-status ${statusClass(match.status_text)}`;
       if (index === 5) cell.classList.add('score');
       row.append(cell);
     });
@@ -333,6 +364,9 @@ async function loadMatches() {
     if (!response.ok) throw new Error(payload.error || '读取失败');
     renderMatches(payload.matches);
     emptyState.hidden = payload.matches.length !== 0;
+    totalCount.textContent = payload.matches.length;
+    invalidCount.textContent = payload.matches.filter(({ pb_status: status }) => status === '作废').length;
+    followedCount.textContent = payload.matches.filter(({ pb_status: status }) => status === '关注').length;
     const statusLabels = payload.statuses.map((status) => ({
       未开始: '赛前预警',
       进行中: '滚球预警',
@@ -351,6 +385,18 @@ async function loadMatches() {
   } finally {
     queryButton.disabled = false;
     refreshTimer = setTimeout(loadMatches, REFRESH_INTERVAL_MS);
+  }
+}
+
+async function loadSession() {
+  try {
+    const response = await fetch('/api/session', { cache: 'no-store' });
+    if (!response.ok) return;
+    const payload = await response.json();
+    homeLink.hidden = !payload.username || payload.username.toLowerCase().includes('user');
+    sessionUsername.textContent = payload.username || '—';
+  } catch (_) {
+    // The match list remains usable when the optional identity label cannot load.
   }
 }
 
@@ -429,4 +475,5 @@ betForm.addEventListener('submit', async (event) => {
     betDialogSave.disabled = false;
   }
 });
+loadSession();
 loadMatches();

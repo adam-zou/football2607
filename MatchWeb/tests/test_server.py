@@ -131,7 +131,13 @@ class MatchWebAppTests(unittest.TestCase):
                 1,
                 0,
                 "客队",
-                [{"company_id": 3, "change_time": "7-17 18:20"}],
+                [
+                    {
+                        "company_id": 3,
+                        "market_type": "让球",
+                        "change_time": "7-17 18:20",
+                    }
+                ],
             )
         ]
         cursor_context = MagicMock()
@@ -157,7 +163,10 @@ class MatchWebAppTests(unittest.TestCase):
             "details.scheduled_time::TIMESTAMP < (%s::DATE + INTERVAL '1 day')",
             query,
         )
-        self.assertEqual(cursor.execute.call_args.args[1], ("2026-07-17", "2026-07-17"))
+        self.assertEqual(
+            cursor.execute.call_args.args[1],
+            ("2026-07-17", "2026-07-17", 0, 0),
+        )
         self.assertIn("(''|′)", query)
         self.assertIn("handicap.home_odds < 0.700", query)
         self.assertIn("handicap.away_odds < 0.700", query)
@@ -166,6 +175,10 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("totals.over_odds < 0.700", query)
         self.assertIn("totals.company_id <> 4", query)
         self.assertIn("totals.source_status <> '滚'", query)
+        self.assertIn("'让球' AS market_type", query)
+        self.assertIn("'大小球' AS market_type", query)
+        self.assertIn("filter_hits.handicap_count >= %s", query)
+        self.assertIn("filter_hits.totals_count >= %s", query)
         self.assertIn("filter_hits.markers IS NOT NULL", query)
         self.assertIn("company_three_handicap.company_id = 3", query)
         self.assertIn("company_three_one_x_two.company_id = 3", query)
@@ -178,6 +191,7 @@ class MatchWebAppTests(unittest.TestCase):
                 {
                     "company_id": 3,
                     "company_name": "Crow*",
+                    "market_type": "让球",
                     "change_time": "7-17 18:20",
                 }
             ],
@@ -271,16 +285,21 @@ class MatchWebAppTests(unittest.TestCase):
         self.assertIn("AND is_suspended", query)
         self.assertIn("seq - ROW_NUMBER()", query)
         self.assertIn("next_row.seq = suspension_runs.end_seq + 1", query)
-        self.assertIn("titan007_handicap_changes AS changes", query)
-        self.assertIn("titan007_over_under_changes AS changes", query)
-        self.assertIn("other_market_heartbeats.latest_change_at", query)
-        self.assertIn("WHEN next_row.seq IS NOT NULL THEN next_row.change_at", query)
+        self.assertIn(
+            "suspension_runs.start_match_minute BETWEEN 0 AND 70", query
+        )
+        self.assertIn("suspension_runs.start_match_minute <> 45", query)
         self.assertIn("INTERVAL '3 minutes'", query)
-        self.assertIn("start_match_minute + 3 AS warning_minute", query)
+        self.assertIn("start_at AS suspension_start_at", query)
         self.assertIn("titan007_over_under_changes AS totals", query)
         self.assertIn("totals.company_id = 47", query)
-        self.assertIn("totals.match_minute >= warning_triggers.warning_minute", query)
-        self.assertIn("ORDER BY totals.seq ASC", query)
+        self.assertIn(
+            "<= warning_triggers.suspension_start_at", query
+        )
+        self.assertIn(
+            "ORDER BY normalized_totals.change_at DESC, normalized_totals.seq DESC",
+            query,
+        )
         self.assertIn("match_web_pb_bet", query)
         self.assertIn("'home_handicap', saved_bets.home_handicap", query)
         self.assertIn("'away_handicap', saved_bets.away_handicap", query)
@@ -869,6 +888,12 @@ class MatchWebAppTests(unittest.TestCase):
         suspension_page = (
             server.STATIC_DIR / "company-47-suspensions.html"
         ).read_text(encoding="utf-8")
+        self.assertIn("足球比赛监控面板", suspension_page)
+        self.assertIn("legacy-container", suspension_page)
+        self.assertIn("stats-bar", suspension_page)
+        self.assertIn('id="home-link"', suspension_page)
+        self.assertIn('href="/" hidden', suspension_page)
+        self.assertIn("payload.username.toLowerCase().includes('user')", suspension_script)
         self.assertIn("增加注单", suspension_page)
         self.assertIn('value="完"', suspension_page)
         self.assertNotIn('value="完" checked', suspension_page)
