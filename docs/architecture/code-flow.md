@@ -102,6 +102,7 @@ flowchart LR
 | `python3 MatchWeb/server.py` | `MatchWeb/server.py:main` | Serve authenticated match lists, PB status/bet controls, date/status filters, and 60-second browser refresh | Creates and updates `match_web_pb_status`, `match_web_pb_bet`, and `match_web_user_session`; crawler-owned tables remain read-only |
 | `python3 MatchWeb/manage_users.py add\|remove\|list` | `MatchWeb/manage_users.py:main` | Maintain local MatchWeb login accounts with interactively entered, salted password hashes | `MatchWeb/users.json` (or `MATCH_WEB_USERS_FILE`) |
 | `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_odds_filter_views.sql` | Manual PostgreSQL script | Create optional live odds-filter hit, match-summary, market-summary, and market-statistics views | Four `match_odds_filter_*` views |
+| `psql "$SIMPLE_CRAWLER_DATABASE_URL" -f SimpleCrawler/sql/create_pb_warning_temp_table.sql` | Manual PostgreSQL script | Materialize all-date, all-status company-47 PB warning matches and print the snapshot | Session-scoped `pb_warning_matches_temp` temporary table |
 
 ## Authenticated match view
 
@@ -132,24 +133,29 @@ handicap side (`home_odds` or `away_odds`) or the over price (`over_odds`) has
 ever been below `0.700` on a non-`滚` record from any company except company 4,
 and independently requires at least one company-3 row in any of the handicap,
 one-x-two, or over-under change tables. Disabling the checkbox omits both odds
-predicates. The same non-rolling, non-company-4 low-price records are aggregated
+predicates. Two independently configurable thresholds, each ranging from 0 through
+10 and defaulting to 0, additionally require the handicap and totals low-price row
+counts to be greater than or equal to their selected values. At the zero defaults
+these thresholds add no restriction, so the original cross-market OR predicate is
+preserved. The same non-rolling, non-company-4 low-price records are aggregated
 per match for the filter marker column. The API maps each stored company ID through the crawler-owned
-company-name configuration and returns the company name with its `change_time`;
-the browser exposes those values on marker hover and keyboard focus.
+company-name configuration and returns the company name, market type (`让球` or
+`大小球`), and `change_time`; the browser exposes those values on marker hover and
+keyboard focus. Hits from different markets remain separate even when their company
+and timestamp are identical.
 
 The authenticated `/company-47-suspensions` view uses the same Shanghai match-day
 window and reads company 47's one-x-two rows. It groups rows satisfying
 `source_status = '滚' AND is_suspended = TRUE` into stable consecutive-`seq` runs.
+A run is eligible only when its first suspension row has a `match_minute` from
+0 through 70 inclusive, excluding exactly minute 45; confirmation may occur after
+minute 70, so a run that starts at minute 69 and proves three elapsed minutes
+remains eligible.
 A run's duration starts at its first suspension `change_time` and ends at the
-immediately following one-x-two row. For an open run without a following one-x-two
-row, MatchWeb uses the latest rolling company-47 handicap or over-under timestamp as
-a cross-market heartbeat; the later of that heartbeat and the run's own last
-suspension timestamp is its confirmation boundary. This recognizes a one-x-two
-market that remains suspended and stops emitting rows while another market for the
-same match and company continues updating. Without either kind of timestamp proving
-three elapsed minutes, the open run remains excluded. All market timestamps are
-parsed before comparison so both one- and two-digit month/day forms are supported.
-The API uses those runs only as a predicate
+immediately following row; an open run without a following row qualifies only when
+the timestamps of its own consecutive suspension rows already prove a duration of
+at least three minutes. This prevents a lone latest suspension marker from being
+treated as a known-duration interval. The API uses those runs only as a predicate
 and returns each qualifying match once even when several runs qualify. The page
 uses a date filter plus three presentation status options: `赛前预警` maps to
 `未开始`, `滚球预警` maps to the in-progress status group, and `完场` maps to exact
@@ -158,10 +164,11 @@ unselected; the PB API still rejects the other-status group. The rightmost
 detail marker reuses the primary list's tooltip styling and exposes the match's
 deduplicated suspension `change_time` plus `match_minute` values, rendering a missing
 minute as `-`, without duration or `seq`. The `预警盘口` column uses the earliest
-qualifying suspension run's starting `match_minute + 3` as the warning trigger
-minute, then selects the first company-47 over-under row in `seq ASC` order whose
-`match_minute` is at or after that trigger and displays its `total_line_raw`; a
-missing trigger or matching totals row renders as `—`. The action
+qualifying suspension run's `start_at`, then selects the last company-47 over-under
+row whose normalized timestamp is no later than that suspension start and displays
+its `total_line_raw`. Timestamps have minute precision, so a totals row in the same
+minute is eligible and `seq DESC` breaks ties; a missing totals row renders as `—`.
+The action
 column exposes mutually exclusive `关注` and `作废`
 actions. MatchWeb creates `match_web_pb_status` at startup and upserts one shared
 status per match together with the acting username and update time. The list joins
@@ -243,16 +250,22 @@ webhook empty skips the worker before database access.
 
 `SimpleCrawler/push_wecom_matches.py` is a one-shot notification worker scheduled
 by `run_scheduler.py` every 600 seconds after the previous round ends. The interval
-is configurable through `SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS`. An empty
+is configurable through `SIMPLE_CRAWLER_WECOM_INTERVAL_SECONDS`. The worker defaults
+to a no-op unless `SIMPLE_CRAWLER_WECOM_ENABLED` is explicitly
+set to a true value, which keeps already-running supervisors from delivering on a
+later round. An empty
 `SIMPLE_CRAWLER_WECOM_WEBHOOK_URL` makes each round a successful no-op, so existing
 deployments do not require a webhook. A configured worker requires the optional
 odds-filter views and reads `match_odds_filter_market_summary` joined to
-`match_details`, selecting only exact `status_text = '未开始'` rows.
+`match_details`, selecting only exact `status_text = '未开始'` rows. Both initial
+baselines and later discovery, including PB warnings, require the parsed kickoff
+time to be strictly later than the current Shanghai time minus two hours.
 
-The worker also reproduces the PB page's company-47 warning calculation.
+The worker also reproduces the PB page's company-47 warning-line selection.
 Consecutive live 1x2 suspension rows must prove a three-minute interval; the
-earliest qualifying run's `start_match_minute + 3` is the trigger, and the first
-company-47 totals row at or after that minute supplies the warning line. A line
+run must start from match minute 0 through 70 inclusive and must not start at
+exactly minute 45. The earliest qualifying run's `start_at` is the boundary, and the final company-47
+totals row no later than that timestamp supplies the warning line. A line
 value of exactly `1.5` or `3.5` creates a `pb_warning` notification. This live
 warning type is not expired by the ordinary rule that requires a queued market
 notification's match to remain `未开始`.
@@ -625,6 +638,7 @@ It no longer re-fetches pages solely to compare row counts or spawns
 | `SimpleCrawler/run_scheduler.py` | Process supervision, task intervals, lifecycle, and dashboard composition |
 | `SimpleCrawler/pyproject.toml` | SimpleCrawler package metadata and complete runtime dependency declaration |
 | `SimpleCrawler/sql/create_odds_filter_views.sql` | Manually installed live views for low-odds hits, three-company category summaries, score settlement, and per-market result rates |
+| `SimpleCrawler/sql/create_pb_warning_temp_table.sql` | Session-scoped PB warning snapshot using company-47 live one-x-two suspensions, over-under heartbeat evidence, and an exact warning-minute total line of 1.5, followed by current-score goal-distribution statistics |
 
 ## Documentation update checklist
 

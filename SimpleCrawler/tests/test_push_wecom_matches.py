@@ -16,9 +16,23 @@ from push_wecom_matches import (
     build_message,
     format_line_value,
     group_deliveries,
+    main,
     send_wecom_text,
     validate_webhook_url,
 )
+
+
+class PushSwitchTests(unittest.TestCase):
+    @mock.patch("push_wecom_matches.run_once")
+    def test_main_skips_delivery_when_push_is_paused(self, run_once):
+        with mock.patch.dict(
+            "os.environ",
+            {"SIMPLE_CRAWLER_WECOM_ENABLED": "false"},
+            clear=False,
+        ):
+            self.assertEqual(main(), 0)
+
+        run_once.assert_not_called()
 
 
 class FakeResponse:
@@ -55,7 +69,10 @@ class NotificationSchemaTests(unittest.TestCase):
         self.assertIn("match_market_baseline", CREATE_NOTIFICATION_SCHEMA_SQL)
 
     def test_baseline_and_discovery_only_include_not_started_matches(self):
-        self.assertIn("details.status_text = '未开始'", BASELINE_SQL)
+        for statement in (BASELINE_SQL, DISCOVER_SQL):
+            self.assertIn("details.status_text = '未开始'", statement)
+            self.assertIn("NOW() AT TIME ZONE 'Asia/Shanghai'", statement)
+            self.assertIn("INTERVAL '2 hours'", statement)
         self.assertIn("'baseline'", BASELINE_SQL)
         self.assertNotIn("ids.created_at > state.initialized_at", BASELINE_SQL)
         self.assertIn("details.status_text = '未开始'", DISCOVER_SQL)
@@ -66,14 +83,26 @@ class NotificationSchemaTests(unittest.TestCase):
     def test_pb_warning_reuses_page_trigger_and_targets_1_5_and_3_5(self):
         for statement in (PB_BASELINE_SQL, PB_DISCOVER_SQL):
             self.assertIn("changes.company_id = 47", statement)
+            self.assertIn("NOW() AT TIME ZONE 'Asia/Shanghai'", statement)
+            self.assertIn("INTERVAL '2 hours'", statement)
+            self.assertIn("runs.start_match_minute BETWEEN 0 AND 70", statement)
+            self.assertIn("runs.start_match_minute <> 45", statement)
             self.assertIn("changes.source_status,", statement)
             self.assertIn("changes.is_suspended,", statement)
             self.assertIn("WHERE source_status = '滚'", statement)
             self.assertIn("AND is_suspended", statement)
             self.assertIn("next_row.seq = runs.end_seq + 1", statement)
             self.assertIn("INTERVAL '3 minutes'", statement)
-            self.assertIn("start_match_minute + 3 AS warning_minute", statement)
+            self.assertIn("start_at AS suspension_start_at", statement)
             self.assertIn("totals.company_id = 47", statement)
+            self.assertIn(
+                "normalized_totals.change_at <= triggers.suspension_start_at",
+                statement,
+            )
+            self.assertIn(
+                "ORDER BY normalized_totals.change_at DESC, normalized_totals.seq DESC",
+                statement,
+            )
             self.assertIn("total_line_value IN (1.5, 3.5)", statement)
             self.assertIn("'pb_warning'", statement)
         self.assertIn("'pb_warning_baseline'", PB_DISCOVER_SQL)

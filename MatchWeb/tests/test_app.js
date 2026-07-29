@@ -16,4 +16,7 @@ eval(source.slice(start, end));
 assert.equal(createFilterMarker(undefined), '—');
 assert.equal(createFilterMarker(null), '—');
 assert.equal(createFilterMarker([]), '—');
+assert.match(source, /item\.company_name.*item\.market_type.*item\.change_time/);
+assert.match(source, /function positionFilterTooltip/);
+assert.match(source, /tooltip\.className = 'filter-tooltip home-filter-tooltip'/);
 console.log('app.js compatibility tests passed');

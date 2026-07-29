@@ -6,24 +6,19 @@
     <title>PB · MatchWeb</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body>
-    <main class="dashboard">
-      <header class="page-header">
-        <div class="header-meta">
-          <a href="/">比赛数据</a>
-          <span id="refresh-state">每 60 秒自动刷新</span>
-          <a href="/logout">退出</a>
-        </div>
-      </header>
+  <body class="pb-legacy-page">
+    <main class="dashboard legacy-container">
+      <h1>⚽ 足球比赛监控面板</h1>
 
-      <section class="filters" aria-label="查询参数">
-        <div class="field">
-          <label for="match-date">日期</label>
+      <section class="filters filter-section" aria-label="查询参数">
+        <div class="filter-container">
+        <div class="field filter-group">
+          <label for="match-date">比赛日期：</label>
           <input id="match-date" type="date" />
         </div>
-        <fieldset class="status-filter pb-status-filter">
-          <legend>比赛状态</legend>
-          <div class="segmented">
+        <fieldset class="status-filter pb-status-filter filter-group">
+          <legend>比赛状态：</legend>
+          <div class="legacy-checkboxes">
             <input id="status-not-started" name="status" type="checkbox" value="未开始" checked />
             <label for="status-not-started">赛前预警</label>
             <input id="status-live" name="status" type="checkbox" value="进行中" checked />
@@ -32,40 +27,50 @@
             <label for="status-finished">完场</label>
           </div>
         </fieldset>
-        <button id="query-button" class="query-button" type="button">查询</button>
+        <div class="legacy-account filter-group">
+          <a id="home-link" class="btn-home" href="/" hidden>返回首页</a>
+          <span class="user-info">当前用户: <strong id="session-username">—</strong></span>
+          <a class="btn-logout" href="/logout">退出</a>
+        </div>
+        <button id="query-button" class="query-button" type="button">🔍 查询</button>
+        </div>
       </section>
 
-      <section class="results" aria-live="polite">
-        <div class="results-heading">
-          <div>
-            <h2>符合条件的比赛</h2>
-            <p id="result-summary">正在读取比赛数据…</p>
-          </div>
-          <p id="updated-at"></p>
-        </div>
+      <section class="stats-bar" aria-live="polite">
+        <span class="stats-text">共找到 <strong class="stats-num" id="total-count">0</strong> 场比赛</span>
+        <span class="stats-text">作废: <strong class="stats-num" id="invalid-count">0</strong> | 关注: <strong class="stats-num" id="followed-count">0</strong></span>
+        <span class="stats-text"><span id="result-summary">正在读取比赛数据…</span> · <span id="updated-at"></span> · <span id="refresh-state">每 60 秒自动刷新</span></span>
+      </section>
+
+      <section class="results data-section" aria-live="polite">
+        <span class="sr-only">符合条件的比赛</span>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>比赛 ID</th>
+                <th>比赛ID</th>
                 <th>联赛</th>
+                <th>主客队信息</th>
                 <th>开赛时间</th>
-                <th>状态</th>
-                <th>主队</th>
-                <th>比分</th>
-                <th>客队</th>
+                <th>实时状态</th>
+                <th>当前比分</th>
                 <th>预警盘口</th>
-                <th>详情</th>
+                <th>封盘详情</th>
                 <th>操作</th>
                 <th>下注</th>
               </tr>
             </thead>
             <tbody id="match-rows"></tbody>
           </table>
-          <div id="empty-state" class="empty-state" hidden>当天没有符合条件的比赛</div>
+          <div id="empty-state" class="empty-state" hidden>暂无符合条件的数据</div>
           <div id="error-state" class="empty-state error-state" hidden></div>
         </div>
       </section>
+
+      <div class="legend-bar" aria-label="状态图例">
+        <span class="legend-item"><span class="legend-color invalid"></span>已作废</span>
+        <span class="legend-item"><span class="legend-color watched"></span>已关注</span>
+      </div>
     </main>
 
     <dialog id="bet-dialog" class="user-dialog bet-dialog">

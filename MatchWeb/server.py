@@ -394,6 +394,8 @@ def fetch_matches(
     match_date: str,
     statuses: Union[str, Sequence[str]],
     odds_filter: bool = True,
+    handicap_min_count: int = 0,
+    totals_min_count: int = 0,
 ) -> List[Dict[str, object]]:
     """Return matching rows from the crawler database without changing it."""
 
@@ -403,12 +405,18 @@ def fetch_matches(
     statuses = list(dict.fromkeys(statuses))
     if not statuses or any(status not in ALLOWED_STATUSES for status in statuses):
         raise ValueError("比赛状态无效")
+    if not isinstance(handicap_min_count, int) or not 0 <= handicap_min_count <= 10:
+        raise ValueError("让球低赔记录数参数无效")
+    if not isinstance(totals_min_count, int) or not 0 <= totals_min_count <= 10:
+        raise ValueError("大小球低赔记录数参数无效")
     status_filter_sql = " OR ".join(f"({STATUS_SQL[status]})" for status in statuses)
 
     odds_filter_sql = ""
     if odds_filter:
         odds_filter_sql = """
           AND filter_hits.markers IS NOT NULL
+          AND filter_hits.handicap_count >= %s
+          AND filter_hits.totals_count >= %s
           AND EXISTS (
               SELECT 1
               FROM titan007_handicap_changes AS company_three_handicap
@@ -440,22 +448,32 @@ def fetch_matches(
             COALESCE(filter_hits.markers, '[]'::JSONB)
         FROM match_details AS details
         LEFT JOIN LATERAL (
-            SELECT JSONB_AGG(
+            SELECT
+              JSONB_AGG(
                 JSONB_BUILD_OBJECT(
                     'company_id', matched.company_id,
+                    'market_type', matched.market_type,
                     'change_time', matched.change_time
                 )
-                ORDER BY matched.company_id, matched.change_time
-            ) AS markers
+                ORDER BY matched.company_id, matched.change_time, matched.market_type
+              ) AS markers,
+              COUNT(*) FILTER (WHERE matched.market_type = '让球') AS handicap_count,
+              COUNT(*) FILTER (WHERE matched.market_type = '大小球') AS totals_count
             FROM (
-                SELECT handicap.company_id, handicap.change_time
+                SELECT
+                    handicap.company_id,
+                    '让球' AS market_type,
+                    handicap.change_time
                 FROM titan007_handicap_changes AS handicap
                 WHERE handicap.match_id = details.match_id
                   AND handicap.company_id <> 4
                   AND handicap.source_status <> '滚'
                   AND (handicap.home_odds < 0.700 OR handicap.away_odds < 0.700)
-                UNION
-                SELECT totals.company_id, totals.change_time
+                UNION ALL
+                SELECT
+                    totals.company_id,
+                    '大小球' AS market_type,
+                    totals.change_time
                 FROM titan007_over_under_changes AS totals
                 WHERE totals.match_id = details.match_id
                   AND totals.company_id <> 4
@@ -474,7 +492,10 @@ def fetch_matches(
     with psycopg2.connect(database_url) as connection:
         connection.set_session(readonly=True)
         with connection.cursor() as cursor:
-            cursor.execute(query, (match_date, match_date))
+            query_params: List[object] = [match_date, match_date]
+            if odds_filter:
+                query_params.extend([handicap_min_count, totals_min_count])
+            cursor.execute(query, tuple(query_params))
             rows = cursor.fetchall()
 
     matches = []
@@ -485,6 +506,7 @@ def fetch_matches(
                 "company_name": COMPANY_NAMES.get(
                     int(marker["company_id"]), f"公司 {marker['company_id']}"
                 ),
+                "market_type": marker["market_type"],
                 "change_time": str(marker["change_time"]),
             }
             for marker in row[8]
@@ -562,56 +584,6 @@ def fetch_company_47_suspensions(
                 END AS change_at
             FROM company_rows_with_raw_time
         ),
-        other_market_rows_with_raw_time AS (
-            SELECT
-                details.match_id,
-                details.scheduled_time::TIMESTAMP AS scheduled_at,
-                TO_TIMESTAMP(
-                    EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
-                    || '-' || changes.change_time,
-                    'YYYY-MM-DD HH24:MI'
-                ) AS raw_change_at
-            FROM match_details AS details
-            JOIN titan007_handicap_changes AS changes
-              ON changes.match_id = details.match_id
-             AND changes.company_id = 47
-            WHERE details.match_id IN (SELECT DISTINCT match_id FROM company_rows)
-              AND changes.source_status = '滚'
-              AND changes.change_time ~ '^\\d{{1,2}}-\\d{{1,2}} \\d{{1,2}}:\\d{{2}}$'
-
-            UNION ALL
-
-            SELECT
-                details.match_id,
-                details.scheduled_time::TIMESTAMP AS scheduled_at,
-                TO_TIMESTAMP(
-                    EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
-                    || '-' || changes.change_time,
-                    'YYYY-MM-DD HH24:MI'
-                ) AS raw_change_at
-            FROM match_details AS details
-            JOIN titan007_over_under_changes AS changes
-              ON changes.match_id = details.match_id
-             AND changes.company_id = 47
-            WHERE details.match_id IN (SELECT DISTINCT match_id FROM company_rows)
-              AND changes.source_status = '滚'
-              AND changes.change_time ~ '^\\d{{1,2}}-\\d{{1,2}} \\d{{1,2}}:\\d{{2}}$'
-        ),
-        other_market_heartbeats AS (
-            SELECT
-                match_id,
-                MAX(
-                    CASE
-                        WHEN raw_change_at < scheduled_at - INTERVAL '180 days'
-                            THEN raw_change_at + INTERVAL '1 year'
-                        WHEN raw_change_at > scheduled_at + INTERVAL '180 days'
-                            THEN raw_change_at - INTERVAL '1 year'
-                        ELSE raw_change_at
-                    END
-                ) AS latest_change_at
-            FROM other_market_rows_with_raw_time
-            GROUP BY match_id
-        ),
         suspended_rows AS (
             SELECT
                 company_rows.*,
@@ -640,35 +612,19 @@ def fetch_company_47_suspensions(
             SELECT
                 suspension_runs.*,
                 COALESCE(next_row.change_time, suspension_runs.last_time) AS end_time,
-                CASE
-                    WHEN next_row.seq IS NOT NULL THEN next_row.change_at
-                    ELSE GREATEST(
-                        suspension_runs.last_at,
-                        other_market_heartbeats.latest_change_at
-                    )
-                END AS end_at,
+                COALESCE(next_row.change_at, suspension_runs.last_at) AS end_at,
                 EXTRACT(
-                    EPOCH FROM CASE
-                        WHEN next_row.seq IS NOT NULL THEN next_row.change_at
-                        ELSE GREATEST(
-                            suspension_runs.last_at,
-                            other_market_heartbeats.latest_change_at
-                        )
-                    END - suspension_runs.start_at
+                    EPOCH FROM COALESCE(next_row.change_at, suspension_runs.last_at)
+                    - suspension_runs.start_at
                 ) / 60 AS duration_minutes
             FROM suspension_runs
             LEFT JOIN company_rows AS next_row
               ON next_row.match_id = suspension_runs.match_id
              AND next_row.seq = suspension_runs.end_seq + 1
-            LEFT JOIN other_market_heartbeats
-              ON other_market_heartbeats.match_id = suspension_runs.match_id
-            WHERE CASE
-                    WHEN next_row.seq IS NOT NULL THEN next_row.change_at
-                    ELSE GREATEST(
-                        suspension_runs.last_at,
-                        other_market_heartbeats.latest_change_at
-                    )
-                  END - suspension_runs.start_at >= INTERVAL '3 minutes'
+            WHERE suspension_runs.start_match_minute BETWEEN 0 AND 70
+              AND suspension_runs.start_match_minute <> 45
+              AND COALESCE(next_row.change_at, suspension_runs.last_at)
+                    - suspension_runs.start_at >= INTERVAL '3 minutes'
         ),
         qualifying_match_ids AS (
             SELECT DISTINCT match_id
@@ -677,9 +633,8 @@ def fetch_company_47_suspensions(
         warning_triggers AS (
             SELECT DISTINCT ON (match_id)
                 match_id,
-                start_match_minute + 3 AS warning_minute
+                start_at AS suspension_start_at
             FROM qualifying_runs
-            WHERE start_match_minute IS NOT NULL
             ORDER BY match_id, start_seq
         ),
         suspension_time_points AS (
@@ -725,12 +680,36 @@ def fetch_company_47_suspensions(
         LEFT JOIN match_web_pb_status AS pb_status USING (match_id)
         LEFT JOIN warning_triggers USING (match_id)
         LEFT JOIN LATERAL (
-            SELECT totals.total_line_raw
-            FROM titan007_over_under_changes AS totals
-            WHERE totals.match_id = details.match_id
-              AND totals.company_id = 47
-              AND totals.match_minute >= warning_triggers.warning_minute
-            ORDER BY totals.seq ASC
+            SELECT normalized_totals.total_line_raw
+            FROM (
+                SELECT
+                    totals.seq,
+                    totals.total_line_raw,
+                    CASE
+                        WHEN parsed.raw_change_at
+                                < details.scheduled_time::TIMESTAMP - INTERVAL '180 days'
+                            THEN parsed.raw_change_at + INTERVAL '1 year'
+                        WHEN parsed.raw_change_at
+                                > details.scheduled_time::TIMESTAMP + INTERVAL '180 days'
+                            THEN parsed.raw_change_at - INTERVAL '1 year'
+                        ELSE parsed.raw_change_at
+                    END AS change_at
+                FROM titan007_over_under_changes AS totals
+                CROSS JOIN LATERAL (
+                    SELECT TO_TIMESTAMP(
+                        EXTRACT(YEAR FROM details.scheduled_time::TIMESTAMP)::INTEGER
+                        || '-' || totals.change_time,
+                        'YYYY-MM-DD HH24:MI'
+                    ) AS raw_change_at
+                ) AS parsed
+                WHERE totals.match_id = details.match_id
+                  AND totals.company_id = 47
+                  AND totals.change_time
+                        ~ '^\\d{{1,2}}-\\d{{1,2}} \\d{{1,2}}:\\d{{2}}$'
+            ) AS normalized_totals
+            WHERE normalized_totals.change_at
+                    <= warning_triggers.suspension_start_at
+            ORDER BY normalized_totals.change_at DESC, normalized_totals.seq DESC
             LIMIT 1
         ) AS warning_totals ON TRUE
         LEFT JOIN LATERAL (
@@ -1202,8 +1181,19 @@ class MatchWebHandler(BaseHTTPRequestHandler):
             return
         odds_filter = odds_filter_value == "1"
         try:
+            handicap_min_count = int(params.get("handicap_min_count", ["0"])[0])
+            totals_min_count = int(params.get("totals_min_count", ["0"])[0])
+        except ValueError:
+            self.send_json({"error": "低赔记录数参数无效"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
             matches = fetch_matches(
-                self.server.app.database_url, match_date, statuses, odds_filter
+                self.server.app.database_url,
+                match_date,
+                statuses,
+                odds_filter,
+                handicap_min_count,
+                totals_min_count,
             )
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -1216,6 +1206,8 @@ class MatchWebHandler(BaseHTTPRequestHandler):
                 "date": match_date,
                 "statuses": statuses,
                 "odds_filter": odds_filter,
+                "handicap_min_count": handicap_min_count,
+                "totals_min_count": totals_min_count,
                 "total": len(matches),
                 "refreshed_at": datetime.now(SHANGHAI).isoformat(timespec="seconds"),
                 "matches": matches,

@@ -1,6 +1,8 @@
 const REFRESH_INTERVAL_MS = 60_000;
 const dateInput = document.getElementById('match-date');
 const oddsFilter = document.getElementById('odds-filter');
+const handicapMinCount = document.getElementById('handicap-min-count');
+const totalsMinCount = document.getElementById('totals-min-count');
 const queryButton = document.getElementById('query-button');
 const rows = document.getElementById('match-rows');
 const emptyState = document.getElementById('empty-state');
@@ -45,6 +47,29 @@ function statusClass(status) {
   return 'live';
 }
 
+function positionFilterTooltip(marker, tooltip) {
+  const viewportMargin = 8;
+  const markerGap = 9;
+  const markerRect = marker.getBoundingClientRect();
+  const tooltipRect = tooltip.getBoundingClientRect();
+  const roomAbove = markerRect.top - viewportMargin;
+  const roomBelow = window.innerHeight - markerRect.bottom - viewportMargin;
+  const showBelow = tooltipRect.height > roomAbove && roomBelow > roomAbove;
+  const preferredTop = showBelow
+    ? markerRect.bottom + markerGap
+    : markerRect.top - tooltipRect.height - markerGap;
+  const preferredLeft = markerRect.right - tooltipRect.width;
+
+  tooltip.style.top = `${Math.max(
+    viewportMargin,
+    Math.min(preferredTop, window.innerHeight - tooltipRect.height - viewportMargin),
+  )}px`;
+  tooltip.style.left = `${Math.max(
+    viewportMargin,
+    Math.min(preferredLeft, window.innerWidth - tooltipRect.width - viewportMargin),
+  )}px`;
+}
+
 function createFilterMarker(markers) {
   if (!Array.isArray(markers) || markers.length === 0) return '—';
   const marker = document.createElement('span');
@@ -54,14 +79,16 @@ function createFilterMarker(markers) {
   marker.setAttribute('aria-label', `筛选命中 ${markers.length} 条，聚焦后查看详情`);
 
   const tooltip = document.createElement('span');
-  tooltip.className = 'filter-tooltip';
+  tooltip.className = 'filter-tooltip home-filter-tooltip';
   tooltip.setAttribute('role', 'tooltip');
   for (const item of markers) {
     const line = document.createElement('span');
-    line.textContent = `${item.company_name} · ${item.change_time}`;
+    line.textContent = `${item.company_name} · ${item.market_type} · ${item.change_time}`;
     tooltip.append(line);
   }
   marker.append(tooltip);
+  marker.addEventListener('mouseenter', () => positionFilterTooltip(marker, tooltip));
+  marker.addEventListener('focus', () => positionFilterTooltip(marker, tooltip));
   return marker;
 }
 
@@ -106,6 +133,8 @@ async function loadMatches() {
     const params = new URLSearchParams({
       date: dateInput.value,
       odds_filter: oddsFilter.checked ? '1' : '0',
+      handicap_min_count: handicapMinCount.value,
+      totals_min_count: totalsMinCount.value,
     });
     selectedStatuses().forEach((status) => params.append('status', status));
     const response = await fetch(`/api/matches?${params}`, { cache: 'no-store' });
@@ -141,5 +170,7 @@ document.querySelectorAll('input[name="status"]').forEach((input) => input.addEv
   loadMatches();
 }));
 oddsFilter.addEventListener('change', loadMatches);
+handicapMinCount.addEventListener('change', loadMatches);
+totalsMinCount.addEventListener('change', loadMatches);
 revealAdminNavigation();
 loadMatches();
